@@ -19,6 +19,7 @@
 <p align="center">
   <a href="#results">Results</a> &nbsp;·&nbsp;
   <a href="#quickstart">Quickstart</a> &nbsp;·&nbsp;
+  <a href="#container">Container</a> &nbsp;·&nbsp;
   <a href="DESIGN.md">Design</a> &nbsp;·&nbsp;
   <a href="docs/price-performance.md">Every measurement</a>
 </p>
@@ -141,6 +142,59 @@ Tests run on CPU:
 
 ```bash
 KILN_TEST_MODEL=Qwen/Qwen3-0.6B NEURON_RT_VISIBLE_CORES= PYTHONPATH=. python -m pytest -q
+```
+
+## Container
+
+The image is AWS's Neuron vLLM inference image (Neuron SDK 2.32, Python 3.13, Ubuntu 24.04) with
+Kiln installed at `/opt/kiln`; its entrypoint is `python -m kiln`. Run it on a trn1 host with the
+Neuron driver (the Deep Learning AMI for Neuron has it) and pass the Neuron devices in.
+
+```bash
+docker pull public.ecr.aws/sanghwa/kiln:0.1.0     # also :0.1.0-neuronx-sdk2.32 and :latest
+```
+
+The quickstart model on one NeuronCore (`/dev/neuron0` holds two on trn1). The first mount is the
+Hugging Face cache; the other two hold the compiled graphs and the NKI kernel binaries, so a
+restarted container serves from them instead of compiling again:
+
+```bash
+docker run --rm --device=/dev/neuron0 -e NEURON_RT_VISIBLE_CORES=0 -p 8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v ~/.cache/neuron_libtorch:/root/.cache/neuron_libtorch \
+  -v /var/tmp/nki-intermediate-cache:/var/tmp/nki-intermediate-cache \
+  public.ecr.aws/sanghwa/kiln:0.1.0 --model Qwen/Qwen3-0.6B --device neuron --port 8000
+
+curl -s localhost:8000/v1/completions -H 'content-type: application/json' \
+  -d '{"model": "Qwen/Qwen3-0.6B", "prompt": "Trainium is", "max_tokens": 32}'
+```
+
+All 16 devices (32 NeuronCores) of a trn1.32xlarge, one tensor-parallel rank per core:
+
+```bash
+docker run --rm $(for i in $(seq 0 15); do echo --device=/dev/neuron$i; done) -p 8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v ~/.cache/neuron_libtorch:/root/.cache/neuron_libtorch \
+  -v /var/tmp/nki-intermediate-cache:/var/tmp/nki-intermediate-cache \
+  public.ecr.aws/sanghwa/kiln:0.1.0 --model <model> --device neuron --tp 32 --port 8000
+```
+
+**GLM-5.3-Flash needs farm-compiled graphs.** Its graphs take hours to compile on the device, so
+compile them on CPU hosts first with `tools/compile_farm.py` (in the image at
+`/opt/kiln/tools/compile_farm.py`) and serve from that cache. The exact configuration behind every
+result above, compile farm included, is under "How to resume" in
+[docs/price-performance.md](docs/price-performance.md); in the container, run those commands with
+`--entrypoint python` (for example `bench/serve_sweep.py ...`). An `s3://` compile cache or farm queue
+is read with the `aws` CLI inside the container, so the container needs AWS credentials: the
+instance role answers from inside a container when the instance's metadata hop limit is 2 (it was on
+a Neuron DLAMI instance) or with `--network host`; otherwise pass credentials in the environment.
+
+The CPU test suite runs in the image too:
+
+```bash
+docker run --rm -e NEURON_RT_VISIBLE_CORES= -e KILN_TEST_MODEL=Qwen/Qwen3-0.6B \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  --entrypoint python public.ecr.aws/sanghwa/kiln:0.1.0 -m pytest -q
 ```
 
 ## License

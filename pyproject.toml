@@ -1,6 +1,11 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "kiln"
-version = "0.0.1"
+# The version is kiln/__init__.py __version__ and nowhere else (tests/test_version.py).
+dynamic = ["version"]
 description = "LLM inference engine for AWS Trainium and Inferentia"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -15,6 +20,9 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest", "httpx"]
+
+[tool.setuptools.dynamic]
+version = { attr = "kiln.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["kiln*"]

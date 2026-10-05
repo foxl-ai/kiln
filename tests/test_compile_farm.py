@@ -361,21 +361,28 @@ def test_workers_on_one_host_share_one_budget(tmp_path):
 
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait()
-    a = HostLedger(str(tmp_path), pid=os.getpid())
-    b = HostLedger(str(tmp_path), pid=os.getppid())
-    gone = HostLedger(str(tmp_path), pid=dead.pid)
-    with a.locked():
-        a.set(294.0, queue="q/t2max-U1", keys=["k-shared"])
-    b.set(133.0, queue="q/t2max-U0")
-    gone.set(500.0, keys=["k-dead"])
-    assert b.others() == (294.0, {"k-shared"})  # a, and not the dead worker, whose file is removed
-    assert not os.path.exists(gone.mine)
-    host_budget = 0.9 * 371
-    assert not admit(17.0, used=133.0, others=294.0, budget=host_budget, host_budget=host_budget, free=211.0)
-    assert admit(17.0, used=0.0, others=294.0, budget=host_budget, host_budget=host_budget, free=211.0)
-    assert not admit(17.0, used=0.0, others=0.0, budget=host_budget, host_budget=host_budget, free=10.0)
-    a.close()
-    assert b.others_gb() == 0.0
+    # The second worker is a live child, not os.getppid(): in a container pytest runs as PID 1, whose
+    # parent pid is 0, and HostLedger(pid=0) means "this process" (measured in the v0.1.0 image).
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+    try:
+        a = HostLedger(str(tmp_path), pid=os.getpid())
+        b = HostLedger(str(tmp_path), pid=live.pid)
+        gone = HostLedger(str(tmp_path), pid=dead.pid)
+        with a.locked():
+            a.set(294.0, queue="q/t2max-U1", keys=["k-shared"])
+        b.set(133.0, queue="q/t2max-U0")
+        gone.set(500.0, keys=["k-dead"])
+        assert b.others() == (294.0, {"k-shared"})  # a, and not the dead worker, whose file is removed
+        assert not os.path.exists(gone.mine)
+        host_budget = 0.9 * 371
+        assert not admit(17.0, used=133.0, others=294.0, budget=host_budget, host_budget=host_budget, free=211.0)
+        assert admit(17.0, used=0.0, others=294.0, budget=host_budget, host_budget=host_budget, free=211.0)
+        assert not admit(17.0, used=0.0, others=0.0, budget=host_budget, host_budget=host_budget, free=10.0)
+        a.close()
+        assert b.others_gb() == 0.0
+    finally:
+        live.kill()
+        live.wait()
 
 
 def test_oom_retry_reserves_from_the_peak_at_kill():
