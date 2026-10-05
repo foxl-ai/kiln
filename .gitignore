@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+# Neuron compiler artifacts and caches
+*.neff
+*.ntff
+neuronx_cache/
+neuron_compile_cache/
+compiler_workdir/
+/var/
+# Local benchmark output (published results go under bench/results/)
+/out/
+*.log
+.env
+
+# Local worktrees
+.claude/worktrees/

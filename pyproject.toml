@@ -1,0 +1,23 @@
+[project]
+name = "kiln"
+version = "0.0.1"
+description = "LLM inference engine for AWS Trainium and Inferentia"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+  "numpy",
+  "safetensors",
+  "tokenizers",
+  "transformers",
+  "fastapi",
+  "uvicorn",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "httpx"]
+
+[tool.setuptools.packages.find]
+include = ["kiln*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
