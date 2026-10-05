@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img alt="License: Foxl Proprietary" src="https://img.shields.io/badge/license-Foxl%20Proprietary-lightgrey.svg" /></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" /></a>
   <img alt="Neuron SDK 2.32" src="https://img.shields.io/badge/Neuron%20SDK-2.32-ff9900.svg" />
   <img alt="trn1 and trn2" src="https://img.shields.io/badge/runs%20on-trn1%20%C2%B7%20trn2-232f3e.svg" />
 </p>
@@ -145,6 +145,5 @@ KILN_TEST_MODEL=Qwen/Qwen3-0.6B NEURON_RT_VISIBLE_CORES= PYTHONPATH=. python -m 
 
 ## License
 
-Foxl Proprietary. The source is published for reading; see [LICENSE](LICENSE) for use, and
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the files adapted from vLLM, SGLang
-and transformers under Apache-2.0.
+Apache-2.0; see [LICENSE](LICENSE). Files adapted from vLLM, SGLang and transformers keep their
+own Apache-2.0 notices, listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
