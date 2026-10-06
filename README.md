@@ -68,6 +68,7 @@ to 1 decode box sustain 930.9 out tok/s at $2.57 per 1M output tokens all-in ove
 of a concurrency-320 level, with ITL p50 277 ms; whole level against whole level that is $3.02
 against $3.12, so on this workload it is close to a wash on cost and buys per-box throughput and
 latency instead. A decode-only box reaches $0.470 per 1M output tokens at 8K context with real KV.
+How it works and what it measures: [Disaggregated serving](#disaggregated-serving).
 **1M context**: GLM-5.3-Flash's full 1,044,480 tokens, needle-in-a-haystack 9 / 9 at 128k / 512k /
 1M on three engines, and $0.168 per 1M input tokens on trn1 at 3,549 input tokens/s per box.
 
@@ -105,6 +106,102 @@ latency instead. A decode-only box reaches $0.470 per 1M output tokens at 8K con
 The feature-by-feature comparison with the latest vLLM and SGLang is in
 [FEATURES.md](FEATURES.md); the architecture and its reasoning are in [DESIGN.md](DESIGN.md);
 which models run with real weights is in [docs/model-coverage.md](docs/model-coverage.md).
+
+## Disaggregated serving
+
+Prefill reads a whole prompt in one pass and is bound by compute; decode emits one token per step
+for every running request and is bound by the per-step cost of reading weights and KV. A
+colocated engine runs both in one process with one set of compiled graphs, so it has to pick one
+configuration for both. Kiln can instead run them as separate engines on separate boxes, connected
+by a router, so each phase gets the layout it is fastest in. It is opt-in: nothing changes unless
+an engine is started with a role.
+
+**Why it pays on Trainium.** On GLM-5.3-Flash the two phases want different expert layouts, and one
+engine cannot have both. With tensor-parallel experts plus three decode-only flags, the fixed part
+of a decode step drops from 70.3 to 47.5 ms (-32%). The same tensor-parallel layout makes the
+4096-row prefill call 475 -> 821 ms (+73%), so a colocated box that adopts it falls from 167.7 to
+120.3 out tok/s at concurrency 64. Expert parallelism is the better prefill layout and tensor
+parallelism the better decode layout; disaggregation lets each engine keep its own (trn1.32xlarge,
+real weights; the decode steps at 1 row per DP group against engine-v0 70ddc1b, the serving
+comparison against engine-v0 8229c3d, both in docs/neuron-notes.md "Decode at scale").
+
+**What runs where.**
+
+| Piece | What it does |
+|---|---|
+| Prefill engine (`--pd-role prefill`) | Loads only prefill graphs. Runs the prompt, samples the first token, and sends the request's state to the decode engine the router names. On trn1 it keeps expert parallelism, EPLB and the one-piece 8192-token prefill. |
+| Decode engine (`--pd-role decode`) | Loads only decode graphs. A handed-off request goes straight to running (no prefill graph, no recompile) and its first step is an ordinary decode row. Context-parallel DSA caches and tensor-parallel experts let one box hold 96 rows per DP group. |
+| Handoff | Moves every paged cache row of the prompt (MLA latent, DSA indexer and pool keys), the request's recurrent KDA state, the first token and its logprobs, the sampling parameters and the RNG state. Each sending rank ships its own shard over TCP into a receive buffer with an explicit size; a full buffer makes the sender wait and is counted, never dropped. It can cross attention-TP degrees (a DP-attention-1 prefill engine into a DP-attention-4 context-parallel decode engine) and re-shards into context-parallel pages. Mismatched layouts are refused at start-up. |
+| Router (`kiln.server.pd_router`) | One OpenAI-compatible front. Prompts shorter than `--threshold` (default 4096 tokens) go straight to a decode engine. A longer one takes a decode credit before anything is sent, so a full decode side queues the request at the router in arrival order instead of overloading it. Optional latency prefill engines and a per-engine queue-depth cap. It refuses to start without at least one engine of each role. |
+| Metrics | End-to-end and prefill TTFT, router and decode queues, KV transfer time, receive-buffer use and full events, disaggregated and bypassed request counts. |
+
+The automatic expert-parallel default follows the role: a prefill engine uses expert parallelism,
+a decode engine tensor-parallel experts, and an engine without a role keeps today's rule. An
+explicit `KILN_MOE_EP` still wins.
+
+**Measured** (GLM-5.3-Flash, 8192 in / 256 out, trn1.32xlarge spot $2.15/h per box, SDK 2.32,
+every graph from the compile farm; the trees are named in
+[docs/neuron-notes.md](docs/neuron-notes.md) "Prefill / decode disaggregation on the device").
+Cost is attributed by role: the prefill boxes over input tokens, the decode box over output tokens,
+and all-in is every box over output tokens.
+
+| Deployment | Steady out tok/s | Steady all-in $/1M out | Split: $/1M in + $/1M out | Whole-level all-in $/1M out | ITL p50 |
+|---|---:|---:|---|---:|---:|
+| 3 prefill : 1 decode (4 boxes), concurrency 320 | 930.9 | $2.57 | $0.060 + $0.642 | $3.02 | 277.0 ms |
+| 4 : 1 (5 boxes), concurrency 440, decode box with `KILN_DSA_CP_ALL_LOCAL=1 KILN_DSA_CP_PAGE_KEYS=1` | 1,139.5 | $2.62 | $0.067 + $0.524 | $3.40 | 353.5 ms |
+| Colocated, one box, concurrency 64 (EPLB + one-piece prefill) | | | | $3.12 | |
+
+"Steady" is the middle half of a closed-loop level; "whole level" includes the ramp and the tail.
+The colocated ITL at concurrency 64 is 363 ms on the defaults (engine-v0 f70c14b).
+No colocated steady figure was measured, so compare whole level with whole level: $3.02 against
+$3.12, 3.1% lower. On this workload disaggregation is close to a wash on cost. What it buys is per-box
+throughput (930.9 / 4 = 232.7 out tok/s per box against 191.3 colocated), a steadier and shorter
+inter-token latency, and a decode side whose own cost reaches $0.524 per 1M output tokens in a
+running deployment ($0.470 decode-only on the same box design).
+
+**Time to first token.** With the ordinary prefill engines (DP attention 4) an idle 8K request
+waits 4.33 s for its first token. A latency prefill engine runs the same model at DP attention 1,
+one request per call over all 32 ranks in 4096-row calls, and brings it to 1.60 s:
+
+| Arm (2 latency prefill + 1 decode) | TTFT p50 / p90 | ITL p50 |
+|---|---|---:|
+| Idle, one request at a time | 1595 / 1607 ms | 267.3 ms |
+| Open loop, 0.6 req/s | 1530 / 1775 ms | 269.6 ms |
+| Open loop, 1.0 req/s | 1596 / 2268 ms | 270.5 ms |
+| Ordinary prefill engines, idle | 4334 / 4338 ms | 267.3 ms |
+| Colocated one box, idle | 4013 / 4175 ms | 87.6 ms |
+
+Two latency boxes hold a p90 under 2 s up to about 0.6 req/s. Feeding a whole decode box that way
+would take far more prefill boxes than a throughput deployment does, so the latency arm trades
+cost for TTFT. No arm reaches a p90 of 1 s for 8K prompts on trn1: the router's own histograms
+put the prefill call at 81% of an idle request's TTFT (1.22 s of it), and the router's queue at
+microseconds, so the floor is the prefill compute itself. The latency arm's
+output matches the colocated reference on 15 of 16 greedy prompts (token agreement 0.964, mean
+teacher-forced |dlogprob| 0.0023 on decode); the differences are near-ties.
+
+**Run it.** Start each engine with the same arguments a `bench/serve_sweep.py` run of that
+configuration takes (they decide the compiled graphs), plus a role, then the router:
+
+```bash
+# decode box
+python bench/pd_serve.py --pd-role decode --pd-listen 0.0.0.0:7400 --port 8100 -- <decode serve_sweep arguments>
+# each prefill box
+python bench/pd_serve.py --pd-role prefill --port 8100 -- <prefill serve_sweep arguments>
+# router, on any host that reaches all of them
+python -m kiln.server.pd_router --prefill-urls http://p1:8100,http://p2:8100,http://p3:8100 \
+  --decode-urls http://d1:8100 --tokenizer zai-org/GLM-5.3-Flash --threshold 4096 --port 8000
+```
+
+The exact prefill and decode configurations behind the table above are in
+[docs/price-performance.md](docs/price-performance.md) "Prefill / decode disaggregation (G1,
+trn1)". `bench/pd_sweep.py` drives the router closed loop or with Poisson arrivals and reports the
+steady and whole-level figures; `tools/check_pd.py` compares a disaggregated deployment's output
+with a colocated reference.
+
+Not done yet: the handoff runs over host memory and TCP; a device-to-device path over EFA is not
+built. trn2 is not a better disaggregation target at 8K: its best real-KV decode box costs $1.21 per
+1M output tokens against trn1's $0.89 for the non-context-parallel trn1 box, and trn2 prefill costs
+more per token than trn1's.
 
 ## What moved the number
 
