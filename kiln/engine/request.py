@@ -94,6 +94,8 @@ class Request:
     think_done: bool = False
     watermarked: bool = False
     mtp_draft: list[int] = field(default_factory=list)  # MTP drafts for the next step
+    spec_inflight: int = 0  # blind speculative steps launched and not yet committed (engine/spec_async.py)
+    spec_ready: bool = False  # its speculative board row is the device's (else the host initializes it)
     # Jump-forward decoding (engine.LLMEngine._jump_forward): output tokens the grammar forced
     # rather than the model sampled, and the end of the newest forced run. Their logprobs come
     # from the prefill rows that compute them (forced_logprob_rows), never from a sample.
@@ -105,6 +107,17 @@ class Request:
     ckpt_targets: list[int] = field(default_factory=list)
     ckpt_pending: list[tuple[int, int, bool]] = field(default_factory=list)
     ckpt_restore: int | None = None  # the checkpoint row a prefix hit restores, until the copy is launched
+    # Prefill / decode disaggregation (engine/disagg.py). Prefill side: (transfer id, decode receiver
+    # "host:port") of a request to hand off once its first token is sampled, the request's own params
+    # (it runs with max_new_tokens 1 here), and its pages at release (Scheduler._release), which the
+    # handoff reads before anything is scheduled again. Decode side: the complete handoff a request was
+    # admitted from, and whether its parts are on the device yet (engine._pd_inject_plan).
+    handoff: tuple[str, str] | None = None
+    handoff_params: SamplingParams | None = None
+    handoff_pages: list[int] | None = None
+    handoff_meta: dict | None = None  # the meta sent to the decode side (engine._pd_handoff)
+    pd_meta: dict | None = None
+    pd_injected: bool = False
 
     def __post_init__(self) -> None:
         if not self.prompt_ids:

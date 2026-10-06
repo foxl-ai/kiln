@@ -207,12 +207,18 @@ def moe_ep_enabled(cfg=None) -> bool:
     logs/kiln-mimo-trn1/20261004T185347Z-serve_sweep.log, 20261004T190618Z-ep-b4f4-serve_sweep.log); real-weight ppl
     -2.074 (TP -2.073), wikitext -0.552 (-0.551); docs/neuron-notes.md "Expert parallelism".
 
-    The model also leaves the automatic default off below EP_AUTO_MIN_DECODE_ROWS decode rows per DP-attention
+    The model also leaves the automatic default off below ep_auto_min_decode_rows() decode rows per DP-attention
     group (max_num_seqs / dp_attention; DecoderForCausalLM), where the small-lane decode kernel's per-expert
-    passes cost more than TP's moe_dedupe: measured on kiln-mimo-trn1 with the q/final-c33a391 configs (feat/moe-ep
-    24ed0fa, 2026-10-04), G16 (16 seqs over 4 groups = 4 rows) EP 80.5 against TP 82.9 out tok/s, ITL 168.8 against
-    156 ms (log s3 logs/kiln-mimo-trn1/20261004T204415Z-ep24-G16-sweep.log), F0 (32 over 4 = 8 rows) EP 98.9 against
-    TP 90.8, ITL 287.5 against 311 ms (20261004T203230Z-ep24-F0-sweep.log)."""
+    passes cost more than TP's moe_dedupe. With kiln_moe_ep_small (KILN_MOE_EP_SMALL_V=1) that is 8: measured on
+    kiln-mimo-trn1 with the q/final-c33a391 configs (feat/moe-ep 24ed0fa, 2026-10-04), G16 (16 seqs over 4 groups = 4
+    rows) EP 80.5 against TP 82.9 out tok/s, ITL 168.8 against 156 ms (log s3
+    logs/kiln-mimo-trn1/20261004T204415Z-ep24-G16-sweep.log), F0 (32 over 4 = 8 rows) EP 98.9 against TP 90.8, ITL
+    287.5 against 311 ms (20261004T203230Z-ep24-F0-sweep.log). With kiln_moe_ep_small2 (the default from 2026-10-05,
+    no pass for an expert without pairs) it is 4: kiln-ut-32 (trn1.32xlarge, SDK 2.32, real weights, conc 16, 4 decode
+    rows per group, 128 requests, same box back to back, every arm at --max-num-seqs 32 --kv-cache-gb 1.5
+    --decode-buckets 4), TP 86.9 out tok/s, EP v1 88.4 (+1.7%), EP v2 98.0 (+12.8%; decode call 0.066 -> 0.084 s,
+    prefill call 0.895 -> 0.592 s against TP; logs s3 logs/kiln-ut-32/ut-g16t32.log, ut-g16e.log, ut-g16e-v2.log with
+    their .log.cmd). The final G16 config (--max-num-seqs 16 --kv-cache-gb 0.65, TP) measured 87.5 on the same box."""
     v = os.environ.get("KILN_MOE_EP", "auto")
     if v in ("0", "1"):
         return v == "1"
@@ -229,7 +235,16 @@ def moe_ep_enabled(cfg=None) -> bool:
 
 EP_AUTO_MODEL_FAMILIES = ("glm5_next",)
 EP_AUTO_PLATFORMS = ("trn1", "trn1n")
-EP_AUTO_MIN_DECODE_ROWS = 8  # decode rows per DP-attention group (moe_ep_enabled)
+EP_AUTO_MIN_DECODE_ROWS = 4  # decode rows per DP-attention group with kiln_moe_ep_small2 (moe_ep_enabled)
+EP_AUTO_MIN_DECODE_ROWS_V1 = 8  # ... with kiln_moe_ep_small (KILN_MOE_EP_SMALL_V=1)
+
+
+def ep_auto_min_decode_rows() -> int:
+    """The automatic expert-parallel default's least decode rows per DP-attention group (moe_ep_enabled): it follows
+    the small-lane decode kernel in use (kernels/moe_ep.py SMALL_V)."""
+    from ..kernels import moe_ep
+
+    return EP_AUTO_MIN_DECODE_ROWS_V1 if moe_ep.SMALL_V == 1 else EP_AUTO_MIN_DECODE_ROWS
 
 
 # KILN_DENSE_FP8 (default "1"): a checkpoint's FP8 weights outside the routed experts (attention projections,
@@ -278,7 +293,9 @@ PREFILL_SP_FAMILIES = ("trn1", "trn1n", "trn2")
 # its group's). auto (the default): on where measured, the trn1 families (and hosts without a Neuron target, the
 # CPU tests); 1 / 0 force it. Read when a model is built (DecoderForCausalLM.sp_group): the platform lookup reads
 # files, which a traced graph may not.
-SP_GROUP_FAMILIES = ("trn1", "trn1n")
+# trn2 (2026-10-05, trn2.48xlarge, feat/trn2-fast): with the MoE prefill skip, one engine at conc 32 88.6 -> 94.8 out tok/s, the
+# 4096-row prefill call 1.017 -> 0.922 s; wikitext-2 with the decode set -0.554 -> -0.544, greedy agreement 97.8%.
+SP_GROUP_FAMILIES = ("trn1", "trn1n", "trn2")
 
 
 def sp_group_enabled() -> bool:
@@ -309,8 +326,18 @@ def prefill_sp_enabled() -> bool:
 # neuron-explorer replay, 2026-10-04): the mix-out plus hyper-connection part of each block ~0.2 ms over 64 replicated
 # rows, ~0.4 ms per layer. Only decode calls whose rows divide over tp (ModelRunner turns it off otherwise); not with
 # an MTP head. Read when a model is built.
+DECODE_SP_FAMILIES = ("trn1", "trn2")  # where the A/Bs with the decode kernels ran (kernels/kda_decode.py)
+
+
 def decode_sp_enabled() -> bool:
-    return os.environ.get("KILN_DECODE_SP", "0") == "1"
+    """KILN_DECODE_SP unset: on for a trn1 / trn2 target, off elsewhere; "1" / "0" force it."""
+    v = os.environ.get("KILN_DECODE_SP")
+    if v:
+        return v == "1"
+    from .. import platform
+
+    t = platform.target()
+    return t is not None and platform.family_of(t) in DECODE_SP_FAMILIES
 
 
 def moe_prefill_down(layer):
@@ -357,9 +384,11 @@ class DecoderLayer(nn.Module):
     def __init__(self, cfg: ModelConfig, spec: AttnSpec, dtype: torch.dtype, tp: int, tp_rank: int, moe: bool,
                  index: int = 0, keep_fp8: bool = False, packed_mxfp4: bool = False, prefix: str | None = None,
                  moe_kernel: str = "xla", attn_tp: int | None = None, attn_rank: int | None = None,
-                 plain: bool = False, ep: bool = False):
+                 plain: bool = False, ep: bool = False, ep_extra: list[int] | None = None):
         """tp / tp_rank shard the MLP (dense or experts); ep: the routed experts are expert-parallel instead
-        (moe_ep_enabled: this rank holds experts tp_rank E / tp .. whole); attn_tp / attn_rank (default: the same)
+        (moe_ep_enabled: this rank holds experts tp_rank E / tp .. whole); ep_extra: with ep, the experts the
+        redundant slots of EVERY rank hold, rank-major (models/eplb.py: s = len / tp slots per rank, this rank's
+        after its own E / tp; None or empty: none); attn_tp / attn_rank (default: the same)
         shard the token mixer's heads (DecoderForCausalLM: attention TP).
         keep_fp8: weights the checkpoint quantizes stay FP8 (with fp32 block scales, see
         models/quant.py) and are dequantized inside the graph right before their matmul.
@@ -465,7 +494,17 @@ class DecoderLayer(nn.Module):
                     raise NotImplementedError(f"KILN_MOE_EP=1: {cfg.architecture}'s experts (biases, moe_act "
                                               f"{cfg.moe_act}, router-weighted shared experts) are not implemented")
                 El, Im = E // tp, cfg.moe_intermediate_size
-                self.ep_first, self.ep_count = tp_rank * El, El  # this rank's experts
+                # models/eplb.py: s redundant slots per rank after the El primaries (physical ids E + r s + j).
+                extra = list(ep_extra or [])
+                if len(extra) % tp:
+                    raise ValueError(f"{len(extra)} redundant expert slots do not divide over tp={tp}")
+                self.ep_s = len(extra) // tp
+                self.ep_extra_all = extra
+                # Logical expert held by each local slot: the primaries, then this rank's redundant slots.
+                self.ep_experts = list(range(tp_rank * El, (tp_rank + 1) * El)) + extra[tp_rank * self.ep_s:
+                                                                                         (tp_rank + 1) * self.ep_s]
+                self.ep_first, self.ep_count = tp_rank * El, El + self.ep_s  # first primary, local slots
+                El = El + self.ep_s
             else:
                 El, Im = E, moe_inter_per_rank(cfg, tp, keep_fp8)
             # DeepSeek-V3-style shared experts: a dense MLP beside the routed experts
@@ -499,8 +538,13 @@ class DecoderLayer(nn.Module):
             self.down_t = not (keep_fp8 and cfg.quant_expert_mxfp4 and packed_mxfp4)
             lin("w_down", "mlp.experts", El, H, Im, expert=True, transposed=self.down_t)
             if self.moe_ep:
-                self.register_buffer("ep_lmap", torch.zeros(1, E + 1, dtype=torch.int32, device="cpu"),
+                self.register_buffer("ep_lmap", torch.zeros(1, E + tp * self.ep_s + 1, dtype=torch.int32, device="cpu"),
                                      persistent=False)  # filled per rank by DecoderForCausalLM.ep_buffers
+                # The expert tensors' per-slot shapes and dtypes, before pack_experts replaces them (an EPLB rebalance
+                # loads new slots into the same layout: models/loader.py load_ep_slots).
+                self.ep_meta = {n: (None if getattr(self, n) is None else (tuple(getattr(self, n).shape[1:]),
+                                                                            getattr(self, n).dtype))
+                                for n in ("w_gu", "w_gu_scale", "w_down", "w_down_scale")}
             if self.moe_ep and moe_kernel in NKI_MOE_KERNELS:
                 from ..kernels import moe_ep
 
@@ -624,12 +668,13 @@ class DecoderForCausalLM(nn.Module):
                  tp_rank: int = 0, tp_size: int = 1, tp_group=None, keep_fp8: bool = False,
                  vocab_parallel: bool = False, packed_mxfp4: bool = False, mtp: bool = False,
                  moe_kernel: str = "xla", attn_tp: int | None = None, attn_group=None, dp_attention: int = 1,
-                 max_num_seqs: int | None = None):
+                 max_num_seqs: int | None = None, pd_role: str | None = None):
         """attn_tp: the attention TP (None: attention_tp's default); attn_group: this rank's
         attention group when 1 < attn_tp < tp_size (engine/tp.py attention_group). dp_attention: the
         number of DP-attention groups (attn_tp is then tp_size / dp_attention, and no attention
         group is needed: the mixers reduce over the world, see above). max_num_seqs: the engine's
-        (None: unknown), for the automatic expert-parallel default (moe_ep_enabled)."""
+        (None: unknown), for the automatic expert-parallel default (moe_ep_enabled). pd_role: the engine's role in a
+        disaggregated deployment (EngineConfig.pd_role), which decides that default by itself (below)."""
         super().__init__()
         self.keep_fp8 = keep_fp8
         if cfg.intermediate_size % tp_size:
@@ -670,14 +715,33 @@ class DecoderForCausalLM(nn.Module):
                           and hy.ple is None and not mtp)
         # Expert parallelism (moe_ep_enabled): only with more than one rank; the automatic default also only where
         # the ranks divide the experts (KILN_MOE_EP=1 raises in DecoderLayer instead) and from
-        # EP_AUTO_MIN_DECODE_ROWS decode rows per DP-attention group on (G16's 4 lose, F0's 8 win: moe_ep_enabled).
+        # ep_auto_min_decode_rows() decode rows per DP-attention group on (4 with the default decode kernel, 8 with
+        # KILN_MOE_EP_SMALL_V=1: moe_ep_enabled).
+        # A disaggregated engine runs one phase, so the automatic default follows its role rather than its decode
+        # rows: a prefill engine takes EP (its 4096-row calls are ~0.3 s faster than TP's, moe_ep_enabled), a
+        # decode engine TP experts (the decode agent's ST measurement: KILN_MOE_EP=0 is the faster decode, 2026-10-05).
+        # KILN_MOE_EP=0 / 1 still decides, and an engine without a role keeps the decode-row rule.
         ep = moe_ep_enabled(cfg) and tp_size > 1 and bool(cfg.num_experts)
         if ep and os.environ.get("KILN_MOE_EP", "auto") == "auto":
             if cfg.num_experts % tp_size:
                 ep = False
-            elif max_num_seqs is not None and max_num_seqs < EP_AUTO_MIN_DECODE_ROWS * dp_attention:
+            elif pd_role == "decode":
+                ep = False
+            elif pd_role != "prefill" and max_num_seqs is not None \
+                    and max_num_seqs < ep_auto_min_decode_rows() * dp_attention:
                 ep = False
         self.moe_ep = ep
+        # Redundant expert slots (models/eplb.py, KILN_EP_REDUNDANT): the experts every rank's redundant slots hold,
+        # per MoE layer, from a statistics file (KILN_EPLB_INIT) or the placeholder; identical on every rank.
+        self.ep_s = _eplb.redundant_slots() if ep else 0
+        self.ep_extra: dict[int, list[int]] = {}
+        if self.ep_s:
+            E = cfg.num_experts
+            init = os.environ.get("KILN_EPLB_INIT")
+            loads = _eplb.load_file(init, E) if init else {}
+            for i in cfg.moe_layers:
+                self.ep_extra[i] = (_eplb.replicas(loads[i], tp_size, self.ep_s) if i in loads
+                                    else _eplb.default_extra(E, tp_size, self.ep_s))
         self.dp_buffers()
         self.inter = cfg.intermediate_size // tp_size
         self.moe_inter = moe_inter_per_rank(cfg, tp_size, keep_fp8)
@@ -694,7 +758,8 @@ class DecoderForCausalLM(nn.Module):
         self.layers = nn.ModuleList(DecoderLayer(cfg, specs[i], dtype, tp_size, tp_rank, moe=i in cfg.moe_layers,
                                                  index=i, keep_fp8=keep_fp8, packed_mxfp4=packed_mxfp4,
                                                  moe_kernel=moe_kernel, attn_tp=self.attn_tp,
-                                                 attn_rank=self.attn_rank, ep=self.moe_ep)
+                                                 attn_rank=self.attn_rank, ep=self.moe_ep,
+                                                 ep_extra=self.ep_extra.get(i))
                                     for i in range(cfg.num_layers))
         self.norm = nn.Parameter(torch.empty(cfg.hidden_size, dtype=dtype), requires_grad=False)
         self.embed_norm = (nn.Parameter(torch.empty(cfg.hidden_size, dtype=dtype), requires_grad=False)
@@ -749,6 +814,18 @@ class DecoderForCausalLM(nn.Module):
         self.full_tables = bool(cfg.sconv_kernel or any(l.spec.rel_extent for l in self.kv_layers()))
         self.page_size = 0
         self.fp8_max = None
+        # Long-context pooled DSA (models/dsa_long.py): every attention layer is a pooled DSA indexer layer
+        # without RoPE (GLM-5.3-Flash), so a bucket past dsa_long.LONG_KEYS keys runs every layer's long path
+        # and the prep graphs build no [C, L] visibility for it (long_ctx).
+        self.long_dsa = bool(self.layers) and all(
+            isinstance(l.spec, LinearSpec) or _mla.long_capable(l.spec) for l in self.layers) and any(
+            not isinstance(l.spec, LinearSpec) for l in self.layers)
+        # Context parallelism of the DSA caches over the attention group (models/dsa_long.py, KILN_DSA_CP=1): each
+        # rank holds 1 / cp of every sequence's latent, indexer rows and pool keys, and every bucket runs the long
+        # path. Needs page_size / kpool to be a multiple of the attention TP (checked in bind_kv_cache).
+        self.cp = self.attn_tp if (_dsa_long.cp_enabled() and self.long_dsa and self.attn_tp > 1) else 1
+        if self.cp > 1 and getattr(self, "mtp", None) is not None:
+            raise NotImplementedError("context-parallel DSA with an MTP layer")
         # Back-compat for single-spec models (tools and tests read these).
         first = next(iter(self.kv_layers()), None)
         self.nh, self.nkv, self.kv_offset = (first.nh, first.nkv, first.kv_offset) if first is not None else (0, 0, 0)
@@ -770,7 +847,37 @@ class DecoderForCausalLM(nn.Module):
         owner = torch.arange(E, device="cpu") // (E // self.tp_size)  # (the model may be built on meta)
         lmap = local_map(owner, self.tp_rank)
         for l in self.ep_layers():
-            l.register_buffer("ep_lmap", lmap.clone().to(device), persistent=False)
+            s = getattr(l, "ep_s", 0)
+            if not s:
+                l.register_buffer("ep_lmap", lmap.clone().to(device), persistent=False)
+                continue
+            # models/eplb.py: physical ids (primaries e, redundant slot j of rank r E + r s + j), the routing ids
+            # mapped to them by remap with these tables (data, so a rebalance changes no graph).
+            l.register_buffer("ep_lmap", _eplb.physical_lmap(E, self.tp_size, s, self.tp_rank).to(device),
+                              persistent=False)
+            self._ep_tables(l, device)
+            if _eplb.record_enabled():
+                st = getattr(l, "ep_stats", None)
+                l.register_buffer("ep_stats", (st if st is not None and st.device.type != "meta"
+                                               else torch.zeros(E, dtype=torch.float32)).to(device), persistent=False)
+
+    def _ep_tables(self, l, device=None) -> None:
+        """A layer's remap tables from its ep_extra_all (models/eplb.py tables): prefill calls spread a replicated
+        expert's pairs over its copies, decode calls too unless KILN_EPLB_DECODE=0. Registered at build, copied
+        into the existing device buffers at a rebalance (device None)."""
+        E, s = self.cfg.num_experts, l.ep_s
+        ids, mp = _eplb.tables(l.ep_extra_all, E, self.tp_size, s, spread=True)
+        _, mpd = _eplb.tables(l.ep_extra_all, E, self.tp_size, s, spread=_eplb.decode_replicas())
+        for name, t in (("ep_rep_ids", ids), ("ep_rep_map", mp), ("ep_rep_map_d", mpd)):
+            cur = getattr(l, name, None)
+            if device is None and cur is not None and cur.shape == t.shape and cur.device.type != "meta":
+                cur.copy_(t.to(cur.device))
+            else:
+                l.register_buffer(name, t.to(device) if device is not None else t, persistent=False)
+
+    def _ep_phys(self, layer, topi: torch.Tensor, decode: bool) -> torch.Tensor:
+        """Routing ids -> physical expert ids of a layer with redundant slots (models/eplb.py remap)."""
+        return _eplb.remap(topi, layer.ep_rep_ids, layer.ep_rep_map_d if decode else layer.ep_rep_map)
 
     def dp_buffers(self, device=None) -> None:
         """DP attention: this rank's group as buffers (an index [1] and a one-hot [N] row in the
@@ -791,6 +898,15 @@ class DecoderForCausalLM(nn.Module):
                 self.register_buffer("sp_grp_index", torch.tensor([self.attn_rank], dtype=torch.int64,
                                                                   device="cpu").to(device), persistent=False)
                 self.register_buffer("sp_grp_onehot", g1.to(device), persistent=False)
+        if getattr(self, "long_dsa", False) and self.attn_tp > 1:
+            # Long-context DSA prefill (models/mla.py _long_prefill_select): this rank's block of a chunk's queries
+            # within its attention group, as an index [1] and an fp32 one-hot [attn_tp] row (fp32: the gathered
+            # pool indices go up to 262,144, which bf16 cannot hold).
+            g2 = torch.zeros(self.attn_tp, dtype=torch.float32, device="cpu")
+            g2[self.attn_rank] = 1
+            self.register_buffer("long_grp_index", torch.tensor([self.attn_rank], dtype=torch.int64,
+                                                                device="cpu").to(device), persistent=False)
+            self.register_buffer("long_grp_onehot", g2.to(device), persistent=False)
         if self.dp == 1:
             return
         # Built on the host and copied: eager ops on the neuron device failed here ("Expected
@@ -895,6 +1011,12 @@ class DecoderForCausalLM(nn.Module):
             layer.v_cache = v
         self.page_size = page_size
         self.fp8_max = fp8_max
+        if self.cp > 1:
+            kp = next(l.spec.mla.dsa.kpool for l in self.kv_layers())
+            if page_size % kp or (page_size // kp) % self.cp:
+                raise ValueError(f"context-parallel DSA: {page_size // kp} pools per page do not divide over "
+                                 f"attention TP {self.cp} (KILN_DSA_CP=1 needs page_size a multiple of kpool x it)")
+            max_keys = 1  # every bucket runs the long path, which stages nothing
         _mla.bind_scratch(self, max_rows, k_caches[0].device if k_caches else None,
                           max_keys or (k_caches[0].shape[0] if k_caches else None))
 
@@ -944,6 +1066,10 @@ class DecoderForCausalLM(nn.Module):
         rank order: x in its block of a zero [attn_tp, r, ...] summed over the group (DP attention with
         sequence-parallel streams: a group's ranks hold exactly its rows, the group-major batch's rows
         dp_group T .. (dp_group + 1) T). Exact, as _sp_gather."""
+        from ..kernels import sp_gather
+
+        if sp_gather.enabled(x, group=True):  # KILN_SP_GATHER=nki-all: an NKI kernel's all_gather (kernels/sp_gather.py)
+            return sp_gather.gather(x, self.tp_size, self.attn_tp)
         full = x.unsqueeze(0) * self.sp_grp_onehot.view(self.attn_tp, *[1] * x.dim())
         return self._all_reduce(full.reshape(-1, *x.shape[1:]), self.attn_group)
 
@@ -1041,11 +1167,24 @@ class DecoderForCausalLM(nn.Module):
         blocks (an index_select by the sp_index buffer, as _attn_in)."""
         return x.reshape(self.tp_size, -1, *x.shape[1:]).index_select(0, self.sp_index)[0]
 
+    def _sp_gather_kernel_ok(self) -> bool:
+        """Whether the world row gather may run as kernels/sp_gather.py's NKI all_gather: a model without routed experts,
+        or with expert-parallel ones. With tensor-parallel experts (KILN_MOE_EP=0, or the automatic expert parallelism
+        left off, as check_ppl's 4 sequences leave it) neuronx-cc 2.27 fails GLM-5.3-Flash's prefill pieces with
+        [NCC_ISCH719] "topological order violations" (12- and 6-layer pieces, and check_ppl --chunk 1024's; trn1,
+        SDK 2.32, 2026-10-05, docs/neuron-notes.md "Collectives issued from an NKI kernel on trn1"), so those keep the
+        zero-padded all-reduce."""
+        return bool(getattr(self, "moe_ep", False)) or not self.cfg.num_experts
+
     def _sp_gather(self, x: torch.Tensor, onehot: torch.Tensor | None = None) -> torch.Tensor:
         """Every rank's rows [tp_size * r, ...] from each rank's own x [r, ...], in rank order: x in
         its block of a zero [tp_size, r, ...] (a one-hot multiply, as _attn_all_reduce) summed over
         the world. Exact: each element is one rank's value plus zeros. onehot: the sp_onehot buffer
         when a graph takes it as an argument (forward_mtp_k)."""
+        from ..kernels import sp_gather
+
+        if onehot is None and self._sp_gather_kernel_ok() and sp_gather.enabled(x):  # KILN_SP_GATHER=nki
+            return sp_gather.gather(x, self.tp_size, self.tp_size)
         oh = self.sp_onehot if onehot is None else onehot
         full = x.unsqueeze(0) * oh.view(self.tp_size, *[1] * x.dim())
         return self._all_reduce(full.reshape(-1, *x.shape[1:]))
@@ -1348,11 +1487,16 @@ class DecoderForCausalLM(nn.Module):
         return {n: getattr(layer, "ep_" + n) for n in names}
 
     def _moe_ep(self, layer: DecoderLayer, x: torch.Tensor, topv: torch.Tensor, topi: torch.Tensor, act: int,
-                lim: float = 0.0) -> torch.Tensor:
+                lim: float = 0.0, phys: bool = False) -> torch.Tensor:
         """An expert-parallel layer's routed output (moe_ep_enabled): sum over the pairs whose expert is this rank's
         of topv expert(x), 0 for the rest (the block's all-reduce adds the ranks). act 0 SiLU, 1 SiLU clamped at
         lim (kernels/moe_dedupe.ACTS). On the device kernels/moe_ep.py; on the host every local expert over every
-        row, weighted by the routing weight of its pair (0 where the token is not routed to it)."""
+        row, weighted by the routing weight of its pair (0 where the token is not routed to it). phys: topi holds
+        physical expert ids already (models/eplb.py); a layer with redundant slots maps routing ids here otherwise."""
+        if getattr(layer, "ep_s", 0) and not phys:
+            from ..kernels.moe_ep import uses_small
+
+            topi = self._ep_phys(layer, topi, decode=uses_small(x.shape[0]))
         if layer.moe_blob and x.device.type != "cpu":
             from ..kernels.moe_ep import moe_ep
 
@@ -1520,6 +1664,21 @@ class DecoderForCausalLM(nn.Module):
         s = self._scores(layer, torch.einsum("bhgd,blhd->bhgl", q.view(T, nkv, G, D), kc), bias, rel, tau, "bhgl")
         return torch.einsum("bhgl,blhd->bhgd", self._softmax(layer, s, kv_axis=1), vc)
 
+    def long_ctx(self, L: int) -> bool:
+        """Whether a bucket of L keys runs every attention layer's long-context path (models/dsa_long.py; static
+        per bucket)."""
+        return self.long_dsa and (self.cp > 1 or _dsa_long.enabled(L))
+
+    def _long_attn(self, block_table, shape):
+        """_attn_inputs of a long-context bucket: the long path reads the positions and the block table only, so
+        the bias is a [*shape, 1] placeholder (its rank tells the batch forms apart, models/mla.py attention). It is
+        made from the block table (times 0) so that every page bucket's prep graph is its own: without the table the
+        prep graphs of all long buckets were one graph, one cache key loaded once per bucket, and at tp=2 the ranks'
+        loaded copies failed the collective barrier ("MPMD execution is not supported. Most likely some ranks
+        recompiled/reloaded a graph", trn1.2xlarge, SDK 2.32, 2026-10-05)."""
+        zero = block_table.reshape(-1)[:1].to(torch.float32) * 0.0
+        return {None: (zero.expand(int(torch.Size(shape).numel())).reshape(*shape, 1).contiguous(), block_table)}
+
     def _attn_inputs(self, vis_full, pos, block_table, swa_table, swa_first, shape):
         """(bias, table) per attention kind: key None for full attention, self.window for
         sliding-window layers. vis_full: visibility over block_table's keys [..., L]; pos:
@@ -1599,6 +1758,8 @@ class DecoderForCausalLM(nn.Module):
         # input_ids, not block_table: the order a graph first touches its inputs orders its
         # placeholders, which is part of the compile cache key.)
         B = input_ids.shape[0] // self.dp
+        if self.long_ctx(block_table.shape[1] * self.page_size):  # models/dsa_long.py: no [B, L] visibility
+            return self._hidden_in(input_ids, ngram_ids, self._sp_on_decode()), self._long_attn(block_table, (B, 1, 1))
         j = torch.arange(block_table.shape[1] * self.page_size, device=block_table.device).unsqueeze(0)
         attn = self._attn_inputs(j < context_lens.unsqueeze(1), positions.unsqueeze(1), block_table,
                                  swa_table, swa_first, (B, 1, 1))
@@ -1642,9 +1803,12 @@ class DecoderForCausalLM(nn.Module):
         [1]) just the pages the chunk's windows reach back to. Under DP attention input_ids holds
         every group's chunk [N * C] and the rest this group's."""
         C = input_ids.shape[0] // self.dp
-        j = torch.arange(block_table.shape[0] * self.page_size, device=block_table.device).unsqueeze(0)
-        pos = positions.unsqueeze(1)
-        attn = self._attn_inputs(j <= pos, pos, block_table, swa_table, swa_first, (1, 1, C))
+        if self.long_ctx(block_table.shape[0] * self.page_size):  # models/dsa_long.py: no [C, L] visibility
+            attn = self._long_attn(block_table, (1, 1, C))
+        else:
+            j = torch.arange(block_table.shape[0] * self.page_size, device=block_table.device).unsqueeze(0)
+            pos = positions.unsqueeze(1)
+            attn = self._attn_inputs(j <= pos, pos, block_table, swa_table, swa_first, (1, 1, C))
         sp = self._sp_on()
         if sp and input_ids.shape[0] % self.tp_size:
             raise ValueError(f"sequence-parallel prefill streams (KILN_PREFILL_SP) need the chunk's {input_ids.shape[0]} "
@@ -1922,4 +2086,6 @@ Qwen3ForCausalLM = DecoderForCausalLM  # the first architecture Kiln ran; kept f
 # Imported last: models/mla.py and models/hybrid.py import this module's helpers.
 from . import hybrid as _hybrid  # noqa: E402
 from . import mla as _mla  # noqa: E402
+from . import eplb as _eplb  # noqa: E402
 from . import mtp as _mtp  # noqa: E402
+from . import dsa_long as _dsa_long  # noqa: E402

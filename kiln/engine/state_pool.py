@@ -60,6 +60,9 @@ class StatePool:
         self._frees = [[list(range(1 + i * rows_per_req, 1 + (i + 1) * rows_per_req)) for i in range(rows - 1, -1, -1)]
                        for _ in range(groups)]
         self._held: dict[str, list] = {}  # rid -> [rows, current index, request]
+        # hold: released rows wait in _cooling until release_cooling() (kv_pool.PagePool.hold, for the same reason).
+        self.hold = False
+        self._cooling = [[] for _ in range(groups)]
         self.num_ckpt_rows = ckpt_rows
         self._ckpt_frees = [list(range(self.rows - 1, n_run, -1)) for _ in range(groups)]
 
@@ -102,7 +105,12 @@ class StatePool:
     def release(self, req) -> None:
         held = self._held.pop(req.rid, None)
         if held is not None:
-            self._frees[held[2].dp_group].append(held[0])
+            (self._cooling if self.hold else self._frees)[held[2].dp_group].append(held[0])
+
+    def release_cooling(self) -> None:
+        for free, cool in zip(self._frees, self._cooling):
+            free.extend(cool)
+            cool.clear()
 
     def alloc_ckpt(self, group: int = 0) -> int | None:
         free = self._ckpt_frees[group]

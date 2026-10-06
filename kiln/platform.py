@@ -127,12 +127,24 @@ _LNC: int | None = None  # resolved by configure_runtime_env, before anything is
 # trn2.48xlarge, tp=32, every 256-token chunk identical to the unsplit engine, 2026-10-04). moe_prefill's split
 # fails that check (a vector-DGE out-of-bound indirect copy at 256-row chunks, under investigation) and
 # moe_dedupe's decode path is not covered by it yet.
-LNC_SPLIT_KERNELS = ("moe_prefill", "moe_dedupe", "delta_rule", "dsa_topk")
+# moe_ep (kernels/moe_ep.py, feat/trn2-fast): the expert-parallel prefill and decode-v2 kernels, I-chunks of gate_up and
+# output columns of down per program with a^T swapped (exact in the NKI simulator; hangs in trn2 serving, an open bug);
+# kda_decode / dsa_decode: halves of the decode rows per program (bit-identical in the simulator, not on the trn2 device,
+# where the decode-path gate passed: docs/neuron-notes.md "trn2 on engine-v0 70ddc1b"). dsa_fused (kernels/dsa_fused.py,
+# KILN_DSA_FUSED=1): halves of the query tiles per program. Off by default.
+LNC_SPLIT_KERNELS = ("moe_prefill", "moe_dedupe", "delta_rule", "dsa_topk", "moe_ep", "kda_decode", "dsa_decode",
+                     "dsa_fused")
 LNC_SPLIT_DEFAULT = "delta_rule,dsa_topk"
+# At LNC=2 (trn2) the default adds the decode splits measured there (feat/trn2-fast, 2026-10-05, trn2.48xlarge, decode-only step at
+# 16 / 32 / 64 rows per DP group 110.7 / 154.8 / 264.2 -> 87.7 / 110.7 / 180.7 ms with moe_dedupe + kda_decode + dsa_decode on
+# the decode kernels; decode-path gate 28 / 32 equal, signed dlogprob +0.00020). Keyed on the runtime's LNC so that trn1, where
+# moe_dedupe's split argument is part of its graph key, traces exactly as before.
+# dsa_fused since 2026-10-06 (kernels/dsa_fused.py FUSED_FAMILIES: +3.2-3.7% per engine, the wikitext and check_mixed gates there).
+LNC_SPLIT_DEFAULT_LNC2 = "delta_rule,dsa_topk,moe_dedupe,kda_decode,dsa_decode,dsa_fused"
 
 
 def lnc_split(kernel: str) -> bool:
-    v = os.environ.get("KILN_LNC_SPLIT", LNC_SPLIT_DEFAULT)
+    v = os.environ.get("KILN_LNC_SPLIT", LNC_SPLIT_DEFAULT_LNC2 if _LNC == 2 else LNC_SPLIT_DEFAULT)
     if v in ("all", "1"):
         return True
     if v in ("0", "none", ""):
@@ -158,14 +170,29 @@ def nki_grid() -> int:
     return _LNC
 
 
+# Families on which the runtime's HARDWARE per-execution barrier replaces its default one
+# (NEURON_RT_ENABLE_HW_EXECUTION_BARRIER=1, a string in libnrt.so.1 of aws-neuronx-runtime-lib 2.34.10, SDK
+# 2.32; runtime 2.27 release notes: NEFF start overhead "up to 50%" lower "with an on-device hardware barrier
+# between ranks"). Measured on trn1.32xlarge at 32 ranks (docs/neuron-notes.md "Upstream harvest (2026-10)"): a
+# graph holding one cross-chip all-reduce 5.07 -> 2.80 ms per chained launch, GLM-5.3-Flash G64 156.1 -> 159.2 and
+# F0 133.8 -> 137.7 out tok/s, and it keeps the barrier's ordering (the race stress that deadlocks with the barrier
+# off passes: 0 mismatches in 3000 launches). Removing the barrier instead (NEURON_RT_DISABLE_EXECUTION_BARRIER=1)
+# gives the same throughput and is unsafe (silently wrong collectives on a mismatch, deadlocks). Other families
+# keep the runtime default until measured there. NEURON_RT_ENABLE_HW_EXECUTION_BARRIER=0 restores it.
+HW_BARRIER_FAMILIES = ("trn1",)
+
+
 def configure_runtime_env() -> None:
     """Call before libtorch_neuronx_lite is imported. On trn2 / trn3 sets
     NEURON_LOGICAL_NC_CONFIG explicitly (the same value neuronx_cc_args passes to the
-    compiler); elsewhere sets nothing."""
+    compiler); on HW_BARRIER_FAMILIES the runtime's hardware execution barrier, unless the
+    environment already chose; elsewhere sets nothing."""
     global _LNC
     t = target()
     if t is not None and family_of(t) in LNC_FAMILIES:
         os.environ["NEURON_LOGICAL_NC_CONFIG"] = str(lnc(family_of(t)))
+    if t is not None and family_of(t) in HW_BARRIER_FAMILIES:
+        os.environ.setdefault("NEURON_RT_ENABLE_HW_EXECUTION_BARRIER", "1")
     _LNC = lnc(family_of(t)) if t is not None else 1
 
 

@@ -401,6 +401,7 @@ def test_dsa_decode_kernel_path_matches(sparse, monkeypatch):
     path, hf = sparse
     ps = prompts(2, (37, 70, 9))
     p = SamplingParams(max_new_tokens=12, ignore_eos=True, logprobs=0)
+    monkeypatch.setattr(dsa_decode, "KERNEL", "xla")  # the mask path, whatever the host's default
     base = engine(path, max_prefill_tokens=16).generate(ps, p)
     calls = []
     real = dsa_decode.attend
@@ -412,6 +413,91 @@ def test_dsa_decode_kernel_path_matches(sparse, monkeypatch):
     for a, b in zip(got, base):
         assert torch.allclose(torch.tensor([x[0] for x in a.logprobs]), torch.tensor([x[0] for x in b.logprobs]),
                               rtol=0, atol=1e-5)
+
+
+def test_dsa_prefill_kernel_path_matches(sparse, monkeypatch):
+    """KILN_DSA_PREFILL_KERNEL=nki: a sparse prefill chunk of the pooled DSA layers runs kernels/dsa_prefill.py (its
+    emulation on the host) over the latent with the selection and visibility as its mask, instead of _core's expand
+    form: the same tokens and logprobs (fp32, so only the order of the sums differs) for prompts cut into chunks of
+    128 over page buckets of 128-key multiples."""
+    from kiln.engine.request import SamplingParams
+    from kiln.kernels import dsa_prefill
+
+    from kiln.kernels import dsa_fused
+
+    path, hf = sparse
+    ps = prompts(5, (300, 140, 129))
+    p = SamplingParams(max_new_tokens=6, ignore_eos=True, logprobs=0)
+    kw = dict(max_prefill_tokens=128, prefill_token_buckets=(128,), page_size=32, num_pages=64, max_model_len=512,
+              page_buckets=(4, 8, 12, 16))
+    monkeypatch.setattr(dsa_fused, "FUSED", False)  # on by default on a trn1 host; it would take these chunks first
+    monkeypatch.setattr(dsa_prefill, "KERNEL", "xla")
+    base = engine(path, **kw).generate(ps, p)
+    calls = []
+    real = dsa_prefill.attend
+    monkeypatch.setattr(dsa_prefill, "KERNEL", "nki")
+    monkeypatch.setattr(dsa_prefill, "attend", lambda *a, **k: calls.append((tuple(a[0].shape), tuple(a[1].shape)))
+                        or real(*a, **k))
+    got = engine(path, **kw).generate(ps, p)
+    assert calls and all(q[0] == 128 and kc[0] % 128 == 0 for q, kc in calls)  # the kernel path ran (128-row chunks)
+    assert [r.output_ids for r in got] == [r.output_ids for r in base]
+    for a, b in zip(got, base):
+        assert torch.allclose(torch.tensor([x[0] for x in a.logprobs]), torch.tensor([x[0] for x in b.logprobs]),
+                              rtol=0, atol=1e-5)
+
+
+def test_dsa_prefill_kernel_path_after_a_prefix_hit(sparse, monkeypatch):
+    """The prefill kernel path on a chunk that resumes from the prefix cache off the 128-token grid (a shared system
+    prompt of 170 tokens: the second request leaves a checkpoint at the junction, page 5 = token 160, and the third
+    resumes there, so its first chunk starts at position 160): the same tokens and logprobs as the mask path."""
+    from kiln.engine.request import SamplingParams
+    from kiln.kernels import dsa_prefill
+
+    path, _ = sparse
+    (system,) = prompts(6, (170,))
+    ps = [system + u for u in prompts(7, (40, 70, 55))]
+    p = SamplingParams(max_new_tokens=6, ignore_eos=True, logprobs=0)
+    kw = dict(max_prefill_tokens=128, prefill_token_buckets=(128,), page_size=32, num_pages=64, max_model_len=512,
+              page_buckets=(4, 8, 12, 16), state_track_interval=8)
+
+    def run(e):
+        return [e.generate([x], p)[0] for x in ps]  # one after the other: the second resumes from the first's prefix
+
+    from kiln.kernels import dsa_fused
+
+    monkeypatch.setattr(dsa_fused, "FUSED", False)
+    monkeypatch.setattr(dsa_prefill, "KERNEL", "xla")
+    base = run(engine(path, **kw))
+    monkeypatch.setattr(dsa_prefill, "KERNEL", "nki")
+    got = run(engine(path, **kw))
+    hit = got[2].num_cached_tokens
+    assert hit == base[2].num_cached_tokens == 160
+    assert [r.output_ids for r in got] == [r.output_ids for r in base]
+    for a, b in zip(got, base):
+        assert torch.allclose(torch.tensor([x[0] for x in a.logprobs]), torch.tensor([x[0] for x in b.logprobs]),
+                              rtol=0, atol=1e-5)
+
+
+def test_dsa_prefill_emulation_is_the_masked_softmax():
+    """kernels/dsa_prefill.emulate is softmax attention over the latent under the additive mask, absorbed: the expand
+    form's values (q_nope . W_UK c) to fp32 rounding, every attended-key pattern including a row whose keys sit in one
+    block."""
+    from kiln.kernels import dsa_prefill as dp
+
+    g = torch.Generator().manual_seed(3)
+    C, H, R, DN, L = 256, 2, 512, 64, 640
+    kc = torch.randn(L, R, generator=g)
+    qn = torch.randn(C, H, DN, generator=g) * 0.2
+    wk = torch.randn(H, DN, R, generator=g) * DN ** -0.5
+    mask = torch.where(torch.rand(C, L, generator=g) < 0.3, 0.0, dp.NEG_INF)
+    mask[0] = dp.NEG_INF
+    mask[0, 600:604] = 0.0  # one row attends four keys of the last block only
+    q_lat = torch.einsum("chd,hdr->chr", qn, wk)
+    got = dp.emulate(q_lat, kc, mask, 0.125)
+    k_nope = torch.einsum("lr,hdr->lhd", kc, wk)
+    p = torch.softmax(torch.einsum("chd,lhd->hcl", qn, k_nope) * 0.125 + mask.unsqueeze(0), dim=-1)
+    want = torch.einsum("hcl,lr->chr", p, kc)
+    assert torch.allclose(got, want, rtol=0, atol=1e-4 * want.abs().max())
 
 
 @pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")
@@ -442,3 +528,154 @@ def test_dsa_decode_simulator_matches_emulation(monkeypatch):
         q_lat=q_lat, kc=kc4, rows_t=rows_t, bias_t=bias_t, identb=torch.eye(128).to(torch.bfloat16),
         scale=256 ** -0.5, fp8=0, rev=dd.REV)).float()
     assert ((got - want).abs().max() / want.abs().max()).item() < 5e-3  # p rounded before / after normalising
+
+
+def test_dsa_prefill_loop_args_count_visible_pairs():
+    """kernels/dsa_prefill.loop_args: per pass of QPASS query tiles, the number of 1024-key pairs holding a key at or
+    before the pass's last position (by comparisons, no integer division), capped at the bucket's full pairs; tab
+    holds each pair's first key and latent element."""
+    from kiln.kernels import dsa_prefill as dp
+
+    C, L, R = 1024, 8448, 512
+    for off in (0, 1000, 1023, 1024, 3072, 7424):
+        pos = torch.arange(C) + off
+        npair, tab = dp.loop_args(pos, C, L, R)
+        npass = C // 128 // dp.QPASS
+        last = pos.view(npass, -1).amax(-1)
+        assert npair.tolist() == [[min(int(x) // 1024 + 1, L // 1024) for x in last]]
+    assert tab.tolist() == [[1024 * i, 1024 * i * R] for i in range(L // 1024)]
+
+
+def test_dsa_fused_kernel_path_matches(sparse, monkeypatch):
+    """KILN_DSA_FUSED=1: a sparse prefill chunk's indexer scores, selection and attention in one kernel
+    (kernels/dsa_fused.py, its emulation on the host: dsa_topk's score and selection emulations, the visibility, then
+    dsa_prefill's attention) instead of pooled_selection + the scratch + _core: the same tokens and logprobs, on the
+    128-token chunks and a prefix hit at 160."""
+    from kiln.engine.request import SamplingParams
+    from kiln.kernels import dsa_fused
+
+    path, _ = sparse
+    (system,) = prompts(6, (170,))
+    ps = [system + u for u in prompts(7, (40, 70, 55))] + prompts(5, (300,))
+    p = SamplingParams(max_new_tokens=6, ignore_eos=True, logprobs=0)
+    kw = dict(max_prefill_tokens=128, prefill_token_buckets=(128,), page_size=32, num_pages=64, max_model_len=512,
+              page_buckets=(4, 8, 12, 16), state_track_interval=8)
+
+    def run(e):
+        return [e.generate([x], p)[0] for x in ps]
+
+    monkeypatch.setattr(dsa_fused, "FUSED", False)
+    base = run(engine(path, **kw))
+    calls = []
+    real = dsa_fused.attend
+    monkeypatch.setattr(dsa_fused, "FUSED", True)
+    monkeypatch.setattr(dsa_fused, "attend", lambda *a, **k: calls.append(tuple(a[0].shape)) or real(*a, **k))
+    got = run(engine(path, **kw))
+    assert calls and got[2].num_cached_tokens == 160
+    assert [r.output_ids for r in got] == [r.output_ids for r in base]
+    for a, b in zip(got, base):
+        assert torch.allclose(torch.tensor([x[0] for x in a.logprobs]), torch.tensor([x[0] for x in b.logprobs]),
+                              rtol=0, atol=1e-5)
+
+
+def test_decode_kernel_defaults_are_trn1_and_trn2(monkeypatch):
+    """KILN_KDA_DECODE_KERNEL / KILN_DSA_DECODE_KERNEL / KILN_DECODE_SP unset: the decode kernels and the
+    sequence-parallel decode streams on trn1 and trn2, where they were measured, off on inf2 and on a host without a
+    Neuron device; each variable wins either way."""
+    from kiln.kernels import dsa_decode, kda_decode
+    from kiln.models.decoder import decode_sp_enabled
+
+    monkeypatch.delenv("KILN_DECODE_SP", raising=False)
+    for target, want in (("trn1", "nki"), ("trn2", "nki"), ("inf2", "xla")):
+        monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", target)
+        assert kda_decode._default_kernel() == want, target
+        assert dsa_decode._default_kernel() == want, target
+        assert decode_sp_enabled() == (want == "nki"), target
+    monkeypatch.setenv("KILN_DECODE_SP", "0")
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn1")
+    assert not decode_sp_enabled()
+
+
+def test_dsa_fused_default_is_trn1_and_trn2(monkeypatch):
+    """KILN_DSA_FUSED unset: the fused kernel on trn1 and trn2, where it was measured, off on inf2 and on a host without
+    a Neuron device; the variable wins either way."""
+    from kiln.kernels import dsa_fused as df
+
+    monkeypatch.delenv("KILN_DSA_FUSED", raising=False)
+    for target, want in (("trn1", "1"), ("trn2", "1"), ("inf2", "0")):
+        monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", target)
+        assert df._default_fused() == want, target
+
+
+def test_sp_gather_default_is_trn1_only(monkeypatch):
+    """KILN_SP_GATHER unset: the world row gather as an NKI kernel's all_gather on trn1, where it was measured (G64
+    156.1 -> 164.7 out tok/s), the zero-padded all-reduce on trn2 / inf2 and on a host without a Neuron device."""
+    from kiln.kernels import sp_gather
+
+    monkeypatch.delenv("KILN_SP_GATHER", raising=False)
+    for target, want in (("trn1", "nki"), ("trn2", "xla"), ("inf2", "xla")):
+        monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", target)
+        assert sp_gather._default_mode() == want, target
+
+
+def test_sp_gather_kernel_needs_expert_parallel_experts():
+    """The NKI world row gather (kernels/sp_gather.py) is for models whose routed experts are expert-parallel or that have
+    none: with tensor-parallel experts neuronx-cc 2.27 fails the prefill pieces (NCC_ISCH719), so they keep the
+    zero-padded all-reduce (DecoderForCausalLM._sp_gather_kernel_ok)."""
+    from types import SimpleNamespace
+
+    from kiln.models.decoder import DecoderForCausalLM
+
+    def ok(moe_ep, experts):
+        return DecoderForCausalLM._sp_gather_kernel_ok(SimpleNamespace(moe_ep=moe_ep, cfg=SimpleNamespace(
+            num_experts=experts)))
+
+    assert ok(True, 288) and ok(False, 0) and ok(False, None)
+    assert not ok(False, 288)
+
+
+def test_dsa_prefill_kernel_default_is_trn1_and_trn2(monkeypatch):
+    """KILN_DSA_PREFILL_KERNEL unset: the kernel on trn1 and trn2 (where the fused kernel that needs it was measured), XLA
+    on inf2 and on a host without a Neuron device; the variable wins either way."""
+    from kiln.kernels import dsa_prefill as dp
+
+    monkeypatch.delenv("KILN_DSA_PREFILL_KERNEL", raising=False)
+    for target, want in (("trn1", "nki"), ("trn2", "nki"), ("inf2", "xla")):
+        monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", target)
+        assert dp._default_kernel() == want, target
+
+
+def test_prefix_counts_matmul_form_is_exact(monkeypatch):
+    """KILN_DSA_PREFIX=mm: decode_slots' inclusive count of selected pools as two triangular matmuls equals torch.cumsum
+    bit for bit on 0 / 1 rows (2112 pools as at the G1 bucket, a P not divisible by 8, and one past MM_GROUPS groups,
+    which falls back to cumsum)."""
+    from kiln.models import glm5_next
+
+    g = torch.Generator().manual_seed(0)
+    for P in (2112, 2110, 8 * (glm5_next.MM_GROUPS + 1)):
+        s01 = (torch.rand(3, P, generator=g) < 0.25).float()
+        s01[1] = 0.0
+        s01[2] = 1.0
+        want = s01.cumsum(-1)
+        monkeypatch.setattr(glm5_next, "PREFIX", "mm")
+        assert torch.equal(glm5_next.prefix_counts(s01), want), P
+        monkeypatch.setattr(glm5_next, "PREFIX", "xla")
+        assert torch.equal(glm5_next.prefix_counts(s01), want), P
+
+
+def test_dsa_decode_kernel_path_prefix_mm(sparse, monkeypatch):
+    """The decode-kernel path through decode_slots with KILN_DSA_PREFIX=mm gives the cumsum form's tokens and logprobs."""
+    from kiln.engine.request import SamplingParams
+    from kiln.kernels import dsa_decode
+    from kiln.models import glm5_next
+
+    path, hf = sparse
+    ps = prompts(2, (37, 70, 9))
+    p = SamplingParams(max_new_tokens=12, ignore_eos=True, logprobs=0)
+    monkeypatch.setattr(dsa_decode, "KERNEL", "nki")
+    base = engine(path, max_prefill_tokens=16).generate(ps, p)
+    monkeypatch.setattr(glm5_next, "PREFIX", "mm")
+    got = engine(path, max_prefill_tokens=16).generate(ps, p)
+    assert [r.output_ids for r in got] == [r.output_ids for r in base]
+    for a, b in zip(got, base):
+        assert torch.equal(torch.tensor([x[0] for x in a.logprobs]), torch.tensor([x[0] for x in b.logprobs]))

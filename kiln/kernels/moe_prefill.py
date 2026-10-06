@@ -256,7 +256,7 @@ if nki is not None:
     @nki.jit
     def kiln_moe_prefill_kernel(x, topi, wts, blob, dsc, dfr, fold_g, fold_u, B: int, NB: int, act: int,
                                 lim: float, dq: int, pc: int, asp: int, skp: int, ord_: int, nyb: int, rev: int,
-                                spl: int = 1, inb: int = 0, nsx: int = 0, bng: int = 0):
+                                spl: int = 1, inb: int = 0, nsx: int = 0, bng: int = 0, dge: int = 0):
         """x bf16 [C, H]; topi int32 [C, K] the experts of each token and wts bf16 [C, K] their routing
         weights; blob uint8 [E, 128, F] (moe_dedupe tiles layout, fp32 or bf16 tile scales); dsc fp32
         [E, CT] and dfr bf16 [E, H]: the down scales as s[h] = dsc[chunk] * dfr[h] (down_factors; dfr
@@ -300,6 +300,11 @@ if nki is not None:
         # npg = 1 and every step is the single-core kernel's.
         # spl 0 (KILN_LNC_SPLIT): both programs do all of the work, as before the split.
         npg, pid = (nl.num_programs(axes=0), nl.program_id(axis=0)) if spl and nl.program_ndim() != 0 else (1, 0)
+        # dge 1 (KILN_MOE_PREFILL_DGE=sw, experiment): every dynamic DMA (vector_offset gathers / scatters,
+        # scalar_offset expert loads) on software DGE, where neuronx-cc otherwise picks the mode; trn2 has hardware DGE
+        # on the sync and scalar engines ("Hardware based DGE is only supported for NeuronCore-v3 or newer",
+        # nki/isa dma_copy), and the split's out-of-bound notification came from an SP-engine instruction
+        DG = nisa.dge_mode.swdge if dge else nisa.dge_mode.unknown
         if npg > 1 and inb:  # KILN_MOE_PREFILL_INBAR (experiment): both programs at the kernel's start before either
             # reads its inputs (an input written by XLA ops on the other physical core)
             nisa.core_barrier(data=topi, cores=(0, 1))
@@ -486,7 +491,7 @@ if nki is not None:
                 nisa.dma_copy(dst=tos.ap(pattern=[[1, 128], [1, 1]], offset=0,
                                          vector_offset=tp.ap(pattern=[[NT * K, 128], [1, 1]], offset=t * K + j),
                                          indirect_dim=0),
-                              src=tid[:, t:t + 1])
+                              src=tid[:, t:t + 1], dge_mode=DG)
         ts = nl.ndarray((128, NTL), dtype=i32, buffer=nl.sbuf)
         nisa.dma_copy(dst=ts, src=tos.ap(pattern=[[NTL, 128], [1, NTL]], offset=0))
 
@@ -572,7 +577,7 @@ if nki is not None:
                  o_sd=o_sd, CT=CT, x=x, H=H, xr=xr, ts=ts, PC=PC, scr=scr, frr=frr, dsc=dsc, dfr=dfr, B=B, f32=f32,
                  bf16=bf16, fp8=fp8, MX=MX, NR=NR, NCH=NCH, DW=DW, r1=r1, r2=r2, r3=r3, r5=r5, ar=ar,
                  xtr=xtr, wqr=wqr, fg=fg, fu=fu, act=act, lim=lim, selg=selg if PC else None, asp=asp, dq=dq, Y=Y,
-                 bfirst=ord_ == 1, ybr=ybr)
+                 bfirst=ord_ == 1, ybr=ybr, DG=DG)
         T1 = NTL - skp * ((NTL - (NTL + 1) // 2) // skp) if skp > 0 else NTL  # tiles that always run
         # This program's share of the tiles that always run: all of them (one program), else the first or
         # the second half (every tile costs the same, empty ones included).
@@ -631,7 +636,7 @@ if nki is not None:
                 yj = nl.ndarray((128, H), dtype=bf16, buffer=nl.sbuf)
                 nisa.dma_copy(dst=yj, src=Y.ap(pattern=[[H, 128], [1, H]], offset=0,
                                                vector_offset=st.ap(pattern=[[NT * K, 128], [1, 1]], offset=t * K + j),
-                                               indirect_dim=0))
+                                               indirect_dim=0), dge_mode=DG)
                 yk.append(yj)
                 dj = nl.ndarray((128, 128), dtype=bf16, buffer=nl.sbuf)
                 nisa.tensor_scalar(dst=dj, data=ident, op0=nl.multiply, operand0=wv[:, j:j + 1],
@@ -755,20 +760,21 @@ if nki is not None:
         asp = S["asp"]
         dq = S["dq"]
         Y = S["Y"]
+        DG = S["DG"]
         if lo <= i + PF < hi:  # loads of tile i + PF
             tl = i + PF
             for g in range(G):
                 e = be.ap(pattern=[[NB, 1], [1, 1]], offset=tl * G + g)
                 nisa.dma_copy(dst=wr[tl % NW][g], src=blob.ap(pattern=[[F, 128], [1, F]], offset=0,
                                                                scalar_offset=e, indirect_dim=0),
-                              oob_mode=oob_mode.skip)
+                              oob_mode=oob_mode.skip, dge_mode=DG)
                 if dq:  # rows 0 (gate) and 64 (up) of the tile scales, broadcast to every partition
                     nisa.dma_copy(dst=tbr[tl % NX][g], src=blob.ap(pattern=[[0, 128], [64 * F, 2], [1, CT * 4]],
                                                                    offset=o_sg, scalar_offset=e, indirect_dim=0),
-                                  oob_mode=oob_mode.skip)
+                                  oob_mode=oob_mode.skip, dge_mode=DG)
             nisa.dma_copy(dst=xr[tl % NX], src=x.ap(pattern=[[H, 128], [1, H]], offset=0,
                                                    vector_offset=ts.ap(pattern=[[NTL, 128], [1, 1]], offset=tl),
-                                                   indirect_dim=0), oob_mode=oob_mode.skip)
+                                                   indirect_dim=0), oob_mode=oob_mode.skip, dge_mode=DG)
         if i < lo:
             return
         if PC and lo <= i - 2 < hi:  # tile i - 2's down scales (stage C next step)
@@ -776,10 +782,10 @@ if nki is not None:
                 e = be.ap(pattern=[[NB, 1], [1, 1]], offset=(i - 2) * G + g)
                 nisa.dma_copy(dst=scr[(i - 2) % 2][g * B:(g + 1) * B, :],
                               src=dsc.ap(pattern=[[0, B], [1, CT]], offset=0, scalar_offset=e, indirect_dim=0),
-                              oob_mode=oob_mode.skip)
+                              oob_mode=oob_mode.skip, dge_mode=DG)
                 nisa.dma_copy(dst=frr[(i - 2) % 2][g:g + 1, :],
                               src=dfr.ap(pattern=[[H, 1], [1, H]], offset=0, scalar_offset=e, indirect_dim=0),
-                              oob_mode=oob_mode.skip)
+                              oob_mode=oob_mode.skip, dge_mode=DG)
         ta, tb, tf, tc = i, i - 1, i - 2, i - 3
         doA, doB, doF, doC = i < hi, lo <= tb < hi, lo <= tf < hi, lo <= tc < hi
         yb = None
@@ -965,6 +971,8 @@ NOSKIPX = int(os.environ.get("KILN_MOE_PREFILL_NOSKIPX", "0"))
 # KILN_MOE_PREFILL_BARENG (experiment): the engine of the split's core barriers, 0 GpSimd (default), 1 sync, 2 vector.
 BARENG = int(os.environ.get("KILN_MOE_PREFILL_BARENG", "0"))
 NYB = int(os.environ.get("KILN_MOE_PREFILL_NYB", "3"))
+# KILN_MOE_PREFILL_DGE=sw (experiment, kernel argument dge): every dynamic DMA of the kernel on software DGE.
+DGE = os.environ.get("KILN_MOE_PREFILL_DGE", "")
 
 
 def _platform():
@@ -999,7 +1007,8 @@ def kernel_inputs(x, topv, topi, blob, act: int = 0, limit: float = 0.0, B: int 
                 fold_g=fold_g, fold_u=fold_u, B=B, NB=n_blocks(C * K, E, B), act=act, lim=float(limit), dq=int(dq),
                 pc=pc, asp=(ACT_SPLIT if asp is None else asp) if dq else 0, skp=SKIP if skp is None else skp,
                 ord_=ORDER if order is None else order, nyb=NYB if nyb is None else nyb, rev=REV,
-                spl=int(_platform().lnc_split("moe_prefill")), inb=INBAR, nsx=NOSKIPX, bng=BARENG)
+                spl=int(_platform().lnc_split("moe_prefill")), inb=INBAR, nsx=NOSKIPX, bng=BARENG,
+                **({"dge": 1} if DGE == "sw" else {}))
 
 
 def emulate(x, topv, topi, blob, act: int = 0, limit: float = 0.0, dq: bool = False) -> torch.Tensor:

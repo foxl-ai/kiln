@@ -124,14 +124,27 @@ def main() -> None:
     ap.add_argument("--tensors-gb", type=float, required=True, help="tools/tensor_bytes.py total_gb (1e9 bytes)")
     a = ap.parse_args()
     with open(a.keys_file) as f:
-        keys = list(json.load(f))
+        kmap = json.load(f)
+    keys = list(kmap)
     graphs = []
     for k in keys:
         g = graph(f"{a.cache.rstrip('/')}/{k}")
         graphs.append(g)
         print(json.dumps({**g, "code_mib": round(g["code"] / 2**20, 2), "rings_mib": round(g["rings"] / 2**20, 2)}),
               flush=True)
-    print(json.dumps({"summary": True, **estimate(graphs, a.tensors_gb * 1e9)}), flush=True)
+    # A capture's keys.json maps each key to the captured ranks that run it. Under DP attention every group's ranks
+    # have graphs of their own (their expert placement differs), so the sum over the file is several ranks' graphs:
+    # G64-EPLB-P8K came to 20.9 GiB summed and 15.8 per rank, and it loads. Estimate each captured rank on its own
+    # graphs and report the worst.
+    ranks = sorted({r for v in kmap.values() for r in v}) if isinstance(kmap, dict) and all(
+        isinstance(v, list) for v in kmap.values()) else []
+    if not ranks:
+        print(json.dumps({"summary": True, **estimate(graphs, a.tensors_gb * 1e9)}), flush=True)
+        return
+    per = {r: estimate([g for g in graphs if r in kmap[g["key"]]], a.tensors_gb * 1e9) for r in ranks}
+    worst = max(ranks, key=lambda r: per[r]["total_gib"])
+    print(json.dumps({"summary": True, "rank": worst, **per[worst],
+                      "per_rank_total_gib": {str(r): per[r]["total_gib"] for r in ranks}}), flush=True)
 
 
 if __name__ == "__main__":

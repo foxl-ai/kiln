@@ -119,6 +119,13 @@ f64 tensor; the python float literals in the comparisons were the only candidate
 computation written with multiplies, adds and `torch.floor` only compiled and was bit-exact
 (`tools/debug_device.py mxfp4`). Multiplying by a float literal is fine everywhere else in the model.
 
+Seen again 2026-10-05 (compile farm q/amtp-9692e97, neuronx-cc 2.27.5334): all seven shapes of the asynchronous-MTP
+board graphs (engine/spec_async.py) failed with NCC_ESPP004. One of them, mtp_post, has nothing else a literal could
+enter: an index_select, `valid > 0.5`, slices, ones_like, a cat, a torch.where of two tensors and an index_put_.
+Comparing the 0 / 1 flags against the integer 0 and writing `torch.where(c, x, torch.zeros_like(x))` instead of a
+float scalar compiled all seven. The sampler's `temperature <= 0` and `g > 0` have always compiled. So a comparison
+against an integer literal is fine, and the float literal is what lowers to f64.
+
 ## Integer division by a constant is inexact in a graph (2026-10-03, SDK 2.32, trn1.32xlarge)
 
 `x // c` on int64 graph values is computed through an fp32 reciprocal: `tools/probe_gqa_moe.py
@@ -415,6 +422,9 @@ matters is the chips crossed: inside the same 32-rank world an all-reduce over r
 chip) is 0.15 ms and over ranks 0-7 (4 chips) 2.55 ms. Consequence: on multi-chip
 TP the decode step must be FEW graphs (NxDI compiles one per step); one graph per layer costs
 48 x 5 ms here, which is the gap to the 55 ms that two ranks measure.
+(2026-10-05: the fixed cost is the runtime's per-execution barrier, which none of the knobs above touches;
+`NEURON_RT_ENABLE_HW_EXECUTION_BARRIER=1` halves it and is now the trn1 default, and turning the barrier off is unsafe.
+"Upstream harvest (2026-10)" at the end of this file.)
 
 ## Decode MoE as one NKI kernel: MoE layers can share graphs again (2026-10-03, SDK 2.32, trn1.2xlarge)
 
@@ -1913,6 +1923,16 @@ tools/hbm_estimate.py counts the instance runs at 32 B x the queue's num_queues 
 bound that fits the 2048-row group (2.92 against 2.67 GiB) and overestimates the 1024-row ones, so a
 configuration whose estimate is over 16 GiB only because of instance rings needs a device run. Prefill
 8192 at 2048 rows per group, with three such groups (~8 GiB of rings), does not fit trn1.
+
+A tighter bound for the EP + SP_GROUP serving layout (engine-v0 e449b98, 2026-10-05). G64-DB4 (the
+final G64 config with `--decode-buckets 4,8,12,16`) loaded and served on kiln-ut-32 (125.8 out tok/s,
+the utilization agent's run). Per rank, tools/hbm_estimate.py over its own attention group's graphs
+gives tensors 13.341 + code 0.629 + scratchpad 0.312 + fixed 0.13 = 14.41 GiB, plus 11,537,328
+instance runs (EP decode groups and 1024-row prefill groups). Fitting in 16 GiB means those runs cost
+at most 1.59 GiB, i.e. **<= ~148 B per instance run** on this layout, against the estimator's 512 B
+and the ~469 B the 2048-row group needed. So at 1024 rows and in the decode groups, an instance run
+costs under a third of the bound. Rank the deltas of two such configs with the estimator; do not
+compare its absolute totals with 16 GiB.
 
 ## Where a GLM-5.3-Flash prefill step goes on trn1 (2026-10-04, sweep shapes)
 
@@ -3449,7 +3469,8 @@ test_mixed_batch.py 273 passed, 8 skipped (logs s3 logs/kiln-ep-ci/ep-suite4.log
 (the plan builds two pass tables and the kernel runs two device loops; every expert on one rank at 1024 rows 20.9 ->
 11.4 ms; outputs unchanged). Not available: GpSimd as a second dequantization engine (a tensor_tensor with an fp8 operand
 on GpSimd fails neuronx-cc, NCC_IXCG965 "Instruction engine check failed (Pool)", `tools/probe_ep_prims.py --engines`), so
-the vector engine bounds a pass.
+the vector engine bounds a pass (of the per-row form; the tile-scale form below is tensor-engine-bound, see the 2026-10-05
+correction after "Where the busiest rank's 8 ms went").
 
 ## The token mixers' collectives inside their attention group, and the routing gather that stayed separate (2026-10-04, SDK 2.32, trn1.32xlarge)
 
@@ -3509,6 +3530,18 @@ waiting 5.2 ms; the per-row form's 384 scale-broadcast matmuls per pass also tie
 The tensor engine itself (`tools/probe_ep_prims.py --pe`, 768 chained matmuls): 0.39-0.48 ns per moving column at
 every width, i.e. ~2.45 G columns/s, the same for bf16 and fp8 operands; `--pe-shape`: against 16 moving lanes a matmul
 costs 30 ns (the stationary load hidden), a [128, 16] stationary against 512 columns 215 ns.
+
+**Correction (2026-10-05): the tile-scale kernel is tensor-engine-bound, not vector-bound, and "busy" above was a sum of
+overlapping durations.** tools/prof_engines.py adds up each instruction's `duration`, and an engine's instructions overlap
+in the profile (a matmul's record spans its pipeline latency; consecutive vector ops overlap too), so its "busy" can exceed
+the wall time (the tensor engine read 11.3 ms busy over a 5.4 ms kernel). The right reading is the UNION of an engine's
+instruction intervals, which tools/prof_ops.py (new) prints. Re-measured on the default tile-scale form (kiln-mk-k1,
+trn1.2xlarge, SDK 2.32, nki 0.6.0, engine-v0 e449b98 kernel, layer 20's busiest rank of the real routers on random tokens,
+`tools/probe_moe_ep.py full --fit block --chunks 4096 --routing-file ep_routing.pt --layer 20 --rank -1 --save-inputs ...`,
+then `tools/prof_engines.py <hash> <inputs>` and `tools/prof_ops.py <hash>`): the tensor engine is busy 83% of the 5.40
+ms window and 85-89% inside every pass, the vector engine 62% (the fp8 dequantization, 13824 TENSOR_SCALAR at 279 ns mean),
+the scalar engine 54%, DMA active 66%. The figures "vector 5.09 ms busy (dequant 4.15), scalar 4.03 ms" quoted for this
+kernel were the overlapping sums. Details and what follows from it: "MoE kernels against their floors" below.
 
 **The tile-scale form** (feat/moe-ep edc04c1, KILN_MOE_EP_FIT=block, KILN_MOE_EP_TILES=1, both default). The EP loader
 fits GLM-5.3-Flash's 128 x 128-block FP8 per block (fit_e4m3_max row_group 128: a block with a code past 240 is
@@ -4296,6 +4329,320 @@ So a prefill MoE layer costs ~20.7 ms, of which the NKI kernels are ~8 (MoE, 7.6
 DSA attention core, the SP gathers / reduce-scatters and the mixer all-reduce). At conc 128 per engine (64 in flight, 16
 per group) a request is 2 prefill steps (~1.86 s) and 256 / 64 x 158 ms = 0.63 s of decode: prefill ~75% of the device.
 
+## trn2 on engine-v0 70ddc1b: baseline, the trn1 ports, decode kernels, expert parallelism at LNC=2 (2026-10-05, SDK 2.32, trn2.48xlarge Capacity Block)
+
+kiln-t2-cb: trn2.48xlarge on EC2 Capacity Block cr-00ff977628a81fb28 (ap-south-2b, 2026-10-05 15:44 to 2026-10-06 11:30
+UTC, $706.87 prepaid = $37.20/h; spot was refused in us-east-2a/b/c and on-demand in all three at 15:10 UTC), Kiln's DLAMI
+copy ami-0cff1ca7a18e21334 (SDK 2.32), LNC=2 (64 logical cores of 24 GiB). GLM-5.3-Flash@eb9eb208 on the instance-store
+RAID0 (`hf download --max-workers 48`: 306 GB in 83 s). Every graph from the compile farm (kiln-t2-cf / kiln-t2-cf2,
+c8i.48xlarge spot in us-east-2, queues s3://<your-bucket>/compile-farm/q/t2f-*, cache compile-cache/trn2-sdk2.32/lnl/),
+`NEURON_LIBTORCH_ASSERT_CACHE_HIT=1`, 0 device compiles. Logs and their `.log.cmd` (exact env and command):
+s3://<your-bucket>/logs/kiln-t2-cb/. Prices: trn2 spot $15.343/h (us-east-2c, read 15:10 UTC), half a box $7.67.
+
+**Summary (2026-10-06 03:00 UTC, feat/trn2-fast c08c5ba = engine-v0 f997d35 merged; every number below is measured further down):**
+- trn2 defaults now (all gated on real weights, trn1 keys either unchanged or recompiled in q/t1-trn2fast-2e9ea5b-G64 with
+  identical NEFF instruction streams): the KDA / DSA decode kernels, SP decode streams, SP_GROUP, the fused DSA prefill kernel, and
+  at LNC=2 the work split over both physical cores for delta_rule, dsa_topk, moe_dedupe, kda_decode, dsa_decode and dsa_fused.
+- G1 whole box (8192 in / 256 out): engine-v0 70ddc1b 192.0 out tok/s at conc 128 ($22.20 per 1M out at spot) -> 221.6 with best1
+  ($19.23) -> the new defaults (best1F, below). 8192-row prefill calls add ~10% on one engine.
+- Prefill is the trn2 problem: 8.8k prefill tok/s per box at 4096-row calls, 9.9k at 8192 (trn1: 8.7k, 10.2k with EPLB; parity of
+  BF16 efficiency would be ~35k). Per call: MoE blocks 52% (TP slices of 64 columns per expert keep the tensor engine busy at a low
+  rate), token mixers 38% (latency-bound, every engine ~20% busy), 101 GB of spill traffic per rank.
+- Decode is trn2's strength per box but not per dollar at 8K: with real KV, ST + v9 on D2K2 decodes 384 rows per engine in 217.5 ms
+  (3,531 out tok/s per box, $1.21 per 1M out at spot; trn1's decode box $0.89); 96 rows per DP group is the 8K-context ceiling.
+- Open trn2 bugs: expert parallelism hangs on the first execution of an EP decode graph at LNC=2, not deterministically (repro
+  configs below); the MoE prefill kernel's LNC split fails the wikitext check with an out-of-bound indirect copy (not the DGE mode);
+  sp_gather has no LNC=2 form (program 0 alone: NCC_ILLC059; both programs: wrong rows on every rank); the KDA / DSA decode row
+  splits are exact in the NKI simulator but not bit-identical on the device (inside the decode-path gate).
+- Measured and not levers today: FP8 operands in XLA dots (0.47-1.69x), the unsplit fused DSA kernel, EP decode.
+
+**Baseline** (engine-v0 70ddc1b on trn2, the q/t2max-EU environment: `KILN_ADMISSION=reserve KILN_CC_ARGS=--model-type=transformer
+KILN_DSA_POOL_CACHE=auto KILN_DSA_SELECT=nki KILN_LINEAR_ATTN_KERNEL=nki KILN_MOE_KERNEL=nki KILN_MOE_PREFILL_KERNEL=nki
+KILN_MOE_PREFILL_SKIP=0 KILN_PIECEWISE_MOE_GROUP=12 KILN_PIECEWISE_PREFILL_MOE_GROUP=6 KILN_PREFILL_SP=1 KILN_SP_ROUTE=1`,
+`bench/serve_sweep.py --tp 32 --dp 2 --dp-attention 4 --piecewise --overlap --input-len 8192 --output-len 256 --page-buckets 264
+--warmup --prefill-tokens 4096 --prefill-buckets 1024 --max-num-seqs 128 --concurrency 16 32 64 128 256 --decode-buckets 4,8,16,32
+--kv-cache-gb 2.75 --kv-cache-dtype fp8`, queue q/t2f-base, log 20261005T155613Z-t2-base-U):
+
+| conc | out tok/s | TTFT p50 | ITL p50 | prefill call | decode call | $/1M out (spot) |
+|---|---|---|---|---|---|---|
+| 16 | 118.5 | 9.5 s | 99 ms | 1.001 s | 32 ms | 35.97 |
+| 32 | 158.9 | 9.9 s | 161 ms | 1.016 s | 48 ms | 26.82 |
+| 64 | 177.3 | 10.1 s | 316 ms | 1.017 s | 73 ms | 24.04 |
+| 128 | 192.0 | 10.4 s | 602 ms | 1.020 s | 107 ms | 22.20 |
+| 256 | 198.4 | 11.1 s | 1163 ms | 1.048 s | 171 ms | 21.48 |
+
+(The previous best valid trn2 number, feat/trn2-max 7138a25, was 189.9 at conc 128.) One engine on cores 0-31 with
+`--concurrency 32 64 128` gives exactly half (88.6 / 96.0 / 99.2, log 20261005T163035Z-t2-e1-base), so the A/Bs below run
+two engines at once, one config per half of the box, or one engine against that half-box baseline.
+
+Roofline: a 4096-row prefill call is 138.6 TFLOP of model arithmetic (33.83 GFLOP per token, "Accelerator utilization of
+the serving graphs") in 1.017 s on an engine of 8 Trainium2 chips: 2.6% of their dense BF16 peak (8 x 667 TFLOPS), 1.3% of
+FP8. The TP MoE prefill kernel alone is ~14.7 ms per layer (the trn2 probe above) x 43 MoE layers = ~630 ms of the call.
+Parity with trn1 per dollar (trn1 G64 156.2 out tok/s at $2.15/h) needs 156.2 x 15.343 / 2.15 = ~1,115 out tok/s per trn2
+box: a 4096-row prefill call of ~0.19 s, ~14% of BF16 peak, where trn1's call runs at ~8.8% of its own.
+
+**The fused DSA prefill kernel is neutral on trn2** (`KILN_DSA_FUSED=1 KILN_DSA_PREFILL_KERNEL=nki`, q/t2f-pC, cores 32-63
+beside the baseline: 88.8 / 96.3 / 99.5 out tok/s, prefill call 1.013 / 1.016 / 1.044 s; log 20261005T164347Z-t2-e2-pC). On
+trn1 it took the call 0.592 -> 0.519 s. It does not split its work by program, so at LNC=2 both physical cores run all of it,
+while the XLA path it replaces is spread over both cores by the compiler.
+
+**The KDA and DSA decode kernels with SP decode streams are a large decode win on trn2** (`KILN_KDA_DECODE_KERNEL=nki
+KILN_DSA_DECODE_KERNEL=nki KILN_DECODE_SP=1`, trn1 defaults since e240cf0). Decode-only step, `tools/time_decode.py
+--all-buckets --steps 48 --skip 8 --pieces` on the decode agent's shapes (`--max-num-seqs 512 --kv-cache-gb 0.5
+--kv-cache-dtype fp8 --no-prefix-caching --decode-buckets 16,32,64`, null-page KV, one engine, q/dc1-t2 configs t2-TD-X /
+t2-TD-K; X by the decode agent on cores 32-63, K log 20261005T172648Z-t2-td-K on cores 0-31):
+
+| rows per group (per step) | engine-v0 trn2 default (XLA decode) | K: + decode kernels + SP decode | D2: K + moe_dedupe LNC split | D2K2: D2 + KDA / DSA decode row splits | out tok/s per engine (D2K2) | $/1M out, half box spot (D2K2) |
+|---|---|---|---|---|---|---|
+| 16 (64) | 143.6 ms | 110.7 ms | 93.7 ms | **87.7 ms** | 730 | 2.92 |
+| 32 (128) | 219.7 ms | 154.8 ms | 121.7 ms | **110.7 ms** | 1157 | 1.84 |
+| 64 (256) | 1438.7 ms (the XLA DSA mask form collapses) | 264.2 ms | 204.0 ms | **180.7 ms** | 1417 | 1.50 |
+
+D2 is `KILN_LNC_SPLIT=delta_rule,dsa_topk,moe_dedupe` (the dedupe kernel's existing split: its two programs' fp32
+partials summed, not bit-identical to grid 1; q/t2f-TDD2, log 20261005T181945Z-t2-td-D2), D2K2 adds this branch's
+`kda_decode,dsa_decode` row splits (exact in the simulator, not on the device: see the gate below; q/t2f-TDD2K2, log
+20261005T185627Z-t2-td-D2K2). D2K2 against engine-v0's trn2
+default: -39 / -50 / -87%; whole box decode-only at 256 rows per engine ~2,830 out tok/s at 8K context, $1.50 per 1M out at
+trn2 spot. Its MBU by the same byte count: 18.1 / 18.2 / 14.1%. The decode agent's fixed-cost stack ST
+(`KILN_DECODE_WHOLE=1 KILN_DENSE_FP8=0 KILN_DSA_PREFIX=mm`, feat/decode-scale c502221) on D2 instead of the row splits (its
+q/dc1-t2 t2-TD-KST, run here on cores 0-31, log td2-KST): 1 / 4 / 16 / 32 / 64 rows per group 58.9 / 49.2 / 86.9 / 114.3 / 204.2 ms,
+i.e. the same as D2K2 at 16 / 32 rows and slower at 64. Stacked, on a local merge of this branch with feat/decode-scale
+(feat/trn2-fast-ds 0ea5c69 on engine-v0 b8814ab; buckets 1,4,16,32,64; q/t2f-TDX2 / q/t2f-TDST2, logs 20261005T212245Z-t2-td-X2,
+211438Z-t2-td-ST2): D2K2 61.7 / 72.9 / 105.8 / 126.8 / 202.7 ms, D2K2 + ST 59.3 / 48.5 / 84.5 / 105.2 / 182.9 ms (1,400 out tok/s
+per engine at 256 rows, $1.52 per 1M out). D2K2 alone is 12-20% slower on that tree than on this branch (87.7 / 110.7 / 180.7 at
+16 / 32 / 64), while engine-v0 8229c3d leaves this branch's trn2 keys unchanged (rank-0 captures of the base2 / pBX / best1
+serving configs identical on the merge), so the difference sits in feat/decode-scale or in the two extra decode buckets; ST
+recovers it there. Against this branch's D2K2, ST is worth -4 / -5 / +1%. The same-bucket check settles it: the TDX2 env on the
+merged tree with buckets 16,32,64 only runs 87.8 / 110.5 / 212.3 ms (64-row min 198.8; log 20261005T221314Z-t2-td-X2b), this
+branch's D2K2 at 16 / 32, so the slowdown came with the two extra loaded decode buckets, not with feat/decode-scale's code; the
+3-bucket ST run could not start (the whole-decode graphs' keys depend on the loaded bucket set: cache miss
+4c0311508677364834b668c51f98a98a, log 20261005T220940Z-t2-td-ST2b).
+
+**The trn2 decode box with real KV** (the PD decode side; 2026-10-06 01:25-02:30 UTC). Null-page rows all read one page and
+flatter the bandwidth, so these time every row on its own pages and state row: `tools/time_decode.py --real-kv` (decode-scale
+83036ba: each group's pool filled once with seeded values, 55-58 s for 28,598 pages), one engine, DP attention 4, contexts
+8192 + a spread over 256, on the scratch merge feat/trn2-fast-ds2 ef289f8 (feat/trn2-fast 8ba166d + feat/decode-scale 83036ba).
+KV sized to the bucket set (`--max-num-seqs 256 --kv-cache-gb 5.2 --decode-buckets 16,32,64` and `--max-num-seqs 384 --kv-cache-gb
+7.8 --decode-buckets 96`); per-rank tensors from tools/tensor_bytes.py (trn2, rank 0, meta device): 18.79 GB (D2K2) / 19.05 GB (with
+ST's bf16 dense weights) at 256 rows, 22.17 / 22.43 GB at 384, 25.45 / 25.71 GB at 512, which does not fit beside the graphs (the
+long-context engine ran at 24.26 GB per logical core): **96 rows per group is the 8K-context ceiling** of a tp=32 engine. Queues
+q/t2f-TDD2K2@r / TDST2@r / TDSTV@r / TDSTVn@r and the @rb set; logs 20261006T*-t2-tdr-{X,ST,STV,STVn,bX,bST,bSTV}.
+
+| rows per group (per step) | X: D2K2 | ST: + `KILN_DECODE_WHOLE=1 KILN_DENSE_FP8=0 KILN_DSA_PREFIX=mm` | STV: ST + `KILN_MOE_DEDUPE_MAX_TOKENS=256` (v9) | out tok/s per engine (STV) | $/1M out, half box spot (STV) | MBU (STV) |
+|---|---|---|---|---|---|---|
+| 16 (64) | 96.82 ms | 81.85 | **78.52** | 815 | 2.61 | 20.2% |
+| 32 (128) | 111.55 | 107.52 | **104.95** | 1,220 | 1.75 | 19.2% |
+| 64 (256) | 179.47 | 172.64 | **147.23** | 1,739 | 1.23 | 17.3% |
+| 96 (384) | 245.74 | 245.96 | **217.50** | 1,766 | 1.21 | 14.0% |
+
+(Null-page D2K2 on this branch was 87.7 / 110.7 / 180.7 ms: real pages cost +10% at 16 rows per group and nothing at 32 / 64.) ST is
+worth -15 / -4 / -4 / 0% on D2K2 and v9 a further -4 / -2 / -15 / -12%: v9 is the decode lever on trn2 from 64 rows per group, where
+every rank's MoE call has 256 tokens that v8 split into two 128-token calls each reading nearly every expert. v9 needs the
+moe_dedupe LNC split there: with it off (`KILN_LNC_SPLIT=delta_rule,dsa_topk,kda_decode,dsa_decode`, v9 unsplit with its
+slot-skip segments, STVn) the steps are 96.90 / 140.45 / 182.01 / 280.08 ms, worse than D2K2. MBU by the per-rank byte
+model above (1.77 GB dense + 9.51 GB x the touched share + 113 MB per row of the group) at 725 GB/s per logical core. The whole box
+(two engines) at 96 rows per group: **3,531 out tok/s, $1.21 per 1M out at trn2 spot** ($2.81 at a $35.76/h Capacity Block). trn1's
+decode box (the decode agent: ST + v9, 28 rows per group at real 8K KV, trn1.32xlarge spot) is $0.89, so at 8K context trn1 is the
+cheaper decode box per token; trn2's case is the context lengths trn1 cannot hold (its 24 GiB per logical core against trn1's 16).
+
+**Numerics gate of D2K2 (the decode path)**: `tools/check_mixed.py` at the serving configuration (one engine, conc 32, 32
+LONG_TEXT prompts of 700-8192 tokens x 64 greedy tokens, logprobs; q/t2f-base2 against q/t2f-pBX = K + `KILN_LNC_SPLIT=delta_rule,
+dsa_topk,moe_dedupe,kda_decode,dsa_decode`; logs 20261005T205926Z-t2-cm-base2b, 210647Z-t2-cm-pBXb): **28 of 32 requests equal**,
+token agreement 0.9175; teacher-forced |dlogprob| over the 1,843 decode-call positions mean 0.00114, p99 0.0351, max 0.187,
+**signed mean +0.00020** (under test minus engine-v0's trn2 decode); prefill chunks identical. trn1 accepted its decode kernels at
+28 / 32 equal and a signed -0.0004. On 64 wikitext prompts of 256-8192 tokens x 64 greedy tokens (`tools/greedy_ab.py`, which
+has no logprobs) the same pair agrees on 12 of 64 prompts (leading agreement 0.476): wikitext prompts sit on near-ties (trn1's
+accepted decode kernels gave 7 of 32 there), so greedy agreement there is not the gate; both runs' continuations read as fluent,
+correct text. Each config repeats itself exactly (a second greedy_ab run of the baseline: 64 of 64, of pBX: 64 of 64; logs
+20261005T220734Z-t2-ga-base2r, 221640Z-t2-ga-pBXr). But the KDA / DSA decode row splits are NOT bit-identical on the device,
+although they are in the NKI simulator: K + dedupe split with them (pBX) against without them (pBD, log 20261005T204042Z-t2-ga-pBD)
+agrees on 21 of 64 wikitext prompts. Their decode-path numerics are inside the gate above (the check_mixed pair includes them);
+why the device differs from the simulator there is not known.
+
+MBU of the K steps from the utilization analysis' per-rank bytes (dense 1.77 GB + 9.51 GB of experts x the share the rows
+touch + 113 MB of KV and KDA state per row of the rank's group) at 725 GB/s per logical core (2.9 TB/s per chip / 4): 14.3 /
+13.0 / 9.7%. In serving (q/t2f-pB, cores 0-31, log 20261005T165902Z-t2-e3-pB) the same switches give 89.6 / 97.5 / 103.3 out tok/s
+at conc 32 / 64 / 128 per engine (+1.1 / +1.6 / +4.1% over the half-box baseline) with the decode call 73 / 107 / 171 -> 71 / 95 /
+133 ms: the sweep is prefill-bound, so most of the decode gain does not show there.
+
+**Expert parallelism was broken on trn2, two ways, and grid 1 is no way out.**
+- kernels/moe_ep.py hit a gen3 rule at trace: "nc_matmul (transpose mode) dst dtype must match input dtype on gen3+, got
+  dst=float32 but input=bfloat16" (the down outputs' transposes into an fp32 PSUM tile). Fixed: a bf16 PSUM tile from gen3 on,
+  the same values (589e7c8).
+- Every moe_ep kernel was launched at platform.nki_grid() = 2, so both physical cores ran the whole kernel, and its output is
+  zeroed and then built by read-modify-write adds (dma_compute): two programs add every pair twice and race the zeroing. An
+  engine with every trn1 default forced on (EP, `KILN_SP_GROUP=1`, the fused DSA kernel, the decode kernels, SP decode; q/t2f-port,
+  log 20261005T163151Z-t2-e1-port) hung in its first 12-layer decode group graph (9e399d1ab412688431556204798c47eb, `TOPSP ...
+  missing collectives status`, every rank dead 31 s later). The decode kernels + SP decode alone (pB above) and SP_GROUP + the MoE
+  prefill skip alone (q/t2f-pD, log 20261005T180000Z-t2-e4-pD) both run, which leaves the grid-2 EP kernels. (pD is also a
+  prefill win: `KILN_SP_GROUP=1 KILN_MOE_PREFILL_SKIP=20`, conc 32 per engine 94.8 out tok/s against 88.6, prefill call 0.922
+  against 1.017 s; numerics not yet checked on trn2.)
+- Launching them at grid 1 does not compile at LNC=2: `[NCC_IXGM002] Expected function sg0001 in subgraph 1 to have 9 basic
+  blocks, but on core 1 it has 1 basic blocks` (q/t2f-pA1, every EP graph): the compiler gives a grid-1 kernel's device loops to
+  core 0 only, and both cores' functions must match. So at LNC=2 every EP kernel runs at grid 2 and program 0 alone writes `out`
+  (7fb0d7b, `_lnc_setup` / `wr`): both cores run the same device loops, the second core's adds are dropped.
+- The LNC split (`KILN_LNC_SPLIT=...,moe_ep`, off by default; 8368d46, 269513c, 1c89e60): the prefill kernel and decode v2 give
+  each physical core half of the I-chunks of gate_up and half of the 512-column output chunks of down; the a^T halves are swapped
+  between the cores by `nisa.sendrecv` into buffers allocated before anything else (the same SBUF address in both programs'
+  traces), so each core computes its output columns from the whole a^T accumulated over every I-chunk in one PSUM tile, the
+  unsplit order, and adds only into its own columns of `out`. In the NKI simulator (tests/test_lnc_split.py
+  test_moe_ep_split_is_the_whole_kernel, on a CPU host) the split and the unsplit grid-2 form both equal grid 1 bit for bit for the
+  prefill kernel (first and overflow passes, per-row and tile scales) and decode v2 (small and dequantize-first passes); a control
+  with the swap removed differs in 86,016 of its outputs. Three tracer rules the simulator does not enforce (each found by a
+  capture failing): dict keys must be str ("'in' expected ... (str, dict)"), no direct call of an inner function inside a
+  device-loop body ("inner functions can only be used as fori_loop/while_loop body arguments"), no `**` expansion ("keyword expansion
+  is not supported"). A capture with `--ranks 0` is the cheapest tracer check (~3 min).
+- **moe_ep's main kernel (kiln_moe_ep_kernel, the dequantize-first kernel that decode v2 hands rows above 128 and every
+  prefill call goes to) hangs on trn2 hardware, split or not.** EP decode at the decode-only shapes above (K + `KILN_MOE_EP=1
+  KILN_LNC_SPLIT=delta_rule,dsa_topk,moe_ep`, q/t2f-TDE2, log 20261005T181111Z-t2-td-E2): 16 / 32 rows per group 97.8 / 123.7
+  ms (decode v2, its small passes), then 64 rows per group (256 rows: the main kernel) "TOPSP ... missing collectives status"
+  and every rank dead. On one logical core (`tools/probe_moe_ep.py full --chunks 256 --fit row|block`, logs
+  20261005T182958Z-t2-probe-ep-unsplit, 182959Z-split, 184031Z-full-row-unsplit): the first execution is correct (rel 0.0019
+  against the emulation, rows without a local pair exactly 0) and a later one times out after 30 s with `SW_SEMAPHORE_ERROR`,
+  `SW_PSUM_COLLISION_ERROR` and DMA aborts on the dynamic queues (`qActDynamicHW_8` / `qPoolDynamic_8`:
+  TX_DATA_AXI_TIMEOUT_ERROR, RDR_NO_DESC_TIMEOUT_HINT). The passes alone (`probe_moe_ep.py core --lanes 128 --passes 9`,
+  kiln_moe_ep_core: static rows, dynamic expert) run every execution, unsplit 612 us and split **318 us per 128-lane pass
+  (1.92x)** with the same outputs (logs 20261005T183700Z-t2-probe-core-unsplit / 183701Z-core-split). So what hangs is in the
+  main kernel's plan, lane-token, gather or scatter-add part, not in the passes.
+- **What runs: the main kernel SPLIT with per-row scales** (`KILN_LNC_SPLIT=...,moe_ep KILN_MOE_EP_FIT=row`; probes on one
+  logical core, 5 timed executions each after the checked one, every one completing):
+
+  | form | C=256 | C=1024 | C=4096 | hot routing (8 / 56 overflow passes) |
+  |---|---|---|---|---|
+  | unsplit, row scales | hangs after the first execution | | | |
+  | unsplit, tile scales (`KILN_MOE_EP_FIT=block`, the loader's default) | hangs | | | |
+  | split, tile scales (with software DGE too) | hangs after the first execution | | | |
+  | **split, row scales** | **1.98 ms** (rel 0.0019) | **1.87 ms** (0.0032) | **2.60 ms** (0.0029) | C=256 3.83 ms, C=1024 7.69 ms (0.0058) |
+  | split, row scales, software DGE (`KILN_MOE_EP_DGE=sw`) | 2.00 ms | | | |
+
+  (uniform routing over 288 experts, rank 0 of 32 with 9 local experts; logs 20261005T190746Z-t2-probe-full-row-sw-split,
+  191017Z-full-row-hw-split, 191244Z-full-row-split-big, 191245Z-full-row-split-hot, 191016Z-full-block-sw-split.) Against the
+  TP prefill kernel's 14.70 ms at C=4096 on a trn2 logical core, the EP split is 5.7x faster per layer on uniform routing (real
+  routing loads the busiest rank more). Why the tile-scale path and the unsplit forms hang is not known yet; the DGE mode is not
+  it.
+- **OPEN trn2 bug: EP still hangs in a serving engine, also split with per-row scales.** Repro: env q/t2f-pE (the baseline set
+  plus `KILN_MOE_EP=1 KILN_MOE_EP_FIT=row KILN_LNC_SPLIT=delta_rule,dsa_topk,moe_ep`), `bench/serve_sweep.py --tp 32
+  --dp-attention 4 --piecewise --overlap --input-len 8192 --output-len 256 --page-buckets 264 --warmup --prefill-tokens 4096
+  --prefill-buckets 1024 --max-num-seqs 128 --concurrency 32 64 128 --decode-buckets 4,8,16,32 --kv-cache-gb 2.75
+  --kv-cache-dtype fp8 --core-base 0` (log 20261005T200308Z-t2-e6-pE): bucket warmup passes (every prefill and decode graph runs
+  once on zeros), then the warm-up request hangs in a 12-layer decode group graph at 32 rows per group (1db35833a19b34f7075f5ffc0080bf75,
+  27 collectives; cores on Neuron devices 5 and 7 time out, DMA queues qSPIO / qSPSpillReload / qSPDynamicHW / qPoolDynamic /
+  qActDynamicHW report TDR_PREF_DESC_FRST_ERROR). 128 rows is decode v2 (kiln_moe_ep_small2); real tokens give an expert more
+  than SMALL_LW = 16 pairs, which sends it to the dequantize-first pass, and the random-token decode timings never did. Not chased
+  further: TP experts are the faster decode layout anyway (the decode agent's trn1 measurement: under EP the slowest rank loads ~4
+  whole experts while the median loads none, and KILN_MOE_EP=0 took the fixed step 70.3 -> 55.1 ms), and trn2 decodes with TP
+  experts by default.
+- **The EP hang is not one pass and not deterministic** (2026-10-06 00:20-00:46 UTC, one engine each, farm graphs, cores 0-31 /
+  32-63): every run died in bucket warmup, i.e. on the FIRST execution of an EP decode group graph, with the same "TOPSP ...
+  missing collectives status" on all 32 ranks: bestE0 (the decode set + SP_GROUP + EP split with row scales +
+  `KILN_MOE_EP_SMALL_ROWS=0`, so decode takes the main kernel: graph 79666893d0e94ea440c0cf19608fe456, one of its 12 new decode
+  graphs; log 20261006T002323Z-t2-e8-bestE0), bestEL (the same with `KILN_MOE_EP_SMALL_LW=128`, so small2's dequantize-first loop
+  has no trip at C <= 128; log t2-e8-bestEL), and pE itself with `--output-len 1 --decode-buckets 4` (graph
+  f8818a2250d753d11ce51b149e28b36a, the same NEFF on all 32 ranks as a decode graph is; log t2-pf-E), although pE passed the same
+  bucket warmup at 20:03. So it is a race somewhere in the EP kernels at LNC=2 that a run hits or not, not small2's overflow pass.
+- **Prefill-only EP with TP decode does not fit**: it needs both expert layouts resident. Per rank the experts are 9.51 GB under
+  either layout (TP: 1/32 of every expert; EP: 9 whole experts), and the best1 engine holds 20.15-20.22 GB per logical core
+  (neuron-monitor: tensors 17.06, shared scratchpad 2.22, code 0.70-0.76) of the ~24 GB the runtime gives a logical core. A
+  disaggregated prefill engine, which never runs a decode graph, could hold the EP layout alone.
+
+**The MoE prefill kernel's LNC split still fails the trn2 wikitext check with software DGE.** The feat/trn2-max defect (an
+out-of-bound vector-DGE notification from an SP-engine instruction, with every output still bit-identical) looked like hardware
+DGE handling `oob_mode=skip`, so `KILN_MOE_PREFILL_DGE=sw` (kernel argument dge: every dynamic DMA of the kernel with dge_mode
+swdge) was tried on the failing check itself (`tools/check_ppl.py --tp 32 --piecewise --kv-cache-gb 1.0 --text-file
+wikitext2_test.txt`, `KILN_LNC_SPLIT=delta_rule,dsa_topk,moe_prefill KILN_MOE_PREFILL_MIN_TOKENS=1`, q/t2f-P1Msw, log
+20261005T214318Z-t2-wt-P1Msw): the same "scatter/gather (indirect memory copy via vector DGE) out-of-bound access" on several
+ranks. Not the DGE mode; the split stays off.
+
+**Real-weight gates of the prefill-side switches** (`KILN_SP_GROUP=1 KILN_MOE_PREFILL_SKIP=20` on top of the decode set, "best1";
+wikitext-2 slice through tools/check_ppl.py at DP attention 4, `--kv-cache-gb 1.0 KILN_MOE_PREFILL_MIN_TOKENS=1`, q/t2f-base2-ppl and
+q/t2f-best1-ppl, logs 20261005T*-t2-wt-base2 / -t2-wt-best1): engine-v0's trn2 default **-0.554**, best1 **-0.544** (difference
++0.0103, |dlogprob| mean 0.0554, greedy agreement 97.8%, the device-vs-device spread of every accepted pair).
+
+**Whole box with best1** (feat/trn2-fast 118c6ea = engine-v0 8229c3d merged; the baseline's command and environment plus
+`KILN_KDA_DECODE_KERNEL=nki KILN_DSA_DECODE_KERNEL=nki KILN_DECODE_SP=1 KILN_LNC_SPLIT=delta_rule,dsa_topk,moe_dedupe,kda_decode,
+dsa_decode KILN_SP_GROUP=1 KILN_MOE_PREFILL_SKIP=20`, i.e. a922fe9's trn2 defaults plus the skip; q/t2f-best1, both engines at once,
+log 20261005T222609Z-t2-U-best1):
+
+| conc | out tok/s | vs baseline | TTFT p50 | ITL p50 | prefill call | decode call | prefill share | $/1M out (spot) |
+|---|---|---|---|---|---|---|---|---|
+| 16 | 131.3 | +10.8% | 8.6 s | 89 ms | 0.908 s | 29 ms | 66% | 32.46 |
+| 32 | 176.0 | +10.8% | 8.9 s | 146 ms | 0.922 s | 42 ms | 72% | 24.22 |
+| 64 | 202.4 | +14.2% | 9.1 s | 276 ms | 0.924 s | 58 ms | 78% | 21.06 |
+| 128 | 221.6 | +15.4% | 9.2 s | 525 ms | 0.927 s | 76 ms | 83% | 19.23 |
+| 256 | 235.1 | +18.5% | 9.4 s | 1004 ms | 0.937 s | 97 ms | 87% | 18.13 |
+
+The decode call at 32 rows per group falls 171 -> 97 ms (-43%) and the prefill call 1.017-1.048 -> 0.908-0.937 s (-9 to -11%,
+SP_GROUP and the skip). Prefill is 66-87% of the device time, so the sweep follows the prefill call: G1 on trn2 is a prefill
+problem (2.8% of BF16 peak at 0.924 s), and at $18.13-19.23 per 1M out it is 3.4x trn1's G64 EP number per dollar ($5.59).
+
+**Prefill tokens per second per box, the metric for trn2 prefill** (2 engines x rows per call / prefill call): best1 4096 rows
+in 0.922-0.937 s = **8.8k**; trn1.32xlarge G64 one-piece 8192 (prefill agent, engine-v0 8229c3d) 8.7k, with EPLB 10.2k. trn2 has
+3.5x trn1's BF16 compute per box, so parity of BF16 efficiency would be ~35k. **8192-row prefill calls** (best1 + `--prefill-tokens
+8192 --prefill-buckets 2048 KILN_PIECEWISE_PREFILL_MOE_GROUP=4`, q/t2f-best1-p4@pf8k, one engine on cores 0-31, log
+20261005T225412Z-t2-e7-best1pf8k): conc 32 / 64 / 128 per engine 110.7 / 122.9 / 131.6 out tok/s against best1's 101.2 / 110.8 /
+117.6 at the same load per engine (+9.4 / +10.9 / +11.9%; whole box ~263 out tok/s = ~$16.2 per 1M out at conc 256), prefill
+call 1.637-1.660 s per 8192 rows = **9.9k** per box (+12%), decode call 23 / 55 / 82 ms.
+
+**Where a best1 4096-row prefill call goes on trn2** (the "Accelerator utilization" method: `KILN_CAPTURE_INPUTS`
+of prefill call 20 in a best1 serving run on cores 0-31, 64 requests at conc 32, ~16 GB per rank of inputs on the NVMe; each of
+the call's 10 NEFFs replayed on 32 workers with every rank's inputs, rank 0 profiled, `tools/util_report.py replay / bins /
+report`; logs 20261005T232558Z-t2-ut-best1, 20261006T*-t2-utrep2-best1): the graphs take 958.6 ms (serving fit 0.92 s), prep
+1.6 + 8 pieces of 6 layers (95-135 ms, the last 67) + post 2.1.
+
+| per call, rank 0 | ms | share | engines busy (tensor / vector / scalar / gpsimd) |
+|---|---|---|---|
+| MoE blocks: 45 segments ending in the world reduce-scatter of 32 MiB, 10.98 ms each | 494.3 | 52% | 85 / 79 / 79 / 34% |
+| token mixers (KDA or DSA): 45 segments ending in the attention group's reduce-scatter of 8 MiB, 8.11 ms each | 365.1 | 38% | 23 / 21 / 23 / 3% |
+| between: 233 segments ending in an 8 MiB all-reduce (0.07 ms each), 42 of 0.25 MiB, graph ends | 22.6 | 2% | |
+| collective transfers (233 x 0.25 + 45 x 0.21 + 45 x 0.07 ms; they overlap the segments) | ~89 | | |
+
+Every engine idle without a collective in flight: 223.7 ms (23%), almost all of it inside the token mixers. HBM: 113.8 GB read
+and 53.5 GB written per rank, of which **101 GB is spill save / reload** (47.8 / 53.2 GB), 175 GB/s average (24% of a logical
+core's 725 GB/s). Tensor engine 21.6 TFLOP (+ 5.5 of transposes) = 22.5 TFLOP/s, 13.5% of a logical core's ~167 dense BF16. So
+the MoE kernel keeps the tensor engine busy (85%) at a low rate: under TP every rank holds a 64-column slice of each of 288
+experts (I = 2048 / 32), so each expert's matmuls are ~114 rows x 4096 x 128, a poor shape for the 128 x 128 array (EP's whole
+experts run the same layer in 2.6 ms, see above). The token mixers are the latency-bound half: 8 ms per layer with every engine
+~20% busy.
+
+**The fused DSA prefill kernel split over the two cores** (baf73ab `KILN_LNC_SPLIT=...,dsa_fused`, with `KILN_DSA_FUSED=1
+KILN_DSA_PREFILL_KERNEL=nki` on best1; q/t2f-best1F, one engine on cores 32-63, log 20261006T*-t2-e9-best1F): conc 32 / 64 / 128
+per engine 104.4 / 114.7 / 121.9 out tok/s against best1's 101.2 / 110.8 / 117.6 (+3.2 / +3.5 / +3.7%), prefill call 0.885-0.899
+against 0.922-0.937 s (-4%). Exact against grid 1 in the NKI simulator (tests/test_lnc_split.py). Gates on the device, against
+best1: wikitext (check_ppl at DP attention 4, q/t2f-best1F-ppl, log 20261006T021852Z-t2-wt-best1F) -0.5498 against -0.5441
+(engine-v0's trn2 default -0.5543), |dlogprob| mean 0.045, greedy agreement 98.2%, inside the device-vs-device spread of the
+accepted pairs (best1 against engine-v0: 0.0554 / 97.8%); check_mixed (conc 32, 32 LONG_TEXT prompts x 64 tokens; logs
+*-t2-cm-best1, *-t2-cm-best1F) 28 of 32 equal, token agreement 0.9136, teacher-forced signed dlogprob -0.0020 over the 32 prefill
+chunks (|d| mean 0.0129) and +0.0009 over 1,839 decode positions (|d| mean 0.0021). So the fused kernel with its split is the trn2
+default now (FUSED_FAMILIES, PREFILL_KERNEL_FAMILIES and the LNC=2 split list; trn1 keys unchanged: both kernels' REV regions are
+untouched). The unsplit fused kernel was neutral (pC above).
+
+**sp_gather (the NKI all_gather for the SP row gather) has no working LNC=2 form yet**: probe_nki_cc.py --ranks 32 --cases
+xag,sp1 on cores 32-63 (logs *-t2-cc-sp1/2, *-t2-cc2-both / -split). Program 0 alone issuing the collective (c7c43e9) fails to
+compile, `[NCC_ILLC059] Could not find MemoryLocation named inst__I-3-0:_mem_0 on core 1`. Both programs issuing it (af9308e
+`KILN_SP_GATHER_LNC=both`, and `split`, each copying out half) compile and run, but the gathered rows are wrong on 32 of 32 ranks
+(max |err| 7.48 in both forms) at p50 3.78 / 3.22 ms. The XLA zero-padded all-reduce it would replace is exact, at 3.5-5.8 ms for
+[32 x 128, 4096] bf16 (trn1: 2.27). trn2 keeps `KILN_SP_GATHER=xla`.
+
+**trn1 is unaffected by this branch's kernel edits.** The REV regions of moe_ep, moe_prefill, kda_decode and dsa_decode moved
+(each kernel's source CRC is a static argument), so a rank-0 capture of the trn1 G64 serving config (`--target trn1 --ranks 0`,
+`--tp 32 --dp-attention 4 --max-num-seqs 64 --decode-buckets 16 --kv-cache-gb 1.5`, `KILN_MOE_PREFILL_SKIP=20
+KILN_PIECEWISE_PREFILL_MOE_GROUP=12`, EP auto) gives 15 keys on engine-v0 8229c3d and 15 on feat/trn2-fast a922fe9, 9 shared and 6
+different. All six pairs, compiled on kiln-t2-cf into one local cache, have identical NEFF instruction streams
+(`tools/neff_stream_cmp.py`'s streams(), every engine queue; /opt/kiln/trn1cmp.sh). trn1 hosts pay one compile of those six
+graphs and run the same code.
+
+**FP8 in XLA dots on trn2: shape-dependent, mostly not faster.** `tools/probe_fp8_matmul.py` (one logical core,
+NEURON_RT_VISIBLE_CORES=2, `KILN_CC_ARGS=--model-type=transformer`, 8 matmuls per graph against 8 different weights, p50 of 20
+synchronous calls; log 20261005T193220Z-t2-probe-fp8mm2): bf16 x bf16 reaches 106.3 / 106.7 / 123.2 TFLOP/s at M x K x N =
+1024 x 4096 x 4096 / 4096 x 4096 x 4096 / 1024 x 4096 x 16384 (64-74% of the logical core's 167 TFLOPS dense: XLA already uses
+both physical cores well for a dense matmul); the same products with float8_e4m3fn operands (per-tensor scales, as the graph is
+compiled with LNL's unsafe e4m3fn-as-e4m3 flag) run 86.9 / 50.2 / **208.5** TFLOP/s = 0.82 / 0.47 / **1.69x** (the last one above
+the BF16 peak, so neuronx-cc used the FP8 double mode there), and casting the fp8 operands to bf16 first gives 0.80 / 0.68 / 1.37x.
+Product error against fp32 0.036-0.040 (per-tensor scales). So the 2x FP8 rate is reachable from XLA only for some shapes, and the
+model's dense matmuls are a small part of a step anyway: 138.6 TFLOP per 4096-row prefill call is 4.33 TFLOP per logical core,
+~39 ms at XLA's measured 110 TFLOP/s against a 1.017 s call. The time is in the MoE kernel, the elementwise and normalisation
+work, and the collectives, not in matmul throughput; FP8 compute moves the call by at most a few percent until those shrink.
+
 ## Packing prefill chunks across DP-attention groups (2026-10-05, SDK 2.32, trn1.32xlarge)
 
 Under DP attention a prefill call carries at most one chunk per group (each group's token mixers take one sequence
@@ -4712,12 +5059,36 @@ at 0.625 with SP decode streams, where the floor's largest is 0.5; the sampler's
 floor's: the kernels sum the same selected keys in a different order, keep the DSA scores in fp32 (the mask form rounds
 them to bf16 before the softmax) and run the KDA state update as fp32 matmuls on the tensor engine.
 
-**Defaults.** All three are opt-in, default off on every platform: `KILN_KDA_DECODE_KERNEL` and `KILN_DSA_DECODE_KERNEL`
-default `xla`, `KILN_DECODE_SP` `0`. Measured only on trn1 (trn1.32xlarge, GLM-5.3-Flash, tp=32, DP attention 4, EP on):
-the G64 config with all three (conc 64, 16 rows per group), F0 with the two kernels (conc 32, 8 rows per group), and the
-decode-only step at 32 and 64 rows per group. Not measured: G16 (4 rows per group, TP), F0 with SP decode streams, trn2,
-mixed batches (`KILN_MIXED_BATCH=1`) and MTP (SP decode streams stay off with an MTP head). Turning them on changes
-every decode group graph's key, so a default flip needs those configs' graphs compiled first.
+**Defaults (2026-10-05): on for trn1.** `KILN_KDA_DECODE_KERNEL` and `KILN_DSA_DECODE_KERNEL` default to `nki` and
+`KILN_DECODE_SP` to on for a trn1 target (kernels/kda_decode.py, kernels/dsa_decode.py `DECODE_KERNEL_FAMILIES`,
+models/decoder.py `DECODE_SP_FAMILIES`), and stay `xla` / off on trn2, inf2 and a host without a Neuron device; each
+variable overrides it (`tests/test_glm5_next.py::test_decode_kernel_defaults_are_trn1_only`). SP decode streams still
+turn themselves off where the decode buckets x DP attention do not divide over tp (G16: 4 x 4 rows over 32), with an MTP
+head, and only glm5_next uses them. The configs that were not measured above, measured for this (feat/attn-kernel-cand,
+every graph from the farm with `NEURON_LIBTORCH_ASSERT_CACHE_HIT=1`; logs s3://<your-bucket>/logs/kiln-ak-33/ and
+.../kiln-ak-32/, each with its `.cmd`; base = q/final-ebe237e, the same EP-on serving env as the tables above):
+
+| config | base | + decode kernels (DK) | + SP decode streams (DKS) | box |
+|---|---|---|---|---|
+| G16 (conc 16, 4 rows per group) | 87.6 out tok/s, decode call 66.6 ms, ITL 149 ms | **88.1**, 62.9 ms, 148 ms | (off: does not divide) | kiln-ak-33 |
+| F0 (conc 32, 8 rows per group) | 112.4, ITL 254 ms | 114.9 (+2.2%), 248 ms | **119.0 (+5.9%)**, 240 ms | kiln-ak-33 |
+
+With the fused DSA prefill kernel as well (q/attnk-54ec5df graphs; no new key: the decode graphs are the ones above and
+the prefill graphs the fused kernel's), kiln-ak-32:
+
+| config | fused prefill kernel | + DKS | the candidate tree with no variable set |
+|---|---|---|---|
+| G64 (conc 64) | 132.0 / 131.9 out tok/s, decode call 178 / 181 ms, ITL 419 ms | **148.5**, 135 ms, 376 ms | **148.6**, 136 ms, 376 ms |
+| F0 (conc 32) | 120.0, 118 ms, 239 ms | **127.2**, 108 ms, 225 ms | |
+| G16 (conc 16; SP off, DK only) | | | **92.2**, prefill call 825 ms (base 893), ITL 142 ms |
+
+So against the final tree's base, G64 122.9 -> 148.6 (+20.9%), F0 112.5 -> 127.2 (+13.1%) and G16 87.6 -> 92.2 (+5.3%)
+out tok/s; the candidate
+tree's plain G64 command, every graph a cache hit, reproduces the variables' run (and on ce333bd, before the decode
+defaults, the farm's capture of the plain G64 / F0 / wt-DP4 configs was key-identical to the fused-kernel configs). The decode-path NLL of the decode
+kernels and SP decode streams is the check_mixed table above (no change against the run-to-run floor); prefill graphs
+are untouched by them, so check_ppl's wikitext is the fused kernel's -0.548. Not measured: trn2, mixed batches
+(`KILN_MIXED_BATCH=1`), MTP.
 
 **Prefill / decode disaggregation, an estimate (design only, nothing built).** What a request hands from a prefill box
 to a decode box, from GLM-5.3-Flash's config.json (zai-org/GLM-5.3-Flash@eb9eb208): the KDA state of 34 layers, 64 heads
@@ -4751,3 +5122,2636 @@ GiB. Totals: base 18.40 GiB, decode kernels 17.55, decode kernels + SP decode 17
 17.79. The base loads and serves (114.9 out tok/s), so the estimator over-counts these EP configurations in absolute terms
 (the EP prefill graphs alone hold 1359 / 1207 / 820 MiB of rings); the differences are what it measures: 0.85-1.0 GiB per
 rank back, of which dense bf16 weights would take 0.24.
+
+## MoE kernels against their floors (2026-10-05, SDK 2.32, nki 0.6.0, neuronx-cc 2.27.5334, trn1)
+
+kiln-mk-k1 (trn1.2xlarge, one NeuronCore), feat/moe-kernel-tune on engine-v0 e449b98. GLM-5.3-Flash EP rank shapes: 9
+whole experts (fp8 gate_up 4096 x 4096, down 2048 x 4096, 128 x 128 block scales fitted per block: the tile-scale form),
+random values; routing = the real routers on the sweep's random-token prompts (`tools/ep_routing.py` data,
+s3 logs/kiln-mimo-trn1/ep_routing.pt, the probe's default four 1024-token pieces), the busiest rank of the contiguous
+placement (`tools/probe_moe_ep.py full --fit block --routing-file ep_routing.pt --layer L --rank -1`). Floors from
+`tools/moe_roofline.py` (the kernels' own pass structure on that routing); profiles from neuron-explorer on each probe
+graph's real inputs (`tools/prof_engines.py`, then the new `tools/prof_ops.py`: busy as the UNION of an engine's
+instruction intervals, idle attributed to the setter of the semaphore the next instruction waits on, DMA by queue and
+engine). Kernel times are p50 of synchronous calls minus the readback reduction, the same within 0.01-0.05 ms over two
+processes unless stated.
+
+**Expert-parallel prefill (kiln_moe_ep_kernel, C = 4096 rows)**
+
+| layer | busiest rank pairs (largest expert) | passes, executed lanes | PE floor on pairs / on executed lanes (2.45 G cols/s) | HBM bytes, at 228 GB/s | measured |
+|---|---|---|---|---|---|
+| 3 | 1545 (665) | 11, 3072 | 0.99 / 1.97 ms | 386 MB, 1.69 ms | 2.79 ms |
+| 20 | 5084 (4090) | 18, 6656 | 3.25 / 4.26 | 650 MB, 2.85 | 5.63 |
+| 44 | 4876 (3132) | 18, 6656 | 3.12 / 4.26 | 650 MB, 2.85 | 6.56 (one process) |
+
+(a pair or lane costs 1568 moving columns: gate_up 1024, down 512, x transposes 32.) The layer-20 profile: the tensor
+engine is busy 83% of the 5.40 ms window and 85-89% inside every pass, at 2.33 G moving columns per second while busy,
+83% of the 2.8 GHz PE clock; the profile's own throttle counters put the core's activity throttle at an 87.5% utilization
+limit for 42% of the run (`throttle_activity_0_avg_util_limit_nc0_percent` 0.875), which is where the measured 2.45 G
+cols/s ceiling of chained matmuls comes from. The vector engine is busy 62% (13824 fp8 dequantization TENSOR_SCALAR,
+median 239 ns, bimodal 220 / 320 ns; standalone the same op is 120-150 ns), the scalar engine 54% (13824 dequantization
+ACTIVATE, median 181 ns), DMA active 66% at 166 GB/s, every one of its 143,424 packets on the GpSimd software-DGE queue
+and spread evenly over the 16 DMA engines. Static 256-lane first passes take 195 us each, the 512-lane device-loop
+overflow passes 406 us: ~0.77 us per executed lane against 0.64 ideal. So the kernel is PE-bound on EXECUTED lanes; the
+gap to its pairs floor is padding (6656 lanes for 5084 pairs, nearly all in the 256-lane first passes of six experts
+with 0-42 pairs) plus ~11-15% PE idle per pass; and 3.25 ms of layer 20's 5.6 is ONE expert with 4090 of the rank's
+5084 pairs, which only a placement change (redundant copies of hot experts) removes.
+
+**Expert-parallel decode (kiln_moe_ep_small, 64 rows = 16 per DP group)**: layer 3 29 pairs on 8 used experts, 1.38 ms
+against 0.88 ms of bytes (each used expert's 25.2 MB once at 228 GB/s); layer 20 82 pairs (largest 60) on 6 used
+experts, 9 static + 3 overflow passes, 1.85 ms against 0.66; layer 44 83 pairs (largest 40), 1.89 ms. Profile layer 20:
+12 passes of ~133 us, DMA active 74% at 202 GB/s; a static pass of an expert with no pair skips its loads but still
+costs ~108 us of compute; each overflow pass reloads the whole expert. PE busy 46%, vector 59% (the PSUM-stack multiply
+and reduce, ~80 us per pass).
+
+**Tensor-parallel kernels (G16 only)**: moe_prefill C=4096 uniform routing, skip 20 (`KILN_MOE_PREFILL_SKIP=20 python
+tools/probe_moe_prefill.py --format loaded --chunks 4096 --decode-max 0`): 9.17 ms against a PE floor of 1.7 ms and
+1.5 GB of HBM traffic (x rows in, Y out, the combine's gather), 6.6 ms at 228 GB/s; moe_dedupe (`tools/probe_moe_kernel.py
+--experts 288 --scales block128 --act silu_clamp --kernels dedupe`): 16 rows 0.64 ms (105 distinct experts, 86 MB, 0.38
+ms of bytes), 64 rows 1.44 ms (244, 200 MB, 0.88 ms).
+
+**The HBM -> SBUF ceiling of one core** (`tools/probe_mk_dma.py`, 9 x 25.2 MB streamed through 2-4 ring buffers; GB/s
+over the call minus the null graph, and while DMA was active in the profile): [128, CH] DMAs of CH = 8, 16, 32 or 64 KB
+per partition, static or dynamic offsets: 261-264 GB/s (272-275 while active, 16 DMA engines at ~17 GB/s each; packets
+of 8 KB and of 32 KB alike); four [32, 8 KB] DMAs per chunk 196 GB/s. So ~272 GB/s, 66% of the 410 GB/s the profiler
+names, is the practical weight-stream ceiling; the kernels reach 160-204 GB/s while active.
+
+**NKI device loops put a full all-engine barrier at every iteration.** In the profile of a `nl.fori_loop` the iteration
+ends with every engine (Sync, GpSimd, Vector, Scalar, Tensor) meeting on one semaphore (`$S[2]==N` across all queues),
+then a COMPARE_BRANCH on each, then fresh instruction fetches (qScalarTable / qDveTable DMAs of 16 KB, queue_type
+"instruction"); nothing of iteration i + 1 starts before iteration i has fully drained. A loop pass therefore pays its
+pipeline fill and drain every time: from the barrier to the first gate_up matmul of a small-lane pass ~20 us (table
+read, lane tokens, the x-row gather, transposes), and no DMA of the next pass overlaps the current one's compute. A
+small-lane pass costs ~164 us in a loop against ~135 us static. Inside a larger graph the barrier also stops the
+compiler overlapping neighbouring ops with the kernel's loop, which may be part of why kernel speedups measured alone
+did not carry into the serving graphs before; the in-graph runs below are the test.
+
+**Decode v2 (kiln_moe_ep_small2, opt-in `KILN_MOE_EP_SMALL_V=2`, 5a6249c).** One pass per local expert WITH pairs and
+none for an expert without: an expert with at most 16 pairs takes one small-lane pass (kiln_moe_ep_small's arithmetic),
+one with more one 128-lane dequantize-first pass (kiln_moe_ep_kernel's), each kind in its own device loop over a table
+the plan builds (`_plan_s2`), so no expert's weights are read twice. Per token the small passes add first, then the
+dequantized ones (`emulate(..., small=2)`, `tests/test_moe_ep.py::test_small2_emulation_mixes_the_two_arithmetics`).
+v1's source is untouched (its graphs keep their keys). Busiest rank, ms, v1 -> v2 (`KILN_MOE_EP_SMALL_V=1|2 python
+tools/probe_moe_ep.py full --fit block --chunks 64 128 32 --routing-file ep_routing.pt --layer L --rank -1`, two
+processes each, identical to 0.04 ms):
+
+| rows per group (C) | layer 3 | layer 20 | layer 44 |
+|---|---|---|---|
+| 8 (32) | 1.38 -> **1.08** | 1.47 -> **0.92** | 1.49 -> **0.91** |
+| 16 (64) | 1.38 -> **1.08** | 1.85 -> **1.25** | 1.89 -> **1.42** |
+| 32 (128) | 1.55 -> **1.39** | 2.60 -> **1.22** | 2.81 -> **1.58** |
+
+Kernel against its emulation 0.0019-0.0038 of the output's max (v1 0.0019-0.0065). The v2 profile (layer 3, 64 rows: 5
+small passes) shows the loop cost: 164 us per pass at 160 GB/s of DMA, against 93 us for its 25.2 MB at the 272 GB/s
+ceiling and ~90 us of vector work per pass.
+
+**Decode v2 in the serving graphs** (kiln-mk-32, trn1.32xlarge, SDK 2.32, GLM-5.3-Flash real weights, tp=32, DP
+attention 4, feat/moe-kernel-tune 5a6249c, every graph from the compile farm q/moek-trn1 with
+`NEURON_LIBTORCH_ASSERT_CACHE_HIT=1`; `python tools/time_decode.py --all-buckets --steps 64 --skip 8 --price
+trn1.32xlarge-spot=2.15 -- <the DCT argv: --max-num-seqs 256 --concurrency 256 --kv-cache-gb 0.5 --kv-cache-dtype fp8
+--no-prefix-caching --decode-buckets 8,16,32>` with the serving env plus the variant's switch; wall p50 of 64 steps,
+launch to logits; logs s3 logs/kiln-mk-32/*-td-{V1,V2,TP}.log with their .cmd):
+
+| rows per group | TP (`KILN_MOE_EP=0`) | EP v1 (engine-v0) | EP v2 (`KILN_MOE_EP_SMALL_V=2`) | v2 against v1 | EP over TP, v1 -> v2 |
+|---|---|---|---|---|---|
+| 8 | 112.2 ms | 138.7 | **124.7** | -14.0 ms (-10.1%) | +26.5 -> +12.5 ms |
+| 16 | 161.0 | 188.0 | **177.3** | -10.7 (-5.7%) | +27.0 -> +16.3 |
+| 32 | 252.2 | 280.8 | **258.5** | -22.3 (-7.9%) | +28.6 -> +6.3 |
+
+So the kernel's standalone gain carries into the decode step (unlike the interleave and the 64-lane passes before it),
+and halves expert parallelism's decode penalty; the remaining gap is the busiest rank's bytes and the loop passes'
+fill and drain.
+
+**v3 (`KILN_MOE_EP_SMALL_V=3`, tile-scale layouts):** v2 with a small pass's weights in 12 DMAs instead of 48 (the
+whole down projection in one 64 KB-per-partition DMA, gate_up two I-chunks per DMA through a ring of three, the tile
+scales broadcast to every partition, one register for the expert offset). Bit-identical to v2 (the same values differ
+from the emulation, element for element). Standalone 3% faster: busiest rank 1.21 / 1.05 / 1.38 ms at 64 rows (layers
+20 / 3 / 44) against v2's 1.25 / 1.09 / 1.43; 0.89 / 1.04 / 0.88 at 32 rows against 0.92 / 1.08 / 0.91. Its profile
+(layer 3, 64 rows): 155 us per small pass against v2's 163; DMA 223 GB/s while active in 16 / 64 KB packets, but active
+only ~123 us of each pass and the tensor engine waiting ~61 us per pass on it: within one loop pass the down weights
+cannot stream under any compute (they are needed last), so the pass is the sum of its gate_up phase and its down phase.
+v3 in the decode step (TD-SMALLV3 graphs, the same box and method): 127.9 / 175.7 / 260.1 ms at 8 / 16 / 32 rows per
+group against v2's 124.7 / 177.3 / 258.5: the same within run-to-run noise.
+
+**Measured and dropped: the down weights per chunk (v4, not kept).** Eight [128, M, 512] down DMAs queued after the last
+gate_up one, so that the down matmuls of chunk q wait only for their bytes: no faster (busiest rank within +-3% of v3),
+because a [128, 16, 512] source is 16 runs of 512 B per partition and moved at ~160 GB/s against 275 for the whole
+contiguous 64 KB-per-partition block, so the down phase was paced by its DMA instead of by its compute.
+
+**v5 (`KILN_MOE_EP_SMALL_V=5`, tile-scale layouts): two small passes per loop iteration.** The small table is split by
+strided HBM -> HBM copies into entries 0, 2, .. and 1, 3, .. (a loop register cannot be stored to SBUF on trn1:
+`register_store` fails NCC_IXCG832 "TensorSave destination must be DRAM on trn1, due to a HW bug"), the pair loop runs
+n // 2 iterations of two _pass_s5 each (the whole-down DMA issued after the last gate_up DMA), a second loop n % 2 times
+for the odd one; both passes' scatter-adds at the end of the iteration. Bit-identical to v2 (same elements differ from
+the emulation in all nine cases). Busiest rank, ms, v3 -> v5: 64 rows 1.22 / 1.05 / 1.39 -> **1.13 / 0.98 / 1.32**
+(layers 20 / 3 / 44); 128 rows 1.21 / 1.34 / 1.59 -> 1.16-1.18 / 1.25-1.26 / 1.50; 32 rows 0.89 / 1.03 / 0.89 -> 0.86 /
+0.97-0.98 / 0.86. Against v1 at 64 rows: 1.85 / 1.38 / 1.89 -> 1.13 / 0.98 / 1.32. Its profile (layer 3, 64 rows): ~275
+us per pair of experts against ~310 for two v3 passes; the second expert's gate_up DMAs still do not stream under the
+first one's down phase, because the compiler gives both passes the same SBUF buffers (the second pass's loads wait on
+the tensor engine releasing the first pass's: `S[5] (Tensor)>=80` before its first DMA), and deferring both scatter-adds
+to the end of the iteration changed nothing (0.986 against 0.983 ms).
+
+**Measured and dropped: the pair software-pipelined by hand (v6, not kept).** The first expert's down chunks interleaved
+one for two with the second expert's gate_up chunks in program order, the second's down weights loaded into the first
+one's space after the interleave: the same within 0-4% of v5 at every layer and size (64 rows 1.15 / 1.02 / 1.33 ms at
+layers 20 / 3 / 44). Its profile (layer 3, 64 rows) shows why: a pair is still ~280 us, of which ~75 us the first
+gate_up (DMA-bound), ~25 us waiting for the first down weights, ~90 us the interleaved phase (vector-bound: 35 us of down
+plus 55 of gate_up), ~25 us waiting for the second down weights, ~40 us the second down phase and ~25 us of loop tail and
+barrier. A small pass streams its 25.2 MB at the ~270 GB/s ceiling and its down phase can only start once all of its down
+bytes are in (16 runs of 512 B per partition per chunk move at ~160 GB/s, so splitting them costs more than it saves), so
+with one in-order DMA queue a loop iteration of k experts costs about k x 93 us of DMA plus ~65 us of down phase and
+tail that nothing can hide; the loop barrier forbids hiding them under the next iteration. That puts v5's ~137 us per
+small expert within ~10% of what this structure allows (~125 us at k = 2).
+
+**Prefill: the padding fix is not worth a recompile.** Over all 42 MoE layers' busiest ranks (4096 rows, the cost model
+of the measured passes: static 256-lane first pass 195 us, a device-loop first pass ~215, a small-lane pass ~140, 512-lane
+overflow 406, 256-lane tail 211), skipping empty experts and giving tiny ones (<= 16 pairs) small-lane passes in device
+loops saves 5.7 ms per 4096-token prefill call on random-token routing (180.7 -> 175.0 ms of busiest-rank kernel time,
+32 empty and 85 tiny experts over the 42 layers) and loses 2.2 ms on wikitext routing (140.7 -> 142.9: 4 empty, 60 tiny),
+because a device-loop pass pays its fill and drain where a static one overlaps its neighbours. A rank's static first
+passes are saturated across engines (tensor 89%, vector 80%, scalar 67% busy in the profile): 256 lanes are 164 us of
+tensor-engine streaming and the expert's 1536 dequantized tiles ~190 us of vector + scalar, so a smaller first pass is not
+cheaper either. On the serving graphs (utilization agent, prefill piece 1, real routing, every rank's own inputs) a
+light rank's MoE segment is 2.55-2.6 ms per layer and the busiest 4.8-5.2, and the world reduce-scatter mirrors it
+(MoE + RS = 5.56-5.59 ms on all four group leaders): the kernel-side lever left in prefill is the busiest rank's load, i.e.
+expert placement, not the kernel.
+
+**Decode v2 in serving** (kiln-mk-32, trn1.32xlarge spot, SDK 2.32, GLM-5.3-Flash real weights, tree 4c3d078 = engine-v0
+e449b98 + kernels/moe_ep.py additions; the q/final-ebe237e G64 and F0 commands verbatim (`--requests 128` / `64
+--max-seconds 3000`), V1 graphs from q/final-ebe237e and V2 (`KILN_MOE_EP_SMALL_V=2`) from q/moek-trn1, every run
+`NEURON_LIBTORCH_ASSERT_CACHE_HIT=1`, back to back on one box; logs s3 logs/kiln-mk-32/*-sv-{G64,F0}-{V1,V2}.log with
+their .cmd):
+
+| config | out tok/s V1 -> V2 | decode call | prefill call | TTFT p50 / p90 | ITL p50 | spot $ / M out |
+|---|---|---|---|---|---|---|
+| G64 (conc 64, 16 rows per group) | 122.8 -> **129.5** (+5.5%) | 0.178 -> 0.158 s | 0.592 = 0.592 s | 6.9 / 79.7 -> 6.8 / 76.3 s | 453 -> 436 ms | $4.86 -> **$4.61** |
+| F0 (conc 32, 8 rows per group) | 110.1 -> **117.1** (+6.4%) | 0.125 -> 0.108 | 0.594 -> 0.592 | 6.5 / 39.6 -> 6.4 / 38.4 | 254 -> 239 | $5.42 -> **$5.10** |
+
+V1 reproduces the final standings (122.9 / 112.3) within 0.1 / 2%. The prefill call is untouched, as it should be (only
+the decode group graphs differ). The A/B's noise, from a bit-identical twin: v3 (`KILN_MOE_EP_SMALL_V=3`, the same
+outputs as v2 element for element) on the same box right after gave G64 129.8 and F0 116.0 out tok/s (decode call 0.157 /
+0.108 s), i.e. ~1% run to run, against the +5.5% / +6.4% measured.
+
+**Future item, not done: the prefill kernel's device-loop pass fill and drain.** In kiln_moe_ep_kernel's 512-lane
+overflow passes (layer 20's profile) ~45 us of each 406 us pass has the tensor engine nearly idle: ~15 us of the four
+sub-blocks' scatter-adds at the end (all compute done), the all-engine loop barrier, then ~25-30 us before the first
+gate_up matmul (the table reads, 128 sign activations of the lane-token count on the scalar engine, 4 MB of x rows
+gathered, their transposes, the first weight chunk and its dequantization). Over the 42 layers' busiest ranks
+(`tools/ep_routing.py` routing, 4096 rows) there are 238 such passes per prefill call on random-token routing (97 ms of
+the ~181 ms busiest-rank kernel time) and 138 on wikitext. Computing the next pass's table reads and lane tokens inside
+the current iteration and prefetching its x rows into a second buffer could recover ~30-35 us per pass, ~7-8 ms per call
+(~1.3% of the prefill call, ~0.75% end to end at conc 64), less once redundant hot-expert copies (EPLB) shorten those
+experts' pass chains. It changes the prefill kernel's source, so every prefill graph recompiles; deferred.
+
+**accumulate=None on nc_matmul (the attention agent's trap, next to "A PSUM accumulation hazard on trn1" above).** With
+`accumulate` left at None the compiler infers the flag, and on the attention agent's kernel consecutive matmuls into one
+reused PSUM tile were chained into one accumulation group (garbage scores until `accumulate=False` was passed). Audit of
+the MoE kernels (2026-10-05): kernels/moe_ep.py (18 matmuls) and moe_dedupe.py (18) pass `accumulate` explicitly
+everywhere; moe_prefill.py leaves it implicit on 5, each the only write to its PSUM slice (the plan's `pt[:, 0:1]` /
+`pt[:, 1:2]`, the column-factor broadcast `pfb`, the fold's `pf[:, 0, :]` / `pf[:, 1, :]`), and a wrong group there would
+scramble the plan's slots or the up rows, which the device checks against the emulation (0.0017-0.0034 of the output's
+max) and real-weight ppl rule out. Left as is (an edit recompiles every tensor-parallel prefill graph for the same
+output); make them explicit at that kernel's next change.
+
+**v5 in the decode step, against v2 back to back** (kiln-mk-32, 2f28ff8's TD-SMALLV5 graphs, the method above; logs s3
+logs/kiln-mk-32/*-td-V5.log, *-td-V2.log of 08:09 and 08:16 UTC): v5 127.4 / 173.3 / 255.2 ms at 8 / 16 / 32 rows per
+group, v2 125.4 / 177.1 / 258.7 (its first run 124.7 / 177.3 / 258.5: v2 reproduces within 0.7 ms). So v5 is 2.1% /
+1.4% faster at 16 / 32 rows and 1.6% slower at 8 (its two extra loop regions and the four strided table copies are a
+fixed ~50 us per call that 8 rows per group do not pay back). v2 stays the default; v5 is `KILN_MOE_EP_SMALL_V=5`.
+
+**The decode-path numerics gate** (`tools/check_mixed.py` on the G64 serving graphs, 32 prompts, 64 greedy tokens,
+top-2 logprobs; V1 = `KILN_MOE_EP_SMALL_V=1` from q/final-ebe237e, V2 from q/moek-trn1; logs and json s3
+logs/kiln-mk-32/*-cm-{L,W}-{V1,V1b,V2}.log, cm-cmp-*.log):
+
+| text | comparison | outputs equal | decode-path NLL change (signed mean, nats / token) | mean / p99 / max \|dlogprob\| | margins at the first differences |
+|---|---|---|---|---|---|
+| LONG_TEXT | V1 vs V1 again | 32 / 32 | 0 | 0 / 0 / 0 | - |
+| LONG_TEXT | V1 vs V2 | 30 / 32 | **+0.00050** | 0.0017 / 0.049 / 0.30 | 0.125, 0.125 (the two 700-token prompts) |
+| wikitext-2 | V1 vs V1 again | 32 / 32 | 0 | 0 / 0 / 0 | - |
+| wikitext-2 | V1 vs V2 | 5 / 32 | **-0.00077** | 0.021 / 0.18 / 0.35 | all <= 0.125 |
+
+The engine is now deterministic run to run (engine-v0 c99a373's padded-row fix: the earlier floor of 30 / 32 and 18 /
+32 came from a tree before it), so every difference above is v2's arithmetic: a token whose local expert has more than 16
+pairs in its call now takes the dequantize-first arithmetic every prefill token already takes, instead of the per-row
+one. The prefill chunks are bit-identical (n = 32, max 0), the two texts move the decode-path NLL in opposite directions
+by under 0.001 nats per token, and every flip is at a near-tie (top-1 minus top-2 <= 0.125). For scale, the KDA / DSA
+decode kernels were accepted at +0.0003 / +0.0002 with mean |dlogprob| 0.0028 / 0.026 (same table above, "Where a
+GLM-5.3-Flash decode step goes").
+
+CPU suite on efe8795 (the default flip; kiln-mk-ci2, m7i.4xlarge, one pytest process, `KILN_TEST_MODEL=Qwen/Qwen3-0.6B`,
+the venv's transformers 5.15): 687 passed, 51 skipped, 0 failed in 15:46; the GLM-family / DSA / EP files with
+transformers 5.18.0 on PYTHONPATH: 294 passed, 12 skipped (logs s3 logs/kiln-mk-ci2/ci-full.log, ci-tf518.log).
+
+**The automatic EP gate follows the decode kernel** (f84c751, models/decoder.py ep_auto_min_decode_rows): from 4 decode
+rows per DP-attention group with v2 (8 kept for `KILN_MOE_EP_SMALL_V=1`). The utilization agent's conc-16 A/B on
+kiln-ut-32 (4 rows per group, 128 requests, back to back, every arm at `--max-num-seqs 32 --kv-cache-gb 1.5
+--decode-buckets 4`): TP 86.9 out tok/s, EP v1 88.4 (+1.7%), EP v2 **98.0** (+12.8%), decode call 0.066 (TP) / 0.101 /
+0.084 s, prefill call 0.895 (TP) -> 0.592 s (logs s3 logs/kiln-ut-32/ut-g16t32.log, ut-g16e.log, ut-g16e-v2.log with
+their .log.cmd); the final G16 config (16 / 0.65, TP) gave 87.5 on the same box, TTFT p50 8.65 against EP v2's 6.10 s.
+
+**A 128-lane first pass, sized on EPLB's slot counts (closed: ~1% of the prefill call).** Measured (kiln-mk-k2,
+trn1.2xlarge, `KILN_MOE_EP_LW=128` against the default 256 in `tools/probe_moe_ep.py full --fit block --chunks 4096`): ten
+local experts with uniform routing (1050 pairs, largest 118, so every expert fits one pass) 2.375 -> 2.031 ms, i.e. a
+static first pass ~195 -> ~161 us, not half: at 128 lanes the pass is bound by its 1536 dequantized tiles on the vector
+and scalar engines instead of by the tensor engine; layer 3's real busiest rank (largest expert 665) 2.796 -> 3.018 ms,
+the 128-lane tails costing more than they save. On the techniques agent's per-slot pair counts (s3
+logs/kiln-tq-cpu2/eplb-counts-s1.pt: the random-token routing, 4096-row batches as the sweep forms them, 20 batches x 42
+layers, s=1 copies; busiest ranks 1678 pairs on average, 54% of their slots <= 128 pairs, 20% 129-256, 26% above), the
+lane model (static first pass 195 / 161 us at 256 / 128 lanes, 512-lane loop pass 406, loop tails 211 / ~178, plan 150,
+the busiest rank per layer and batch) gives per 4096-token call: all-256 (today) 119.8 ms of busiest-rank kernel time,
+all-128 138.1 (+18.3), slots sorted by pairs with the K largest at 256 and the rest at 128 best at K = 5: 114.6 (-5.2),
+a per-slot oracle 111.1 (-8.7); on the contiguous placement 188.3 -> 182.3 at best. -5.2 ms is ~1% of EPLB's 0.529 s
+prefill call, under the 3% bar for a prefill-kernel change: not done.
+
+CPU suite on f84c751 (the EP gate change; kiln-mk-ci3, m7i.4xlarge on-demand, one pytest process, transformers 5.15):
+687 passed, 52 skipped, 0 failed in 15:44; the GLM-family / DSA / EP files with transformers 5.18.0: 295 passed, 12
+skipped (logs s3 logs/kiln-mk-ci3/ci-full.log, ci-tf518.log). At 4 decode rows per group v2 is bit-identical to v1 (no
+local expert has more than 16 pairs there): the utilization agent's check_mixed on the conc-16 serving graphs, EP v2 vs
+EP v1, 16 / 16 outputs equal and dlogprob exactly 0 over 1008 decode positions; EP vs TP there 15 / 16, decode-path
+signed mean -0.00023 nats per token (EP's summation order, as when EP was merged; s3 logs/kiln-ut-32/cm-g16*.json).
+## Expert-parallel load balancing with redundant expert slots (EPLB) (2026-10-05, SDK 2.32, trn1.32xlarge)
+
+feat/techniques (`kiln/models/eplb.py`, opt-in `KILN_EP_REDUNDANT=s`; default 0 traces exactly engine-v0's graphs).
+The reference engines: SGLang v0.5.21 `python/sglang/srt/eplb/` (eplb_algorithms/deepseek.py replicate_experts and
+balanced_packing; expert_distribution.py:614-626 per-layer counts into a GPU buffer; eplb_manager.py:89-185 a rebalance
+every `--eplb-rebalance-num-iterations` 1000 passes; expert_location_dispatch.py:121-161, without an all-to-all backend,
+a pair's copy by its row index modulo the copy count so every rank agrees) and vLLM v0.30.0 `vllm/distributed/eplb/`
+(policy/default.py:76 replicate_experts, :192 preserve_intragpu_slots; eplb_state.py:553-716 a 1000-step window and a
+3000-step interval; fused_moe/router/base_router.py:51-56 a hash of the local token index modulo the copy count;
+vLLM main #52641 batches the weight migration). Neither publishes a speedup.
+
+**Why.** Under expert parallelism a MoE layer waits for its busiest rank (the block's reduce-scatter needs every
+rank's partial sum), and on the sweep's random-token prompts the busiest of 32 ranks holds 3.7-3.8x the mean pairs at
+4096 rows ("Expert parallelism" above): a few deep-layer experts take most tokens (one expert with 4090 of 4096 tokens
+on layer 20). A placement alone cannot split one such expert, and a static hot set did not transfer from random tokens
+to text (13% overlap), so the copies are placed from the traffic's own counts and re-placed periodically.
+
+**Kiln's form.** Every expert keeps its PRIMARY copy where the contiguous placement puts it (rank r: experts 9r ..
+9r + 8 at tp 32), and each rank adds s redundant slots per MoE layer that hold copies of the hottest experts
+(DeepSeek's replicate: each extra slot to the expert with the largest load per copy; each copy, heaviest first, onto
+the least-loaded rank without one). Physical ids: primary e is e, slot j of rank r is E + r s + j; the EP kernel's
+local map grows to [1, E + tp s + 1] and its blob to El + s experts, the kernel itself unchanged (the MoE-kernel agent
+confirmed nothing assumes El = 9). Routing ids are mapped to physical ids before the kernel by an elementwise int32
+sum over only the experts that have copies (no matmul, which auto-cast could round; no integer division: the row
+classes are a tiled identity), on each rank's own 128 sequence-parallel rows before the routing gather; a pair of row
+t takes copy (t mod 16) mod n. The prefill graphs also count each rank's routing ids per expert into a per-layer
+buffer (`ep_stats`, an in-place add). A rebalance all-reduces the counts over gloo, places the copies (sticky: a copy
+whose expert still deserves one keeps its slot unless a fresh placement's busiest rank is 5% lighter, vLLM's
+preserve_intragpu_slots taken further), loads only the changed slots from the checkpoint on a host thread beside
+serving, and installs them at a later step once a gloo flag says every rank is done (vLLM's async EPLB; the pause is
+the commit: the calls in flight finish and the staged slots are copied in). The slot count is a shape, the placement
+data, so a rebalance compiles nothing.
+
+**Simulated first** (`tools/eplb_sim.py` over tools/ep_routing.py's saved top-k of real GLM-5.3-Flash routing, the
+copies placed from random1, evaluated on random0's 4096-row batches; 2026-10-05, kiln-tq-cpu): the busiest rank's
+EP-kernel time summed over the 42 MoE layers per 4096-row prefill call, with the measured pass costs (0.245 ms per
+256-lane static pass, 0.40 per 512-lane overflow pass): contiguous 199.3 ms; +1 slot per rank, primaries fixed, 140.3;
+a full re-placement 137.0; an oracle placement from the evaluated batches 122.9; +2 slots no better (140.9: each slot
+adds a static pass). Busiest / mean pairs 3.76 -> 1.83. On wikitext routing 166.5 -> 138.7. With the MoE-kernel agent's
+lane model (0.15 ms + 0.78 us per executed lane): 188.3 -> 127.5 ms.
+
+**The busiest rank per layer on the device** (`tools/probe_eplb_kernel.py --routing-file ep_routing.pt --init
+eplb-init-random1.pt`, kiln-tq-32 one NeuronCore, the served tile-scale EP kernel at GLM-5.3-Flash rank shapes, real
+routing of random0's 4 x 1024 tokens, copies placed from random1 only, each layer's busiest rank found by the lane
+model and timed, p50 of 5; log s3 logs/kiln-tq-32/probe-eplb-kernel.log): **207.2 -> 145.6 ms summed over the 42
+layers (-61.6 ms per 4096-row prefill call)**. Per layer (contiguous ms -> +1 slot ms): L3 2.98 -> 2.56, L4 3.38 ->
+2.54, L7 5.25 -> 2.98, L13 5.41 -> 3.19, L17 5.41 -> 3.39, L19 6.06 -> 3.15, L20 6.05 -> 3.80, L21 6.49 -> 3.78, L26
+5.40 -> 4.64, L29 5.42 -> 4.24, L35 3.78 -> 3.99 (worse: an expert with 1609 pairs got no copy from random1's
+counts), L41 6.30 -> 3.78, L42 6.63 -> 4.00, L44 6.05 -> 4.00; the busiest rank's pairs go from 1572-5884 to 889-3089.
+`tools/probe_eplb_device.py` on the same core: an eager host-to-device copy into ONE slot of blob-shaped device
+tensors rewrites it and leaves the others bit-identical; remap and the in-place count compiled with the neuron
+backend equal their CPU values over 3 calls.
+
+**Serving A/B** (kiln-tq-32, trn1.32xlarge spot, real weights, tp=32, DP attention 4, the G64 command with
+`--kv-cache-gb 1.2 --state-checkpoints 4` for both (HBM room for the slot: 64 x 8448 tokens need 4224 of the 4399 pages
+per group, and the random-prompt sweep takes no checkpoint), 128 requests per level, farm graphs q/eplb-a2b1414
+(configs G64-4096-KV1.2-CK4-S20-P12-K-EPT and -R1), 0 device compiles; logs s3 logs/kiln-tq-32/ab-A.log, ab-B.log with
+`.log.cmd`):
+
+| run | out tok/s | TTFT p50 / p90 | ITL p50 | prefill call | decode call | spot $ / M out |
+|---|---|---|---|---|---|---|
+| A, plain EP (feat/techniques b841426, KILN_EP_REDUNDANT unset) | 122.9 | 6.9 / 79.7 s | 453 ms | 0.592 s | 0.179 s | 4.86 |
+| B level 1: +1 slot, copies from host routing of random prompts (`KILN_EPLB_INIT`, ep_routing.pt random0 + random1) | **128.7 (+4.7%)** | 6.4 / 73.7 s | 430 ms | **0.529 s** | 0.185 s | **4.64** |
+| B level 2: copies re-placed from level 1's own recorded counts (`--concurrency 64 64 --eplb-rebalance`) | 127.6 (+3.8%) | 7.2 / 76.2 s | 429 ms | 0.527 s | 0.185 s | 4.68 |
+
+A equals engine-v0 ebe237e's G64 default (122.9), so KV 1.2 and 4 checkpoint rows are neutral. The prefill call is
+63-65 ms shorter, as the probe predicted; the decode call 6 ms longer: the small decode kernel runs one static pass
+per local slot whatever its pairs (~108-133 us, the MoE-kernel agent's measurement, x 42 layers), which its decode v2
+(KILN_MOE_EP_SMALL_V=2: passes only for experts with pairs) removes. From each level's recorded counts
+(`tools/eplb_level_stats.py`): busiest / mean pairs over the level 3.65 -> 1.61 (level 1) and 3.71 -> 1.58 (level 2);
+the lane-model busiest-rank kernel of the level's average batch 185.0 -> 119.9 and 186.6 -> 117.7 ms over 42 layers.
+The rebalance between the levels (synchronous in that run, before the non-blocking form): 1069 / 919 of the 1344
+slots moved, rank 0 reloaded 32 of its 42, 20.3 / 18.7 s; the policy for a sweep is to rebalance between levels,
+outside both timed windows.
+
+**Greedy text, teacher-forced** (`tools/check_mixed.py` on the serving graphs, 32 prompts of 700-8192 tokens, 64
+greedy tokens, concurrency 32, top-2 logprobs; tools/eplb_check.sh; logs s3 logs/kiln-tq-32/cm-*.json, cm-cmp-*.log):
+
+| text | comparison | outputs equal | decode calls: mean / p99 / max \|d\|, signed mean | prefill chunks: mean \|d\|, signed |
+|---|---|---|---|---|
+| LONG_TEXT | A vs A (run to run) | 32 / 32 | 0 / 0 / 0, +0.00000 | 0, +0.00000 |
+| LONG_TEXT | A vs B | 30 / 32 | 0.0033 / 0.10 / 0.26, **-0.00077** | 0.015, +0.0151 (n = 32) |
+| wikitext-2 | A vs B | 3 / 32 (token agreement 0.42) | 0.034 / 0.29 / 0.94, **-0.0022** | 0.027, -0.0019 |
+
+The engine is deterministic since the cold-determinism fix (A vs A is bit-identical), so any change of the ranks'
+summation order moves tokens. The copies compute the same pairs with the same weights; what moves is which rank's
+bf16 partial sum a pair joins and so the reduce-scatter's order. Against the floor of two numerically neutral engines
+on the same natural text (EP row form vs EPT above: 9 / 64 equal, agreement 0.454, decode calls mean 0.037 / p99 0.30 /
+signed -0.0028, prefill chunks 0.038 / +0.021) EPLB sits at that floor; its decode-path NLL change, -0.0008 and -0.0022
+nats per token, is of the size of the accepted decode kernels' (+0.0003 / +0.0002) and SP decode streams' (+0.0001 /
+-0.0007), with an SE of ~0.002 on wikitext's 760 tokens.
+
+**A per-layer slot budget does not pay** (`python tools/eplb_sim.py budget --load ep_routing.pt --budget N`, kiln-tq-cpu,
+2026-10-05; the same out-of-sample split and lane model as above): the same 42 slots per rank given by marginal gain
+(0-3 per layer; the cool layers 3, 5 and 35 take none, layers 20, 21 and 29 two) model at 126.7 ms against 127.5 for one
+slot on every layer; 63 slots (1.5x the HBM) 124.2. What is left above the floor is the static first pass every local
+slot runs whatever its pairs (lane model: 0.15 ms + 10 x 256 lanes x 0.78 us = 2.15 ms per layer, 90 ms over 42), so
+more balance has to come from the kernel's passes, not from placement.
+
+**What is left of the imbalance, profiled on every rank** (the utilization agent's method, feat/utilization 805b909:
+`KILN_CAPTURE_INPUTS` records the inputs of one real serving prefill call on all 32 ranks, prefill call #20 of a G64
+level with all 4 groups busy. `tools/util_report.py replay --seq 2 --profile-all` replays the second 12-layer piece, layers
+12-23, under neuron-explorer, and the per-layer table comes from each rank's profile: the MoE segment up to its world
+reduce-scatter. tools/eplb_imbalance.sh on scratch/eplb-util; kiln-tq-32; logs s3 logs/kiln-tq-32/imb-table-{A,B}.log):
+
+| piece 1 (layers 12-23) | piece time (rank 0) | MoE segment, median rank | MoE segment, busiest rank per layer | busiest - median | rank 0 waiting in its RS |
+|---|---|---|---|---|---|
+| A, plain EP | 170.3 ms | 33.4 ms | 68.6 ms | **+35.2 ms (2.05x)** | 36.3 ms |
+| B, +1 slot (copies from KILN_EPLB_INIT) | 148.8 ms (-21.6) | 38.4 ms | 46.2 ms | **+7.8 ms (1.20x)** | 11.0 ms |
+
+Per layer, busiest minus median goes from 1.1-4.7 ms to 0.3-1.1 ms. The copies remove 78% of the excess the slowest rank
+adds. The median rank pays +5.0 ms over the 12 layers (0.41 ms per layer): its tenth slot's static pass and that
+expert's weight reads. Over the call's 42 MoE layers the residual is about 27 ms of a 530 ms prefill call (5%), the
+bound on what any further placement could still buy. It agrees with the slot budget above: more slots add static passes
+faster than they remove imbalance.
+
+**With the MoE-kernel agent's decode v2** (scratch/eplb-v2 = feat/techniques + feat/moe-kernel-tune 4c3d078,
+`KILN_MOE_EP_SMALL_V=2`: decode passes only for local experts with pairs, so an empty slot costs nothing; farm graphs
+q/eplb-v2-0697abc; same box, the same G64 KV 1.2 CK4 command, 128 requests per level; logs s3
+logs/kiln-tq-32/stack-D.log, stack-C.log with `.log.cmd`):
+
+| run | out tok/s | TTFT p50 / p90 | ITL p50 | prefill call | decode call | spot $ / M out |
+|---|---|---|---|---|---|---|
+| A, plain EP (the table above) | 122.9 | 6.9 / 79.7 s | 453 ms | 0.592 s | 0.179 s | 4.86 |
+| D, decode v2 | 129.6 (+5.5%) | 6.8 / 76.2 s | 436 ms | 0.592 s | 0.156 s | 4.61 |
+| C level 1, decode v2 + one redundant slot (copies from KILN_EPLB_INIT) | **135.6 (+10.3%)** | 6.3 / 70.4 s | 414 ms | 0.530 s | 0.166 s | **4.40** |
+| C level 2, copies from level 1's recorded window | **135.9 (+10.6%)** | 6.3 / 70.3 s | 413 ms | 0.530 s | 0.166 s | 4.39 |
+
+The two compose: EPLB takes the prefill call to 0.530 s and v2 the decode call to 0.156 s; the copies' 10 ms on the
+decode call under v2 is decode spreading a replicated expert's pairs over its copies (each used copy is one more pass
+and 25 MB of weight reads on its rank), which `KILN_EPLB_DECODE=0` (decode pairs on the primaries, same graphs) is
+measured against below. The rebalances between the levels in this run were the non-blocking, sticky form: 315 and 180
+of the 1344 slots moved, rank 0 reloaded 9 and 5 slots on its host thread in 2.9 s, and the engine paused 0.21 / 0.19 s
+for the commit (the earlier synchronous, non-sticky form: 1069 / 919 moved, 20.3 / 18.7 s paused).
+
+| run (same box and command) | out tok/s | TTFT p50 / p90 | ITL p50 | prefill call | decode call | spot $ / M out |
+|---|---|---|---|---|---|---|
+| Cd0: C with decode pairs on the primaries (`KILN_EPLB_DECODE=0`: the v2 default, 0b88bd2 with `KILN_MOE_EP_SMALL_V=2` set and 25a45c9 with it unset; stack-Cd0.log) | **136.7 (+11.2%)** | 6.3 / 70.1 s | 410 ms | 0.530 s | 0.162 s | **4.37** |
+
+So under v2 a copy is worth more to prefill than to decode: spreading decode pairs costs 4 ms per decode call (0.166 ->
+0.162 s on the primaries) and gains nothing back.
+
+**G1b with the stack** (tools/eplb_g1b_stack.sh on scratch/eplb-v2 fa4ef92, which carries 0b88bd2's decode default:
+conc 64, 75% of every 8192-token prompt one of 4 shared 6144-token prefixes, a cold level then a warm one, 256
+requests per level, KV 1.2 fp8, CK4, q/eplb-v2-0697abc; logs s3 logs/kiln-tq-32/g1bs-D.log, g1bs-C.log):
+
+| run | level | out tok/s | wall | TTFT p50 / p90 | ITL p50 | hit rate | prefill call | decode call + per step | spot $ / M out |
+|---|---|---|---|---|---|---|---|---|---|
+| D, decode v2 | cold | 208.2 | 314.8 s | 2.27 / 25.5 s | 278 ms | 0.674 | 0.590 s | 0.159 s | 2.87 |
+| D | warm | 222.6 | 294.4 s | 2.25 / 20.5 s | 280 ms | 0.721 | 0.589 s | 0.158 s | 2.68 |
+| C, v2 + one redundant slot | cold | 212.0 (+1.8%) | 309.1 s | 2.26 / 23.3 s | 273 ms | 0.674 | 0.557 s | 0.161 s | 2.82 |
+| C | warm | **225.7 (+1.4%)** | 290.3 s | 2.14 / 18.8 s | 277 ms | 0.721 | 0.558 s | 0.160 s | **2.65** |
+
+Read the decode column as the least-squares decode coefficient plus the per-step constant: on G1b every step carries
+one decode call, so the two are collinear and the fit alone put +32 ms on C's decode call and -24 / -29 ms on its
+constant. Their sum moves by 2 ms. The gain is smaller than on G64 because G1b is decode-bound (prefill 36-45% of
+device time, against 57-60% on G64), and a hit request's chunks carry only its 2048 uncached tokens. EPLB's copies
+only shorten a prefill call, by 32 ms here against 62 ms on G64's full 4096-row calls.
+
+**F0, conc 32** (tools/eplb_f0.sh: 32 sequences, 8 decode rows per group, bf16 KV 1.3 GB, 4 checkpoint rows, 128
+requests, q/eplb-a2b1414, no decode v2; logs s3 logs/kiln-tq-32/f0-A.log, f0-B.log):
+
+| run | out tok/s | TTFT p50 / p90 | ITL p50 | prefill call | decode call | spot $ / M out |
+|---|---|---|---|---|---|---|
+| A, plain EP | 112.4 | 6.5 / 28.2 s | 254 ms | 0.593 s | 0.124 s | 5.31 |
+| B, +1 slot | **116.1 (+3.3%)** | 6.0 / 25.7 s | 247 ms | 0.530 s | 0.131 s | **5.14** |
+
+The same shape as G64 without v2: the prefill call is 63 ms shorter, and the decode call is 6 ms longer from the
+static pass of the extra slot. A equals ebe237e's 112.3.
+
+**HBM** (tools/tensor_bytes.py, rank 0, meta build on kiln-tq-cpu2; tools/hbm_estimate.py differences over each
+configuration's compiled keys):
+
+| configuration | tensors per rank |
+|---|---|
+| G64 default (KV 1.5, 2 x 16 checkpoint rows per group; loads) | 14.325 GB |
+| + one redundant slot (R1) | 15.415 GB |
+| + the decode kernels and SP decode streams (DK; no tensor changes) | 14.325 GB |
+| DK + R1 + KV 1.2 | 15.093 GB |
+| DK + R1 + CK4 | 14.898 GB |
+| R1 + KV 1.2 + CK4 (configuration B above; loads and serves) | 14.576 GB |
+
+R1 adds 0.027 GiB of code and 0.026 GiB of spill rings, summed over all 24 keys: negligible. The 1.09 GB is
+the slot's weights: 42 layers, one 26 MB expert each. Without the decode kernels B needs both `--kv-cache-gb 1.2`
+and `--state-checkpoints 4` (B is +0.23 GiB over the default, measured to load). With them either one alone is about
+as safe as the default:
+- DK + R1 + CK4 is -0.0 to -0.4 GiB, counting the decode kernels' 0.85-1.0 GiB of rings given back.
+- DK + R1 + KV 1.2 is +0.17 to -0.2 GiB.
+- DK + R1 with neither is about +0.5 GiB and has not been tried on a device.
+
+CK4's 4 rows per group still hold G1b's 4 prefix junctions. KV 1.2 keeps 4400 pages per group against the 4224 that
+64 x 8448 tokens need. A at KV 1.2 / CK4 serves 122.9 out tok/s, the default's.
+
+**Real-weight ppl with EPLB** (`tools/check_ppl.py --model zai-org/GLM-5.3-Flash --tp 32 --dp-attention 4 --piecewise
+--kv-cache-gb 1.0 [--text-file wikitext2_test.txt]` with the serving env, `KILN_MOE_PREFILL_MIN_TOKENS=1` and
+`KILN_MOE_EP=1`: check_ppl's 4 sequences per call leave the automatic expert-parallel default off, so a ppl config without
+it scores TP, which is what the first captures of this section did by mistake; farm configs ppl4-EP1-GRP-DP4 /
+wt-EP1-GRP-DP4 and -R1 in q/eplb-a2b1414; tools/eplb_ppl.sh; kiln-tq-32; logs s3 logs/kiln-tq-32/ppl-*.log):
+
+| tree | France | Water boils | def add | quick fox | mean | wikitext-2 (3071 tokens) |
+|---|---|---|---|---|---|---|
+| A, plain EP | -2.216 | -3.631 | -0.922 | -1.702 | -2.109 | -0.550 |
+| B, +1 slot (copies from KILN_EPLB_INIT) | -2.216 | -3.631 | -0.922 | -1.702 | -2.109 | -0.551, -0.551 (two runs) |
+
+The 4-sentence mean is -2.109 where the brief's reference is ~-2.07: it is Water boils' knife-edge, which moved with the
+f9dc4c4 merge at DP attention 4 (-2.108 on 2b3bdbe above), the same on both trees here. wikitext is within 0.001 of
+the -0.5515 reference on both.
+
+**Seen once, not reproduced: an NKI trace error on one rank.** The first wikitext run of B failed on rank 6 of 32 with
+`<unknown>:0: error: entry function 'kiln.kernels.moe_ep.kiln_moe_ep_kernel' not found` inside a dynamo fake-tensor call
+of kiln_moe_ep_kernel (operands (10, 16, 2, 32) / (10, 128, 16, 4096) / (10, 16, 32), static args 128, 512, 13, ...),
+so that rank never reached the graph the other 31 executed and the call failed with `Failed to schedule neff
+execution. status=2 message=Invalid` and a replica-group signature dump. A second 32-rank job (a G1b serve_sweep started
+by a waiter script that read a stale STACK_DONE) was running on the same box at that time, 08:01-08:03 UTC. After the
+box ran one job at a time again, the same command passed twice (-0.551, -0.551). If the message recurs, capture that
+rank's full traceback: the candidates are the NKI frontend's module lookup or its intermediate cache under two jobs'
+32 processes.
+
+## The attention kernels against their floors, and the pooled-DSA prefill attention as one kernel (2026-10-05, SDK 2.32, nki 0.6.0, trn1)
+
+The owner relayed a claim from the SGLang side that Kiln's NKI kernels perform poorly. Each attention kernel was
+measured alone at GLM-5.3-Flash's serving rank shapes (tp=32, DP attention 4, attention TP 8: 8 heads, latent 512, a
+32 x 128 indexer, 8448 keys = page bucket 264, 8 KDA heads of 128 x 128) on kiln-ak-k1 (trn1.2xlarge spot, one
+NeuronCore, random inputs of the right kind) against floors built from measured engine rates.
+
+**Engine rates** (`python tools/probe_engine_rates.py`: one instruction kind repeated nt = 16 and 272 times in one
+kernel, each repeat writing its own ring tile, every result read; ns per instruction = the difference / 256; the
+graph's launch floor is ~0.145 ms):
+
+| instruction | ns |
+|---|---|
+| PE matmul bf16, stationary [128, 128], moving [128, 512] | 219 (0.43 ns per moving column: 82 TFLOPS) |
+| same, moving [128, 128] / [128, 256] | 48 / 175 |
+| same with fp32 operands, moving [128, 512] | 1150 (5.2x bf16) |
+| bf16 stationary, fp8 (e4m3) moving [128, 512] | 263 (slower than bf16) |
+| stationary [128, 8] (8 columns), moving [128, 512] / [128, 128] | 421 / 68 (no cheaper than a full stationary) |
+| stationary [64, 128] (K = 64), moving [64, 512] | 271 |
+| outer product, K = 1, moving [1, 512] | 373 |
+| transpose as a matmul against the identity, bf16 [128, 128] (stationary changing every time) | 40 |
+| fp32 matmul, stationary [128, 1], moving [128, 128] (kernels/kda_decode.py's reads) | 233 |
+| DVE tensor_reduce max [128, 512] from PSUM / [128, 2048] from SBUF | 494 / 1908 (0.95 ns per element) |
+| DVE tensor_copy PSUM -> bf16 SBUF [128, 512] | 447 |
+| DVE scalar_tensor_tensor (PSUM x scalar) + SBUF [128, 512] | 505 |
+| DVE tensor_tensor SBUF x SBUF / PSUM x SBUF [128, 512] fp32 | 1039 / 494 (two SBUF operands: half rate) |
+| DVE tensor_scalar SBUF [128, 2048] | 1894 |
+| DVE tensor_scalar_reduce (>=, sum) [128, 2112] (a radix round of kernels/dsa_topk.py) | 2154 |
+| DVE tensor_reduce add [128, 128] (per-instruction overhead: ~25-50 ns back to back) | 147 |
+| ACT exp(x - m) [128, 512] PSUM -> bf16 SBUF with the row sum | 466 |
+| ACT copy [128, 512] PSUM -> bf16 SBUF / [128, 128] SBUF -> SBUF | 383 / 106 |
+| ACT exp [128, 2048] SBUF -> bf16 with the row sum | 1574 |
+| indirect DMA gather, 128 rows x 2048 bytes (kernels/dsa_decode.py's pool gather) | 1419 (185 GB/s) |
+| GpSimd tensor_scalar fp32 | does not compile on trn1 |
+
+(The static HBM -> SBUF DMA variant measured nothing: repeated loads into the same ring tiles were folded.)
+
+**Each kernel against its floor** (`python tools/prof_attn_kernels.py <case>`: p50 of synchronous calls with the
+output reduced to a scalar, then `neuron-explorer capture` of the graph's NEFF on the same inputs in a fresh process
+and each engine's busy time from the profile JSON; the floors use the rates above and 410 GB/s of HBM per core):
+
+| kernel at its serving shape | PE floor | vector floor | HBM floor | measured | what the profile says binds |
+|---|---|---|---|---|---|
+| DSA prefill attention core, XLA (models/mla.py _core expand), 1024 queries x 8448 keys | 106 GFLOP: 1.3 ms (absorbed 146: 1.8) | 69 M scores: max 0.51 ms, exp 0.49, P^T drain 0.41 | ~70 MB: 0.17 ms | 9.49 ms (in the layer: 8.7) | spill DMA: active 8.8 ms, 911 MB saved and 1.19 GB reloaded; PE busy 2.15 ms, DVE 1.72, ACT 2.36 |
+| DSA prefill scores + selection (dsa_topk score_select), 1024 queries x 2112 pools, keep 512, kp 4 + tail | 17.7 GFLOP: 0.22 ms | relu 0.41 ms ACT; head sum 0.54 DVE with a PSUM operand (1.08 with two SBUF ones, as written); 47 radix and tie rounds 0.81 DVE | 35 MB out: 0.08 | 2.96 (in the layer: 3.72 with the pool-key read) | DVE: busy 2.54 ms, its scalar_tensor_tensor head sum ~2.7 ms of instruction time; ACT 0.59, PE 0.43 |
+| KDA prefill chunk (delta_rule), C = 1024, 8 heads | PE fp32 busy 0.70 ms | DVE 0.68, ACT 0.32 | 23 MB: 0.06 | 1.20 | PE and DVE about equal, overlapping ~60% |
+| KDA decode (kda_decode), 4 / 16 / 64 rows | ~1.2 us of one-column fp32 matmuls per (row, head): 0.04 / 0.15 / 0.6 ms | small | 1 MB per row read and written: 0.01 / 0.04 / 0.16 | 0.22 / 0.36 / 0.94 | PE (busy 0.146 ms at 16 rows); two of its five matmuls per head only move a k / v row to partition 0 |
+| DSA decode gather (dsa_decode), 4 / 16 / 64 rows of 2560 tokens | ~18 us per row (80 latent transposes, scores and P K with an 8-column stationary) | 20 latent drains of [128, 512] per row (8.4 us), the softmax on 8 of 128 lanes | 1.3 MB per row: 0.05 ms at 16 rows (0.11 at the gather rate) | 0.33 / 0.85 / 2.88 | latency: at 64 rows PE busy 1.34 ms, DVE 1.48, the GpSimd DMA queue 2.24 waiting for ring slots (2 rows in flight) |
+| DSA decode selection (dsa_topk select), 16 / 64 rows x 2112 | | | | 0.23 / 0.28 | ~0.1 ms above the launch floor |
+
+So the claim holds for two of them: the XLA prefill attention core runs at ~13% of the tensor engine because its
+[8, 1024, 8448] fp32 score tensor spills (2.1 GB of spill traffic per call), and the DSA decode kernel is ~4x its
+floor. The KDA kernels and the selection are within 1.5-2.2x of theirs.
+
+**The pooled-DSA prefill attention as one kernel** (`kernels/dsa_prefill.py`, `KILN_DSA_PREFILL_KERNEL=nki`, default
+xla; models/mla.py _core: a pooled DSA layer's chunk of one sequence with whole 128-query tiles takes it, and W_UK /
+W_UV stay in XLA around it): absorbed flash attention over the latent, the selection plus the causal visibility (the
+graph's vis + top) as a bf16 additive mask. Phase 0 transposes the chunk's latent once into K^T [512, 8448] in SBUF
+(67.6 KB per partition); per tile of 128 queries, q_lat^T per head by transposes, then for every (512-key block, head)
+unit a software pipeline A (4 QK matmuls over R plus the mask as one more accumulating matmul against the identity),
+B (block max, running max, alpha and P = exp(scale S - scale m) with its row sum), C (P^T by 4 transposes), D (P K
+with P^T stationary and the block's latent rows streamed from HBM; acc = alpha acc + P K); unit u issues A(u),
+B(u - 1), C(u - 2), D's matmuls of u - 3 and D's update of u - 4. No list comprehension (the NKI tracer rejects
+them: "unsupported expression") and the scalar engine's copy takes no tensor bias (NCC_IBVF043), so l's update stays on
+the vector engine.
+
+`python tools/probe_dsa_prefill.py --forms nki xla xla-absorb --offset -1 0` (kiln-ak-k1, 1024 queries over 8448 keys,
+512 random selected pools per query plus its tail pool, causal; error = max |o - emulate()| / max |o|):
+
+| form | time | error |
+|---|---|---|
+| XLA expand (what the engine runs) | 9.42 ms | 3.9e-3 |
+| XLA absorbed | 11.50 | 3.0e-4 |
+| kernel, first version | 3.34 (chunk at the bucket's end and at position 0 alike: it attends every block) | 1.8e-3 / 1.9e-3 |
+| kernel, the -scale m and alpha moved to the scalar engine | 3.34 | |
+
+Its profile (`prof_attn_kernels.py dsa_prefill`): PE busy 2.27 ms, DVE 1.72 (from 2.25), ACT 1.27, spill 51 MB. It is
+tensor-engine bound now: the absorbed QK and P K at R = 512 are 1.76 of the ~2.1 us per unit, so what is left is
+not attending blocks no query of the tile can see (on average 54.5% of the 17 blocks are visible to a 1024-token
+chunk of an 8192-token prompt) or selected.
+
+CPU (`tests/test_glm5_next.py`, kiln-ak-k1 host, transformers 5.18 on PYTHONPATH): `test_dsa_prefill_kernel_path_matches`
+(prompts of 300 / 140 / 129 tokens in 128-token chunks over 128-key page buckets: the kernel path ran and gives the mask
+path's tokens and logprobs within 1e-5), `test_dsa_prefill_kernel_path_after_a_prefix_hit` (a shared 170-token system
+prompt: the third request resumes at token 160, off the 128 grid; same tokens and logprobs),
+`test_dsa_prefill_emulation_is_the_masked_softmax` (the emulation against the expand form, a row attending four keys of
+the last block only).
+
+**In the layer graph the saving is a third of the standalone one.** `tools/profile_layer.py --model zai-org/GLM-5.3-Flash
+--tp 32 --dp-attention 4 --ranks 2 --prefill 1024 --pages 264 --layers 4 --what hcblocks --part-layers 3 --sum-readback`
+(the serving env of q/final-ebe237e: EP, SP, nki selection, pool cache auto; 2 live ranks on kiln-ak-k1; `--prefill-offset`
+is new: the chunk's first position), layer 3's blocks, p50:
+
+| form | token mixer with its all-reduce | attention block (mHC + mixer + all-reduce + mix) | SP attention block |
+|---|---|---|---|
+| XLA (engine-v0) | 11.23 ms | 19.00 | 15.70 |
+| kernel, static (every key block), chunk at 0 / at 7424 | 9.40 / 9.06 | 17.98 / 17.79 | 13.93 / 13.75 |
+| kernel, causal loop (below), chunk at 0 / 3072 / 7424 | 7.27 / 8.56 / 10.10 | 16.31 / 17.52 / 19.24 | |
+
+So the XLA core cost ~5 ms inside the layer graph, not the 8.7-9.5 it costs alone (the graph overlaps its spills with
+other work). A neuron-explorer replay of the two mixer graphs (`neuron-explorer capture -r 2 -i 0 --ignore-exec-errors`,
+zero inputs; `tools/prof_hlo.py`, new: busy per engine and instruction time per HLO op for a graph whose collectives
+prof_step.py cannot cut): XLA form PE busy 6.14 ms, DVE 5.50, ACT 3.86, 1.0 GB spill; kernel form PE 3.84, DVE 5.18,
+ACT 2.61, 0.47 GB spill. What is left on the critical path is the selection kernel (DVE-bound) and the attention kernel
+(PE-bound) back to back.
+
+**The causal form** (`KILN_DSA_PREFILL_LOOP=1`, with `KILN_DSA_PREFILL_KERNEL=nki`; models/mla.py passes the chunk's
+positions): per pass of `KILN_DSA_PREFILL_QPASS` (2) query tiles, a device loop (`nl.fori_loop`, trip count = the pairs of
+512-key blocks at or before the pass's last position, counted by comparisons in the graph: `loop_args`) over pairs; each
+iteration DMAs its pair's K^T from a pair-major HBM scratch the kernel writes in phase 0 (the loop register as the
+offset), its latent rows and masks at the pair's first key read from a table through the register, then runs the static
+kernel's pipeline over the pass's (block, query tile, head) units; keys past the last full pair are a static tail block.
+What it took: PSUM allocated per region (a PSUM tensor referenced by two device-loop regions fails, NCC_IBIR092); with 4
+query tiles per pass the layer graph failed `[NCC_INLA001] ... overlapping with must-pinned memloc DynamicDMAScratchLoc`
+(the dynamic DMAs' scratch is pinned in SBUF and the kernel's 64 KB of accumulators plus rings overran it; standalone it
+compiled), so 2 tiles per pass and phase 0 in the loop's pair buffers. Alone (`tools/probe_dsa_prefill.py --forms
+nki-loop`, 1024 queries over 8448 keys): 1.19 / 2.41 / 4.02 ms with the chunk at 0 / 3072 / 7424 (4 tiles per pass, which
+fails in the layer: 1.14 / 2.29 / 3.79), against 3.35 for the static kernel, same error against the emulation
+(1.8-2.2e-3). In the layer graph (table above) it is linear in the pairs at ~0.39 ms per pair, so over the 8 chunks of an
+8192-token prompt (pairs 1..8) the mixer averages ~8.6 ms against 9.1-9.4 static and 11.2 XLA. trn1's transpose mode
+writes only fp32 PSUM ("nc_matmul (transpose mode) dst dtype must be float32 on gen2"), so P^T of a 1024-key unit would
+take two banks.
+
+Measured and set aside: the score kernel's head sum reading the relu from PSUM instead of SBUF (2.96 -> 2.73 ms alone,
+DVE busy 2.54 -> 1.93), held because any edit of kernels/dsa_topk.py changes its source revision and so every DSA graph
+key, decode ones included; it goes into the fused selection-and-attention kernel instead.
+
+**Serving A/B, conc 64** (kiln-ak-32, trn1.32xlarge spot, GLM-5.3-Flash real weights; the final G64 command of
+docs/price-performance.md, 128 requests, back to back on one box, every graph from the farm with
+`NEURON_LIBTORCH_ASSERT_CACHE_HIT=1`; logs s3://<your-bucket>/logs/kiln-ak-32/ab-G64-base.log, ab-G64-PK.log, each
+with its `.cmd`): base (q/final-ebe237e) 122.9 out tok/s, TTFT p50 / p90 6.90 / 79.7 s, ITL p50 452 ms, $4.86 per 1M spot;
+`KILN_DSA_PREFILL_KERNEL=nki`, static form (feat/attn-kernel-tune 448b9f6, q/attnk-448b9f6; this tree's kernel is b1166b1's, the same arithmetic with queries padded to whole tiles) **127.6 (+3.8%)**, 6.57 / 75.7 s,
+434 ms, $4.68. The farm's `tools/hbm_estimate.py` over the graphs (ranks 0/8/16/24): the kernel frees 0.69 GiB per rank
+of the prefill groups' spill rings (G64 16.98 vs 17.67 GiB, DKS 15.98 vs 16.67), the three prefill groups' instance spill
+runs 22-30% fewer.
+
+**Serving A/B, conc 32** (same box and method, final F0 command): base 112.5 out tok/s (TTFT p50 6.46 s, ITL 254 ms,
+$5.31), static kernel (448b9f6) **116.5 (+3.6%)**, 6.11 s, 245 ms, $5.13 (logs .../kiln-ak-32/ab-F0-*.log).
+
+**Real weights, wikitext-2 at DP attention 4** (`tools/check_ppl.py --model zai-org/GLM-5.3-Flash --tp 32 --dp-attention 4
+--piecewise --kv-cache-gb 1.0 --text-file wikitext2_test.txt`, the final serving env plus `KILN_MOE_PREFILL_MIN_TOKENS=1`,
+farm queue q/attnk-c9b86e3 configs wt-DP4-*, tree b1166b1 (the static kernel's arithmetic of 448b9f6, queries padded:
+check_ppl's chunks are 64 rows per group, which 448b9f6 left to XLA), kiln-ak-32, logs .../kiln-ak-32/ppl-wt-*.log and
+.json): base -0.547 (by chunk -0.730 -0.692 -1.092 -0.927 -1.219 -0.172 -0.358 -0.138 -0.291 -0.270 -0.342 -0.334, the
+group-collectives reading above to three decimals); static kernel -0.548 (-0.739 -0.701 -1.105 -0.929 -1.209 -0.176 -0.350
+-0.137 -0.297 -0.270 -0.328 -0.331). The causal form (`KILN_DSA_PREFILL_LOOP=1`) ended its run with rc 1 and no
+message after its graphs loaded (64-row chunks padded to 256, 3328 keys; exact alone at that shape in
+`probe_dsa_prefill.py --rows 64 --keys 3328`), not debugged: it stays an experiment.
+
+**Selection and attention as one kernel** (`kernels/dsa_fused.py`, `KILN_DSA_FUSED=1`; models/mla.py attention(): a
+pooled DSA layer's chunk with pool keys of 4 and the tail, NoPE, the nki selection, nothing staged or shared). The
+selection of query tile t + 1 is issued as micro-steps (each (head, 512-pool chunk) of the scores, then the sign, the 31
+radix rounds, the ties' 12, the output) spread evenly between query tile t's attention steps, and it stays on chip: per
+pool 0 / 1 in SBUF, the candidates and the visibility from the positions (a pool is a candidate once kp p + 3 <= pos;
+token kp p + e is attended iff its pool is selected, the tail included, and kp p <= pos - e), the token mask built per
+1024-key block. Attention units of 1024 keys, l's update on the scalar engine as relu(alpha l + rowsum) (all
+non-negative; the copy function takes no tensor bias), the selection's relu written back into its own PSUM bank so its
+weighted head sum reads one PSUM operand: the 8 banks are attention scores 2 x 2, P^T 2, P K 1, selection 1. One trap:
+`nc_matmul`'s default `accumulate=None` chained the selection's 160 matmuls into one reused PSUM tile as an
+accumulation group (scores off by up to 62 against 4.7) until `accumulate=False` was passed.
+
+`python tools/probe_dsa_fused.py --forms dbg fused two --offset 7424 0` (kiln-ak-k1, 1024 queries, 8448 keys, 32 x 128
+indexer, keep 512): tile 0's scores within 7e-7 of `emulate_scores`, the pool selection and the token mask identical to
+the emulation on all 1024 rows at both positions, o within 2.3e-3 / 1.6e-3 of max |o| (the two-kernel path the same).
+Time: the two kernels back to back (score_select, visibility, static attention) 6.10 ms; fused with 512-key units 5.22;
+with 1024-key units 4.92. Its profile: DVE busy 3.3 ms, PE 2.6, ACT 1.75; the vector engine holds the selection (head
+sum ~0.77 ms, radix ~0.75) and the online softmax's max and rescale, and its in-order queue lets a radix round delay the
+attention's block max (PE waits of up to 14 us on the scalar engine's exp). In the layer graph (same profile_layer run as
+the tables above, layer 3, 2 live ranks):
+
+| form | token mixer with its all-reduce | attention block | SP attention block |
+|---|---|---|---|
+| XLA | 11.23 ms | 19.00 | 15.70 |
+| static attention kernel | 9.06-9.40 | 17.8-18.0 | 13.75-13.93 |
+| fused (1024-key units), chunk at 7424 / at 0 | **7.24 / 7.26** | 16.17 / 16.18 | 12.20 / 12.19 |
+
+So in the layer the fused kernel takes ~4 ms off the XLA form's DSA mixer (~2 more than the attention kernel alone),
+whatever the chunk's position. CPU: `test_dsa_fused_kernel_path_matches` (128-token chunks and the prefix hit at 160:
+the mask path's tokens and logprobs within 1e-5).
+
+**Serving A/Bs with the fused kernel** (kiln-ak-32, same box and method; feat/attn-kernel-tune 54ec5df, farm queue
+q/attnk-54ec5df, `KILN_DSA_FUSED=1`; logs s3://<your-bucket>/logs/kiln-ak-32/ab-G64-FU.log, ab-F0-FU.log):
+
+| config | base (final-ebe237e) | static attention kernel | fused selection + attention |
+|---|---|---|---|
+| G64, out tok/s | 122.9 | 127.6 (+3.8%) | **132.0 (+7.4%)** |
+| G64 prefill call / decode call | 0.592 / 0.181 s | 0.553 / 0.179 | 0.519 / 0.178 |
+| G64 TTFT p50 / p90, ITL p50, $ per 1M out (spot) | 6.90 / 79.7 s, 452 ms, 4.86 | 6.57 / 75.7 s, 434 ms, 4.68 | 6.26 / 72.2 s, 419 ms, 4.52 |
+| F0, out tok/s | 112.5 | 116.5 (+3.6%) | **120.0 (+6.7%)** |
+| F0 prefill call / decode call | 0.592 / 0.120 s | 0.553 / 0.124 | 0.521 / 0.118 |
+| F0 TTFT p50 / p90, ITL p50, $ per 1M out (spot) | 6.46 s, 254 ms, 5.31 | 6.11 s, 245 ms, 5.13 | 5.82 / 25.2 s, 239 ms, 4.98 |
+
+The prefill call drops 72 ms (12%) of which the static kernel had 39; the decode call does not move (no decode graph
+changes). Wikitext-2 at DP attention 4 with the fused kernel (q/attnk-54ec5df wt-DP4-FU; its 64-row chunks are padded to
+a query tile and take the kernel): -0.548, base -0.547.
+
+**Defaults.** `KILN_DSA_FUSED` defaults to on for trn1 (kernels/dsa_fused.py `FUSED_FAMILIES`) and
+`KILN_DSA_PREFILL_KERNEL` to `nki` there (kernels/dsa_prefill.py `PREFILL_KERNEL_FAMILIES`), where the A/Bs and the
+wikitext gates above ran; both are off (`0` / `xla`) on trn2, inf2 and a host without a Neuron device, and either variable
+overrides it (`tests/test_glm5_next.py::test_dsa_fused_default_is_trn1_only`, `::test_dsa_prefill_kernel_default_is_trn1_only`).
+The fused kernel takes a pooled DSA layer's prefill chunks first; the static attention kernel is what runs where it does
+not (a mixed batch's chunk, an IndexShare layer, a layer whose selection is wanted), so G64 / F0 with both defaults are
+the FU graphs above. The causal-loop form stays off (`KILN_DSA_PREFILL_LOOP=0`).
+
+## Accelerator utilization of the serving graphs, and why concurrency buys little (2026-10-05, SDK 2.32, trn1.32xlarge)
+
+GLM-5.3-Flash real weights, engine-v0 ebe237e defaults (the final G16 / F0 / G64 configs of docs/price-performance.md,
+farm graphs q/final-ebe237e, 0 device compiles), trn1.32xlarge kiln-ut-32, neuronx-cc 2.27.5334, neuron-explorer 2.32,
+2026-10-05 04:50-08:00 UTC. Logs and profiles: s3://<your-bucket>/logs/kiln-ut-32/.
+
+**Method** (feat/utilization; nothing changes a graph or its key):
+- `KILN_TIMELINE=<file>` (kiln/profiling.py): rank 0 records every graph call (broadcast, argument upload, launch), every
+  read-back of a call's output (how long the host blocked on the device) and every step() call. `KILN_RT_INSPECT=<dir>`
+  (engine/tp.py) turns on the Neuron runtime's system trace for the ranks in `KILN_RT_INSPECT_RANKS` (default 0);
+  `neuron-explorer view -d <dir> --output-format json --ignore-device-profile` gives every execution's device start and
+  stop (`nc_exec_running`, its `nc_start_timestamp_ns` / `nc_stop_timestamp_ns`). The trace ring holds ~0.5M events per
+  NeuronCore and dropped 5M in a 267 s level (it kept the last 36 s); `NEURON_RT_INSPECT_SYS_TRACE_MAX_EVENTS_PER_NC`
+  and `NEURON_RT_INSPECT_EVENT_FILTER_TYPE` (names from `neuron-explorer capture --systrace-get-event-types`; strings in
+  libnrt.so.1) are the knobs. With both on, G64 ran 122.7 out tok/s (fin2: 122.9): they cost nothing measurable.
+- `KILN_CAPTURE_INPUTS=<dir> KILN_CAPTURE_AT=prefill:20,decode:400` (kiln/profiling.py) writes the exact inputs of every
+  NEFF executed during the chosen calls, on every rank, through libtorch_neuronx_lite's `pre_execute_hook`
+  (compile/execute_context.py: "the exact input tuple execute receives (post dead-input filtering and RNG-seed append)",
+  which is the NEFF's input0..inputN order, neff.json `arg_nodes`). A tensor object seen before (weights, KV and state
+  pools) is written once: ~14 GB per rank, ~430 GB for 32 ranks on the instance-store RAID. The counts include the bucket
+  warmup and the warm-up request (decode:200 was the warm-up request's 1-live-row decode; decode:400 is a 64-row call after
+  all 128 prefill calls of a 64-request level, checked against the timeline). LNL device tensors have no host-visible
+  storage pointer (`untyped_storage().data_ptr()` raises "Attempted to access the data pointer on an invalid python
+  storage"), so identity is the object, held by a weak reference.
+- `tools/util_report.py replay <cap> --call <name:n>` replays each NEFF on 32 workers with every rank's own inputs
+  (`neuron-explorer capture --multi-input`, one line per worker) and profiles worker 0. Two traps: (1) the DP-attention
+  groups' prefill pieces are different NEFFs (their FX graphs differ only in the group collectives' process group, 1 vs 2:
+  tools/hlo_diff + diff of fxgraph.txt), and a group-0 NEFF does not load on rank 8+: "ENC:enc_parse_replica_groups [nec_dev
+  31] replica groups (0/2) does not have myself 31", after which the capture hangs. So each NEFF runs as its own
+  neuron-explorer process over its own cores (`NEURON_RT_VISIBLE_CORES=8g-8g+7`), joined into one 32-worker collectives
+  world by `--collectives-worker-start-id 8g --collectives-worker-count 32` (its multi-node form) and one
+  `NEURON_RT_ROOT_COMM_ID`; each process profiles its first worker, so ranks 0 / 8 / 16 / 24 come for free (`--profile-all`
+  profiles all 32). (2) A single execution starts cold: the decode prep graph replayed in 6.55 ms (run: 0.36 ms), group 0 in
+  47.6 ms (run: 44.45); `--num-exec 2 --profile-nth-exec 2` gives 3.06 and 45.04 ms. The profile is
+  `<session>_rank_<r>_exec_2.ntff`. Without captured inputs every input is zero and the MoE routes every row to experts 0-7:
+  under EP the whole MoE lands on rank 0 (a decode group replayed in 145.7 ms with zeros, 45.0 with real inputs).
+- `view --output-format summary-json` (seconds, no full JSON) gives neuron-explorer's own per-execution counters (engine
+  active times, `hbm_read_bytes` / `hbm_write_bytes`, `spill_*_bytes`, `hardware_flops`, `cc_op_time`); its mfu / mbu /
+  hfu fields divide by 91.75 TFLOPS (128 x 128 x 2 x 2.8 GHz) and 410e9 B/s. `tools/util_report.py bins` cuts the
+  instruction trace (`--output-format json --ignore-dma-trace`) into 0.1 ms bins (an engine's queued instructions overlap
+  in the trace, so each engine's busy time is the union of its instruction intervals) and into segments between
+  collectives, each labelled by the collective that ends it; `report` prints the table and the model-level MFU / MBU from
+  config.json plus the safetensors headers (`util_report.py model`).
+- Peaks per NeuronCore-v2 from AWS's Trainium architecture page ("190 FP16/BF16/cFP8/TF32 TFLOPS" and "820 GiB/sec" per
+  2-core device): 95 TFLOPS (cFP8 is no faster than bf16 on trn1) and 410 GiB/s = 440 GB/s.
+
+**Model arithmetic** (`python tools/util_report.py model --shape-dir <glm53 shape dir>`): a prefill token of an 8192-token
+prompt is 33.83 GFLOP: routed experts 16.91 (8 of 288), KDA projections 9.36, DSA projections 2.58, shared expert 2.11, DSA
+attention core 1.29 (64 heads x 512 x the mean 1792 keys of a top-2048 sparse attention), dense MLPs 0.91, KDA recurrence
+0.25, indexer 0.25, router 0.10, mHC 0.07; the dense masked core over the 8448-key bucket that the XLA path computes would be
+5.91 GFLOP instead of 1.29. A decode step must move per rank: dense weights 1.77 GB (KDA projections at attention TP 8 1.17,
+DSA 0.19, indexer and router replicated 0.15 + 0.10, mHC 0.07) + the routed experts the step's rows touch (9.51 GB x (1 -
+(1 - 8/288)^rows): 84% at 64 rows) + per row 113 MB of fp8 KV over 8448 keys and KDA state read and written: 11.52 GB at 16
+rows per group x 4.
+
+**The table** (rank 0, replayed, real inputs):
+
+| call | graphs (ms) | tensor / vector / scalar / gpsimd | HBM moved, rate | tensor engine | collectives |
+|---|---|---|---|---|---|
+| prefill, 4096 rows (prefill:20) | prep 4.4, pieces 136.2 / 168.2 / 169.1 / 128.7, post 8.3 = 614.8 (serving fit 592) | 29.7 / 34.2 / 27.3 / 2.2% | 33.6 GB (spill save 7.9 + reload 10.6), 55 GB/s = 12.4% | 11.1 TFLOP, 18.1 TFLOP/s = 19% | cc_op 183.5 ms; every engine idle with one in flight 180.9 ms (29%), idle otherwise 2.8 ms |
+| decode, 64 rows (decode:400) | prep 3.1, groups 45.0 / 49.7 / 48.8 / 37.2, post 5.0 = 188.8 (runtime trace in the run: 178.0) | 27.1 / 47.9 / 16.3 / 10.6% | 18.8 GB (6.9 spill), 100 GB/s = 22.6% | 5.05 TFLOP/s = 5.3% | 19 ms; all idle 16.5 ms in the group graphs |
+
+MFU (prefill) = 33.83 GFLOP x 4096 / (0.592 s x 32 x 95 TFLOPS) = **7.7%**; MBU (decode) = 11.52 GB / 0.178 s / 440 GB/s =
+**14.7%**. Every engine's active time is below 50% in both: neither call is compute-bound or bandwidth-bound; prefill
+waits on collectives, decode is a chain of small dependent ops.
+
+Per layer, from the segments (the segment ending in the attention group's reduce-scatter is the token mixer, the one
+ending in the world reduce-scatter the MLP / MoE):
+
+| | prefill (4096 rows) | busy (tensor / vector / scalar / gpsimd) | decode (64 rows) | busy |
+|---|---|---|---|---|
+| DSA mixer, 11 layers | 12.85 ms (141 ms per call, 23%) | 28.6 / 42.8 / 31.4 / 0.5% | 4.31 ms (47 ms, 27%) | 38.7 / 29.3 / 28.0 / 16.7% |
+| KDA mixer, 34 layers | 3.07 ms (104 ms, 17%) | 43.7 / 45.9 / 29.6 / 3.5% | 0.585 ms (20 ms, 11%) | 30.2 / 57.9 / 32.4 / 2.4% |
+| MoE FFN, 42 layers (EP kernel, shared expert; decode: + mHC, router) | 3.10 ms (131 ms, 21%) | 69.4 / 61.6 / 53.4 / 6.4% | 1.77 ms (74 ms, 42%) | 34.4 / 68.4 / 9.7 / 14.3% |
+| dense MLP, 3 layers | 0.32 ms | 90.6 / 14.4 / 56.7 / 0.3% | 0.40 ms | |
+| mHC, norms, router between collectives | ~26 ms per call | | (in the FFN segment) | |
+| collectives | world RS 32 MiB 45 x 2.36 ms = 106; 8 MiB all-reduces (the world gather as 4 chunks per layer, the group gather) 233 x (0.13 wait + 0.30) = 100; group RS 7; routing 1 | | 90 all-reduces of 0.5 MiB x 0.29 = 26 ms | |
+| decode tail (KDA state writes) | | | 2.9 ms per group graph (12 ms) | vector 74.5% |
+
+**Most of the prefill reduce-scatter time is the busiest rank's MoE, not the transfer.** All 32 ranks of piece 1 (layers
+12-23; `replay --profile-all`, every rank's own inputs; `s3://<your-bucket>/scripts/ut/imball.py`): per MoE layer
+the MoE segment on the median rank is 2.59-2.89 ms, on the busiest rank 3.90-7.34 ms (a different rank each layer: r0, r6,
+r13, r1, r31, r21, r3, r14, r25, r9, r12, r5), and the world reduce-scatter takes 0.34-0.37 ms on the busiest rank (the
+transfer) and 1.4-4.9 ms on the median rank (waiting for it). Over the piece the median rank's MoE is 33.8 ms and the
+busiest ranks' 67.3 ms: **+33.5 ms per 12 MoE layers, ~117 ms of the 592 ms prefill call (19%)**, more than every collective
+transfer of the call together (~64 ms). Expert load balance (EPLB, redundant hot experts) is the lever for it.
+
+**Spill, by region** (the DMA trace of rank 0's piece 1 and decode group 1, spill queues only, each packet assigned to the
+segment it moves in): prefill piece 1 moves 10.05 GB of spill-queue traffic: DSA mixers 41% (1.38 GB per DSA layer), KDA
+mixers 27% (0.30 GB per layer), MoE segments 23% (0.19 GB per layer), the rest 10%; the spilled tensors are the NKI kernels'
+outputs (custom_call, get_tuple_element), residual adds, d2d transposes of kernel outputs and graph inputs, reshape and
+all-reduce buffers. Decode group 1: 2.00 GB, 87% in the DSA attention segments (0.58 GB per DSA layer: the gathered fp8
+latent, `input140_d2dtranspose_*`, and coalesced spill saves), which the opt-in DSA decode kernel removes ("The decode
+kernels give HBM back" above).
+
+**Does neuronx-cc overlap a collective with independent compute in one graph? No** (`tools/probe_overlap.py`, 32 ranks,
+rows 128 per rank, H 4096; every case's NEFF replayed with neuron-explorer and the tensor engine's instruction time inside
+the collectives' trigger-to-end intervals counted; reps 2 = two SwiGLU MLPs, 5.3 ms of tensor work):
+
+| graph | device ms | collectives ms | tensor time inside collective intervals |
+|---|---|---|---|
+| gather (the SP world gather: zero-padded all-reduce, as 4 x 8 MiB) | 4.34 | 1.58 | 0 |
+| mlp | 5.78 | 0 | 0 |
+| gather -> mlp (dependent) | 9.60 | 1.63 | 1.58 ms |
+| gather and an unrelated mlp, gather first in program order | 9.75 | 1.50 | **0** |
+| the same, mlp first | 8.99 | 1.94 | **0** |
+| two half-batches, gather -> mlp each | 12.54 | 3.56 | 1.06 |
+| two half-batches, both gathers first | 11.37 | 3.18 | 1.06 |
+| gather -> mlp -> reduce-scatter (one FFN block) | 13.77 | 5.40 | 1.58 |
+| the same on two half-batches, both gathers issued first | 10.36 | 2.08 | 1.05 |
+
+The only compute that runs under a collective is the dependent chain's: the mlp on the first 8 MiB chunk of the gathered
+rows while the next chunks' all-reduces are in flight. An independent computation is scheduled entirely outside the
+collective windows whatever its program order, and so is a second half-batch: in the last row the compiler issued half B's
+gather after half A's mlp and reduce-scatter, not before. `--internal-backend-options=--enable-SPMD-opt` ("Enable
+reordering of collectives", walrus_driver --help), `--policy=3` (time-aware post-scheduler) and `--cc-dma-alignment-mode=0`
+(prefetch as much as possible) give the same zero. So two-batch overlap in the SGLang / vLLM sense (one micro-batch's
+dispatch and combine under the other's compute) is not available from this compiler by restructuring the graph; it would
+need collectives issued from inside an NKI kernel. The last row is faster than the one-batch block (10.36 vs 13.77 ms)
+only because that block's 32 MiB reduce-scatter ran 4.65 ms right after the mlp in this probe (two 16 MiB ones 0.35 + 0.30;
+a 32 MiB reduce-scatter of an input tensor alone 0.55 ms); in the serving pieces the rank that arrives last finishes its
+32 MiB reduce-scatter in ~0.35 ms, so the probe's pathology is not the serving graphs' cost.
+
+**Why 4x concurrency buys 1.41x** (the fin2 runs' `device_split`, engine-v0 ebe237e, 128 requests = 32,768 output and
+1,048,576 prompt tokens per level; host and device facts from kiln-ut-32's timeline, runtime trace and replays above):
+
+| | conc 16 | conc 32 | conc 64 |
+|---|---|---|---|
+| out tok/s (wall) | 87.3 (375.2 s) | 112.3 (291.8 s) | 122.9 (266.6 s) |
+| prefill calls x s/call | 256 x 0.894 = 228.7 s (61%; EP off at 4 decode rows per group) | 256 x 0.592 = 151.6 s (52%) | 256 x 0.592 = 151.6 s (57%) |
+| decode calls x s/call | 2127 x 0.066 = 139.7 s | 1103 x 0.123 = 136.1 s | 639 x 0.178 = 113.7 s |
+| per-step remainder | 6.0 s | 3.0 s | 0.9 s |
+| ms per output token: prefill + decode | 6.98 + 4.26 | 4.63 + 4.15 | 4.63 + 3.47 |
+| live decode rows per call | 15.3 of 16 | 29.6 of 32 | 51.2 of 64 |
+| padded decode rows, at ~1.5 ms per row per call | 3.0 s (0.8%) | 4.0 s (1.4%) | 12.5 s (4.7%) |
+
+1. Prefill is the same 256 full calls at every level (token slots 100%) and is 52-61% of the wall: concurrency has nothing left
+   to batch there. conc 16 -> 32 gains +29% almost only because EP turns on at 8 decode rows per group (prefill call 0.894 ->
+   0.592 s, -77 s).
+2. A decode call costs ~50 ms + ~1.6 ms per row, so 4x the rows per call buy 1.23x per output token; the per-row parts are the
+   DSA attention over all 8448 keys of the bucket, the KDA state updates, the MoE FFN's vector work and the DSA spills (table
+   above).
+3. Padded rows (the 128-request closed loop's burst start and drain: 224 of 640 conc-64 decode calls carry 4-59 live rows) cost
+   4.7% at conc 64.
+4. Host: ~0. Rank 0 blocked on the device in 648 of 648 step() calls (250.8 of 267.1 s wall), its device was 99.6% busy in the
+   traced window with gaps of at most 0.17 ms; the 11.7-12.2 ms of graph launches and 2.3-3.7 ms of broadcast per call are hidden
+   behind the call before. Overlap misses: none seen.
+5. With free decode, conc 64 would still cap at 32768 / 151.6 s = 216 out tok/s.
+
+**Per output token at conc 64** (8.14 ms of wall each), the replays' shares applied to the serving costs (prefill call
+0.592 s for 128 output tokens' worth of prompt = 4.63 ms per output token; decode call 0.178 s over 51.2 live rows = 3.47 ms):
+prefill: DSA mixers 1.06, KDA mixers 0.79, MoE compute 0.99, waiting for the busiest EP rank 0.88, collective transfers and
+their sync 0.73, mHC / norms / router 0.20 ms; decode: MoE FFN 1.45, DSA attention 0.92, all-reduces 0.51, KDA attention 0.39,
+KDA state writes 0.23 ms (of which ~0.7 ms is padded rows). conc 16 / 32 have no replay of their own: their prefill call is
+0.894 s (TP) / 0.592 s, their decode call 0.066 / 0.123 s for 15.3 / 29.6 live rows.
+
+**Finding, 2026-10-05: in-graph two-batch overlap is closed on neuronx-cc 2.27 (SDK 2.32).** Do not re-try it by
+restructuring Kiln's graphs on this compiler: the probe above shows 0 ms of independent compute inside any collective
+window in 9 graph shapes and 3 backend scheduler options, and the prefill call's "idle with a collective in flight" time is
+~117 ms of EP imbalance (which no overlap can remove) plus ~64 ms of transfer. The one remaining route to overlap is
+collectives issued from inside an NKI kernel, so that the kernel interleaves them with its own tiles. nki 0.6.0 ships
+`nki.collectives` (all_reduce, all_gather, all_gather_v, reduce_scatter, all_to_all, all_to_all_v, collective_permute, rank_id,
+ReplicaGroup; `nki/collectives/__init__.pyi`; HBM or SBUF tensors, coalesced lists on HBM, "priority ... NeuronCore-v4+
+only"), and `nisa.sendrecv` ("Available only on NeuronCore-v3 or newer", within one LNC). Not built and not measured on trn1;
+what it would need: a probe that an `nki.collectives` reduce_scatter / all_gather inside an LNL-compiled kernel runs on
+NeuronCore-v2 at 32 ranks with the world's replica groups, that it coexists with the graph's XLA collectives (the replica
+group signature check that breaks cached all-gather NEFFs, above), and then an EP kernel that starts its first expert tiles
+while the rows' gather is still arriving and reduce-scatters finished row blocks while later tiles compute.
+
+**Levers, measured on kiln-ut-32 against the same-box G64 base (122.7 out tok/s; 128 requests, farm graphs,
+`NEURON_LIBTORCH_ASSERT_CACHE_HIT=1`, logs s3 logs/kiln-ut-32/ut-<tag>.log with `.log.cmd`):**
+
+| lever | what it attacks (from the tables above) | bound | measured |
+|---|---|---|---|
+| a second decode bucket, `--decode-buckets 8,16` (config only) | padded decode rows in the burst start and drain (4.7% of the conc-64 wall) | ~3% | 126.7 (+3.3%); 128 of 640 decode calls in the 8-row bucket; loads (farm estimate +0.64 GiB) |
+| four decode buckets, `--decode-buckets 4,8,12,16` | the same | ~3% | 125.8 (+2.5%): loads (estimate +2.26 GiB) but no better than 8,16, so 8,16 is the set |
+| EP at 4 decode rows per group (conc 16) with the MoE agent's decode v2 | conc 16's TP prefill (0.893 s per call) | +20% if EP decode cost TP's | at identical shapes (--max-num-seqs 32, KV 1.5, decode bucket 4): TP 86.9, EP v1 88.4 (+1.7%), **EP v2 98.0 (+12.8%)**; the final G16 shapes' TP: 87.5 |
+| mixed batches + KDA / DSA decode kernels + SP decode streams, together | decode rows outside prefill calls; the DSA mask over 8448 keys, its spills, the KDA state writes | | 141.4 (+15.2%); with decode buckets 8,16 as well 142.9 (+16.5%: mixed batches already take the ramp's decode rows) |
+| two-batch overlap in the prefill pieces | collectives with every engine idle (29% of a prefill call) | closed: no overlap from neuronx-cc 2.27 | probe above |
+| expert load balance (EPLB, the techniques agent) | the busiest rank's MoE, ~117 ms of the 592 ms prefill call | ~+12% at conc 64 | its own A/B: one redundant slot per rank, prefill call 0.592 -> 0.529 s, 122.9 -> 128.7 |
+| host scheduling / launch | ~0.4% of the wall | ~0 | not worth a change |
+
+**Correctness of the levers** (`tools/check_mixed.py` through each serving configuration's own graphs, ASSERT_CACHE_HIT,
+kiln-ut-32; LONG_TEXT prompts of 8192 to 700 tokens, 64 greedy tokens, top-2 logprobs; `--compare` teacher-forces every
+position before a pair's first difference; logs s3 logs/kiln-ut-32/cm-<tag>.log and .json):
+
+| comparison | outputs equal | decode-path signed mean dlogprob (nats / token) | mean / p99 / max \|d\| | first-difference margins |
+|---|---|---|---|---|
+| G64 base vs base (32 prompts at conc 32, run to run on this box) | 32 / 32 | 0 | 0 / 0 / 0 (deterministic) | |
+| G64 base vs `--decode-buckets 8,16` (8 rows per group: every decode call in the 8-row bucket) | 31 / 32 | +0.00016 | 0.00029 / 0.0030 / 0.14 | 0.125 |
+| the same on wikitext-2 prompts | 31 / 32 | -0.00023 | 0.00085 / 0.031 / 0.19 | 0.0 (a tie in the reference) |
+| G16 TP vs EP v1 (16 prompts at conc 16) | 15 / 16 | -0.00023 (prefill chunks +0.0117 over 16) | 0.0038 / 0.10 / 0.35 | 0.125 (a prefill token) |
+| G16 EP v1 vs EP v2 (feat/moe-kernel-tune 2f28ff8, `KILN_MOE_EP_SMALL_V=2`) | 16 / 16 | 0 | 0 / 0 / 0 (bit-identical) | |
+| G64 base vs mixed batches + KDA / DSA decode kernels + SP decode streams (`--state-checkpoints 4`) | 29 / 32 | mixed decode rows -0.00112 (n=572), decode calls -0.00049 (n=1320); prefill chunks +0.00375 (n=32: the mixed prefill graphs) | 0.0039 / 0.085 / 0.34 (mixed rows) | 0.375, 0.125, 0.125 |
+
+The 8-row decode graphs are not bit-identical to the 16-row ones (one flip at a 0.125 margin, the sampler's logprob step),
+and the decode-path NLL does not move (+0.00016, against the decode kernels' accepted +0.00028 / +0.00015 and the earlier
+floors' +0.00001 / -0.00079 on other boxes). Prefill graphs are unchanged by a decode bucket, so check_ppl, which scores
+prefill, is the base's by construction. EP vs TP moves the MoE summation order (the merged EP's ppl check: -2.074 / wikitext
+-0.552 vs TP -2.073 / -0.551).
+The combination's decode-path NLL moves by -0.0005 to -0.0011 nats per token, the size of the individually accepted levers'
+own moves (decode kernels +0.0003 / +0.0002, SP decode streams +0.0001 / -0.0007, the earlier wikitext floor -0.0008) and with
+its flips at ordinary margins; it is the sum of three opt-ins each already checked alone, measured together for the first time.
+
+**Measured and set aside** (code on feat/attn-kernel-tune, opt-in there, not in this tree):
+- *The KDA short conv as shift matmuls* (`KILN_LA_CONV=block2`, 56193cd): the chunk's conv over `cat([prev, qkv])` moves
+  rows across partitions (the token axis), which the compiler round-trips through HBM; per 128-row tile, two 128 x 128
+  0 / 1 shift matrices on the tensor engine and no concatenation instead, bit-identical on CPU and device. In a 2-rank
+  replay of layer 4 the KDA token mixer went 4.483 -> 3.997 ms with its spill halved (476 -> 275 MB); six forms were
+  measured (dense shift constants 4.15, iota-built 4.52, transposed slices 7.99, conv1d 8.02). In serving it bought
+  nothing: G64 with the fused kernel 132.0 -> 131.5, F0 120.0 -> 119.7 out tok/s, prefill call unchanged, and the farm's
+  static count of the 32-rank graphs' spill runs went up slightly (+104K per rank). The 2-rank replay is not the 32-rank
+  serving graph's layout.
+- *Decode kernels, rows on the partitions / k and v rows by DMA* (`KILN_DSA_DECODE_ROWS=1`, `KILN_KDA_DECODE_ROWSRC=1`,
+  1416cf5 / 9cf8131): alone 0.713 -> 0.453 ms (DSA, 16 rows) and 0.258 -> 0.228 ms (KDA, 16 rows), same error; at 11 /
+  34 layers that is ~2.9 + ~1 ms of a ~135 ms G64 decode call, not taken further without a decode-path NLL check.
+- *The score kernel's head sum reading PSUM* (2.96 -> 2.73 ms alone): any edit of kernels/dsa_topk.py rekeys every DSA
+  graph; the fused kernel carries the same change instead.
+- *A 32-core replay of a prefill-group NEFF*: `neuron-explorer capture -r 32` of rank 0's prefill group graph (group
+  collectives inside the attention groups) fails at load with `NRT:nrt_load_collectives Failed to load collectives for
+  model` (and without `NEURON_RT_ROOT_COMM_ID` the 32 ranks hang in bootstrap): each attention group's ranks compile their
+  own NEFF, so one rank's NEFF does not replay on all 32 cores. The decode-graph recipe above needs per-rank NEFFs here.
+
+## Suffix decoding on GLM-5.3-Flash at G64 (2026-10-05, SDK 2.32, trn1.32xlarge, tp=32, DP attention 4)
+
+`--spec-method suffix --spec-k 1` (engine/spec_suffix.py, vLLM v0.30.0 v1/spec_decode/suffix_decoding.py) on the G64
+command of the EPLB A/B (plain EP, KV 1.2 fp8, CK4, 128 requests, conc 64, q/eplb-a2b1414 graphs; tools/suffix_g64.sh;
+kiln-tq-32, log s3 logs/kiln-tq-32/suf-A.log), against that section's A on the same box:
+
+| run | out tok/s | TTFT p50 / p90 | ITL p50 | spot $ / M out | drafts accepted |
+|---|---|---|---|---|---|
+| A, plain EP | 122.9 | 6.9 / 79.7 s | 453 ms | 4.86 | - |
+| suffix k=1 | **89.5 (-27%)** | 20.5 / 121.1 s | 565 ms | 6.67 | 15903 / 16228 (98.0%), 1.980 tokens per verify, 0.0 s drafting |
+
+The 98% is the random-token prompts making the model repeat itself (the MTP section's acceptance table: real text
+accepts much less), so this is the most favourable acceptance the workload can give, and suffix still loses 27%:
+- A speculative step runs synchronously, so the overlap the baseline has is lost.
+- Its verify graph costs ~1.32x a decode call under EP (the MTP section's 247 against 187 ms).
+- Draftless sequences (no suffix match yet) launch their own decode graph beside the verify, because spec_verify_plain
+  is off for suffix: 674 decode calls beside 16228 verified rows.
+- The level is prefill-bound. The running batch averaged 43.6 of 64 (the KV line), because slower turnover held fewer
+  sequences in decode.
+
+Merging the draftless rows into the verify would at best reach sync MTP's -4.6% on the same shape, which still loses.
+Overlap scheduling cannot take suffix drafts. They come from the host's token history, which a blind step does not have
+yet, unlike MTP's drafts, which come from the device (engine/spec_async.py on feat/async-mtp). Suffix decoding
+therefore stays off for G1 / G1b on this model. Its place is repetitive text at low concurrency (FEATURES.md: Qwen3.5-0.8B
+B=1 102 -> 148 tok/s).
+
+## Asynchronous MTP drafting under overlap scheduling (2026-10-05, SDK 2.32, trn1.32xlarge, tp=32, DP attention 4)
+
+`KILN_SPEC_ASYNC=1` (EngineConfig.spec_async, MTP k=1, with `--overlap`; engine/spec_async.py) is the first item that
+"MTP speculative decoding ... at serving scale" above named for turning MTP into a win: keep the accepted count and the
+next drafts on the device, so the next step is scheduled while this one runs. The reference engines' forms:
+- vLLM v0.30.0: v1/core/sched/async_scheduler.py:19-49 schedules each decode row with 1 + k tokens as if every draft is
+  accepted. Model Runner V2 (worker/gpu/model_runner.py:1997-2181, worker/gpu/states.py:58-73) corrects
+  num_computed_tokens on the GPU after the rejection sampler and builds the next input ids and positions from device
+  buffers.
+- SGLang v0.5.21: speculative/eagle_worker_v2.py:1313-1450 with managers/overlap_utils.py:513-594 publishes the new
+  lengths and bonus tokens into a device FutureMap that the next batch gathers from, and reserves slots for both steps
+  in flight (mem_cache/allocation_sizing.py:16-59).
+
+**Kiln's form.** One fp32 board row per request slot holds T (the last verify's emitted tokens), acc, the newest
+token's position, the KDA state row the next verify reads, a has-drafts flag and the k drafts. Seven small graphs read
+and write it around the verify and MTP graphs, which are unchanged, so their compile keys are the synchronous engine's:
+- spec_prep: ids, positions, KV slots through the host's page table, state rows and the sampler's draft column.
+- spec_post: the accepted prefix, the emitted tokens, base + 1 + acc, and cur = the request's row acc.
+- mtp_prep and mtp_post: the MTP pass from the last accepted position, then its drafts into the board.
+- spec_init and mtp_prefill_ids: after a final prefill chunk, from the token board the prefill sampled into.
+- spec_host_init: a row whose newest token is a prompt token the host holds (a whole-prompt cache hit, a recompute).
+
+The scheduler gives each MTP row a blind step:
+- It reserves pages for the upper bound num_computed + (1 + k) x steps in flight.
+- It commits the tokens one step later, from spec_post's [rows, Q + 2] read-back.
+- A preemption clears the request's board row.
+
+Requests that need every token on the host keep the synchronous step (grammar, penalties, watermarking, a running
+thinking budget: Request.host_bound). Integer arithmetic stays in fp32 below 2^24, with floor(pos / page_size) for a
+power-of-two page size. No comparison is against a float literal: the first compile of every board graph failed
+NCC_ESPP004 f64 ("Float-literal comparisons can lower to f64" above).
+
+**CPU** (tests/test_spec_async.py, fp32, gloo):
+- Board graphs on hand-built boards.
+- GLM-5.3-Flash with its MTP layer at tp 1 and under DP attention (tp 2, 2 groups): the synchronous MTP engine's tokens,
+  logprobs (< 1e-4) and accepted counts, and plain greedy's tokens.
+- DeepSeek-V3 and GLM-5.3 whose MTP layer is the target's own copy (most drafts accepted).
+- Oracle drafts through the KDA state rows.
+- Sampled requests (temperature 0.8, seeded), the prompts twice, so DeepSeek-V3's second round goes through
+  spec_host_init: tokens and logprobs equal the synchronous engine's except each request's last token. There the
+  synchronous engine has no room for a draft and samples y_0, while the blind step verifies one: another exact sample of
+  the same distribution.
+- Whole suite on the merged tree (engine-v0 25a45c9 + feat/techniques 2209f68 + this): 719 passed, 72 skipped,
+  7 failed. The 7 are tests/test_inkling.py under the tf518 transformers (KeyError 'model.llm.embed...'); they fail the
+  same way on engine-v0 and pass with the venv's own transformers (7 passed).
+
+**Serving A/B on G1b** (tools/amtp_g1b.sh: conc 64, 75% of every 8192-token prompt one of 4 shared 6144-token
+prefixes, a cold level then a warm one, 256 requests per level, EP, KV 1.2 fp8; MB the default 32 checkpoint rows,
+MS / MA 16 so the KDA pool keeps MB's 49 rows per group). Tree feat/async-mtp 9b849da (engine-v0 f54fc18 + this), farm
+q/amtp-9692e97 (configs G64-4096-KV1.2-S20-P12-K-EPT-MB / -MA, MS runs MA's graphs), 0 device compiles, one box
+(kiln-tq-32), logs s3 logs/kiln-tq-32/amtp-{MB,MS,MA}.log:
+
+| run | level | out tok/s | wall | TTFT p50 / p90 | ITL p50 | tokens per verify (accepted) | host drafting | spot $ / M out |
+|---|---|---|---|---|---|---|---|---|
+| MB, no MTP | cold | 207.8 | 315.4 s | 2.3 / 26.8 s | 287 ms | - | - | 2.87 |
+| MB | warm | 246.9 | 265.4 s | 2.3 / 15.4 s | 246 ms | - | - | 2.42 |
+| MS, MTP k=1, synchronous | cold | 213.4 (+2.7%) | 307.1 s | 3.5 / 30.7 s | 268 ms | 1.973 (97.3%) | 19.1 s | 2.80 |
+| MS | warm | 249.6 (+1.1%) | 262.6 s | 3.5 / 17.8 s | 225 ms | 1.976 (97.6%) | 16.9 s | 2.39 |
+| MA, MTP k=1, async | cold | **222.6 (+7.1%)** | 294.4 s | 4.4 / 30.2 s | 252 ms | 1.965 (96.5%) | 0.0 s | 2.68 |
+| MA | warm | **260.4 (+5.5%)** | 251.7 s | 3.5 / 17.4 s | 215 ms | 1.967 (96.7%) | 0.0 s | **2.29** |
+
+Against the synchronous MTP engine the blind steps are worth +4.3% on both levels: warm 262.6 -> 251.7 s, -10.9 s
+of the 16.9 s MS spent drafting on the host (with its read-back waits). Part of that goes to the blind step past each
+request's last token, which is computed and dropped. Against no MTP, +5.5% warm and $2.42 -> $2.29 per million output tokens. The earlier bound,
+~+9% over the baseline, was taken on a tree whose baseline was 229.6. MTP still raises TTFT p50, 2.3 -> 3.5 s, because
+every prefill step also carries the verify's extra rows and the 4096-row MTP pass. The acceptance counts differ from
+MS because a blind step always carries a draft, also at a request's last token where MS has none. That step's proposal
+is counted and its tokens past the limit are dropped. serve_sweep's least-squares device split is not meaningful for
+MA: its verify_async calls are neither decode nor prefill calls, so only the steps carrying a prefill enter the fit.
+
+**Greedy equality on the device** (tools/amtp_check.sh: tools/check_mtp.py, 16 prompts x 256 tokens per set, the G64
+graphs above, MS writes the reference, MA compares token for token; logs s3 logs/kiln-tq-32/amtp-check-{MS,MA}.log):
+| set | acceptance MS / MA | greedy identical MA vs MS | matched prefix: chosen logprob bit-equal, mean / p99 / max \|d\|, signed mean |
+|---|---|---|---|
+| random (8192-token prompts) | 95.9% / 96.0% | **16 / 16** | 95.8%, 0.00000 / 0.0000 / 0.0004, +0.00000 |
+| wikitext (2048-token slices) | 77.3% / 75.8% | 8 / 16 | 64.8%, 0.0035 / 0.080 / 0.245, -0.00030 |
+| chat (24-token questions) | 86.9% / 87.2% | 6 / 16 | 71.0%, 0.0032 / 0.076 / 0.263, -0.00008 |
+
+Every first token (the prefill's) is bit-equal. Each divergence is at a reference top-2 margin of 0.0 to 0.375 (0 to 3
+bf16 ulps of the logits), and the first differing logprob falls 2 to 63 tokens into decode on natural text, 220 to 252
+on random prompts, where requests start to finish. So the blind steps compute the same function, and what moves is
+which other rows share a verify call. A control without async MTP shows the synchronous engine is just as sensitive
+to that: MS run again with 12 prompts instead of 16 (amtp-check-MS12.json; the first 12 prompts are the same) against
+MS on those 12. Chat is 7 / 12 identical, matched-prefix logprobs 89.1% bit-equal, mean |d| 0.0013, signed -0.00015.
+Random is 12 / 12, but only 71.8% bit-equal against async's 96.2%. Async against sync on the same 12 chat prompts is
+5 / 12, signed +0.00007. The signed means, -0.0003 to +0.0002 nats per token, are an order below the
+two-neutral-engines floor of the EPLB checks (-0.0028 on wikitext).
+
+The first attempt of MS's check failed at load on one rank with `NMGR:dlr_build_and_load_cc_resources Failed to build
+and load collectives resources` for verify graph 7ed1597e (log amtp-check-MS.fail1.log), and the other 31 ranks waited
+in CCOM bootstrap. The box was idle, with no other job. Killing the job and starting it again passed, with every graph
+loading.
+
+**Not measured / not done.**
+- k > 1: the runner refuses it, because the later MTP passes' positions would come from the device too.
+- The merged tree's defaults: engine-v0 25a45c9 turns on the decode kernels, SP decode streams and the fused DSA kernel
+  on trn1, which change the verify and MTP graph keys. This A/B is on the f54fc18 base. The same three-way comparison
+  on the merged head is `bash tools/amtp_g1b.sh MB MS MA` after a farm capture of its two configs.
+- Prompt-heavy G1 (8192 in / 256 out with no shared prefix) stays prefill-bound; MTP is not expected to pay there
+  (the section above).
+
+## The final combined measurement (engine-v0 f70c14b / 25a45c9, 2026-10-05, trn1.32xlarge spot)
+
+One box (kiln-ak-32), every row back to back on it, every graph from the farm with `NEURON_LIBTORCH_ASSERT_CACHE_HIT=1`
+(0 device compiles), 128 requests per level, GLM-5.3-Flash real weights, 8192 in / 256 out. Logs
+s3://<your-bucket>/logs/kiln-ak-32/ab-fin3-<config>.log, each with a `.log.cmd` holding the exact command.
+
+**What each config used.**
+- Tree: engine-v0 f70c14b for the plain and mixed-batch rows (= e240cf0: the fused DSA prefill kernel, the trn1 decode
+  kernel and SP decode stream defaults, MoE decode v2 `KILN_MOE_EP_SMALL_V=2` as the default and EP at 4 decode rows per
+  group (54b2e56), EPLB opt-in, host-only profiling off; plus notes); engine-v0 25a45c9 for the EPLB rows (f70c14b +
+  `eplb.decode_replicas()` reading `moe_ep.SMALL_V`, so under v2 decode pairs stay on the primaries; its graphs outside
+  EPLB are f70c14b's). Farm queues q/final-f70c14b and q/final-25a45c9, each from a clean export of its tree.
+- Env, every row: the q/final-ebe237e serving env, `KILN_ADMISSION=reserve KILN_CC_ARGS=--model-type=transformer
+  KILN_DSA_POOL_CACHE=auto KILN_DSA_SELECT=nki KILN_LINEAR_ATTN_KERNEL=nki KILN_MOE_KERNEL=nki KILN_MOE_PREFILL_KERNEL=nki
+  KILN_MOE_PREFILL_SKIP=20 KILN_PIECEWISE_MOE_GROUP=12 KILN_PIECEWISE_PREFILL_MOE_GROUP=12 KILN_PREFILL_SP=1
+  KILN_SP_ROUTE=1`; nothing else for the defaults (the fused kernel, the decode kernels, SP decode streams, v2 and the EP
+  gate are trn1 defaults).
+- Argv, every row: `bench/serve_sweep.py --model zai-org/GLM-5.3-Flash --device neuron --tp 32 --dp-attention 4
+  --piecewise --overlap --input-len 8192 --output-len 256 --page-buckets 264 --warmup --prefill-tokens 4096
+  --prefill-buckets 1024 --requests 128 --max-seconds 3000 --price trn1.32xlarge-spot=2.15`, plus G16 `--max-num-seqs 16
+  --decode-buckets 4 --kv-cache-gb 0.65 --concurrency 16`, F0 `--max-num-seqs 32 --decode-buckets 8 --kv-cache-gb 1.5
+  --concurrency 32`, G64 `--max-num-seqs 64 --decode-buckets 16 --kv-cache-gb 1.5 --kv-cache-dtype fp8 --concurrency 64`.
+- MX (mixed batches): `KILN_MIXED_BATCH=1`, `--state-checkpoints 4 --decode-buckets 8,16`.
+- EPLB: `KILN_EP_REDUNDANT=1 KILN_EPLB_INIT=/opt/kiln/eplb-init-random.pt` (s3 logs/kiln-tq-cpu/eplb-init-random.pt, the
+  techniques agent's initial placement), `--eplb-rebalance` and two levels (`--concurrency 64 64` / `32 32`): level 1 on
+  the initial placement, level 2 after the online rebalance from level 1's counts. KV stays 1.5: the farm's
+  `tools/hbm_estimate.py` puts G64-EPLB / F0-EPLB / G64-MX-EPLB at <= 15.48 / 15.05 / 15.92 GiB per rank at the
+  calibrated <= ~148 B per spill run (the redundant slot is +1.015 GiB of tensors), and all three loaded.
+
+| config | out tok/s | TTFT p50 / p90 | ITL p50 | spot $ / 1M out | prefill call / decode call |
+|---|---|---|---|---|---|
+| G16 (f70c14b) | **105.4** | 5.43 / 5.46 s | 131 ms | **$5.67** | 0.519 / 0.076 s |
+| F0 | **133.9** | 5.61 / 24.5 s | 213 ms | **$4.46** | 0.521 / 0.088 s |
+| F0 + EPLB (25a45c9), level 1 / level 2 | 143.2 / **143.3** | 5.08 / 21.4, 5.03 / 21.4 s | 201 ms | $4.17 / **$4.17** | 0.461 / 0.094, 0.456 / 0.086 s |
+| F0 + MX (second attempt; the first failed at load, below) | 128.8 | 5.92 / 26.5 s | 221 ms | $4.64 | (the split does not separate mixed calls) |
+| G64 | **156.2** | 5.81 / 65.1 s | 363 ms | **$3.82** | 0.520 / 0.118 s |
+| G64 + MX | 152.1 | 5.96 / 68.9 s | 375 ms | $3.93 | (the split does not separate mixed calls) |
+| G64 + EPLB (25a45c9), level 1 / level 2 | 166.4 / **167.2** | 5.31 / 58.9, 5.29 / 58.9 s | 338 / 339 ms | $3.59 / **$3.57** | 0.458 / 0.125 s |
+| G64 + MX + EPLB, level 1 / level 2 | 163.4 / 163.3 | 5.41 / 62.4, 5.37 / 62.2 s | 348 / 346 ms | $3.65 / $3.66 | |
+
+Against ebe237e's final standing (87.3 / 112.3 / 122.9 at conc 16 / 32 / 64): +21% / +19% / +27% by the defaults, and
++28% / +36% at conc 32 / 64 with EPLB. The prefill call drops 0.592 -> 0.520 s at every concurrency (the fused DSA
+kernel; at G16 0.893 -> 0.519 s with the EP gate as well), EPLB takes it to 0.46 s. Per change, from the A/Bs that
+promoted them: the fused kernel +7.4% at G64, the decode kernels + SP decode +12.6% on top, v2 +5.1% (148.6 -> 156.2
+here, with the rest of the merge), EPLB +7.0%. The online rebalance moves the number by -0.1 to +0.5% against the initial
+placement (each rebalance moved 186-348 redundant slots over all ranks and layers, 4.0-5.8 s).
+
+**Mixed batches stopped paying on this tree** (G64 156.2 -> 152.1, -2.6%; F0 133.9 -> 128.8, -3.8%; on ebe237e with the
+decode kernels they were +3%). The likely reason is in the code, not measured: a mixed call runs the joint mixers
+(`KILN_MIXED_MIXERS=joint`): models/mla.py `attention_joint` attends the chunk through `_core` (the static attention
+kernel after a separate selection) and the decode rows in the mask form, and linear_attn.mix runs the decode rows'
+recurrent form in XLA, so the chunk loses the fused selection-and-attention kernel and the mixed decode rows lose the DSA
+and KDA decode kernels. The device split cannot attribute it (it reports a negative decode-call time when decode rows
+ride in prefill calls). F0 + MX's first attempt (log ab-fin3-F0-MX.log) failed at load in the collectives' bootstrap
+(`CCOM WARN Unexpected message type ... rank 22 awaiting root parameters`, then `ENC:ncclInitGlobalComm failed` and
+`Failed to build and load collectives resources`), one minute after the previous run on the box ended; the second
+(ab-fin3-F0-MX-r2.log, started after other runs) loaded and ran, so it reads as a transient of back-to-back starts.
+
+**Quality of the defaults** (f70c14b, against ebe237e):
+- Wikitext-2 at DP attention 4 (`tools/check_ppl.py`, wt-DP4, the earlier gate's command): **-0.548** (-0.54753 over
+  3071 tokens) against ebe237e's -0.547 (-0.54723); by chunk -0.739 -0.701 -1.086 -0.925 -1.216 -0.174 -0.345 -0.141
+  -0.290 -0.264 -0.348 -0.338. Per token it is identical to the fused kernel's run on 54ec5df (max |d| 0): v2 and the
+  EP gate do not reach check_ppl's graphs.
+- Greedy text (`tools/check_mixed.py`, the utilization agent's shape: the G64 argv with `--concurrency 32 --requests 32`,
+  64 greedy tokens, top-2 logprobs, compared with its ebe237e base dumps from kiln-ut-32; ebe237e's base rerun on this
+  box is bit-identical to them, 32 / 32 with |d| = 0, so the cross-box floor is zero):
+
+| prompts | outputs equal | decode-path signed mean dlogprob (test - reference, nats / token, +/- SE) | mean / p99 / max \|d\| | first-difference margins |
+|---|---|---|---|---|
+| LONG_TEXT | 28 / 32 | -0.00039 +/- 0.00030 (n = 1839) | 0.0016 / 0.048 / 0.31 | the four 700-token prompts: 0.375, 0.75, 0.125, 0 |
+| wikitext-2 | 7 / 32 | -0.00113 +/- 0.00237 (n = 1010) | 0.035 / 0.29 / 0.87 | 25 flips: 23 at <= 0.25, one at 0.5, one at 1.5 (prompt 700, output 8) |
+
+**Where the wikitext-2 jitter comes from** (the same check, each stage's graphs on this box, wikitext-2 prompts; logs
+cm-attr-*-wiki and cm-cmp-*; teacher-forced over decode calls):
+
+| stage | against | equal | signed mean +/- SE | mean / p99 / max \|d\| | prefill-chunk tokens |
+|---|---|---|---|---|---|
+| ebe237e base, rerun | ebe237e base (kiln-ut-32) | 32 / 32 | 0 | 0 / 0 / 0 | identical |
+| + decode kernels + SP decode (ebe237e, DKS) | base | 5 / 32 | -0.00192 +/- 0.00172 | 0.024 / 0.21 / 0.69 | identical |
+| + fused prefill kernel (54ec5df FU + DKS) | DKS | 4 / 32 | -0.00256 +/- 0.00236 | 0.034 / 0.29 / 0.52 | mean \|d\| 0.036, -0.0037 |
+| + v2 + EP gate (f70c14b defaults) | FU + DKS | 9 / 32 | +0.00105 +/- 0.00165 | 0.024 / 0.21 / 0.54 | identical |
+
+No single stage carries the tail: each numerical change adds per-token jitter of about the same size (mean |d|
+0.024-0.034), none moves the mean by more than ~1.3 standard errors, and the LONG_TEXT check, whose SE is 8x smaller,
+puts the whole default stack at -0.0004 +/- 0.0003. Greedy flips follow from that jitter at the positions where wikitext
+continuations are nearly tied (most first differences sit at margins <= 0.25).
+
+**The fused kernel's prefill numerics, decode-free** (check_ppl wikitext, DP 4, 3071 tokens, per token against XLA):
+XLA -0.54723; the static attention kernel -0.54782 (-0.00059 +/- 0.00231, mean |d| 0.042, max 1.59); the fused kernel
+-0.54753 (-0.00030 +/- 0.00249, mean |d| 0.043, max 1.53); fused against static +0.00029 +/- 0.00205 (mean |d| 0.033).
+Both kernels move per-token logprobs by the same amount against XLA and neither moves the mean. With the selection exact
+in both, that points to the attention core's summation order and rounding (P in bf16 into the P K matmul, the online
+softmax's rescaling) rather than to anything the fused kernel adds over the static one, and the KV written for the
+decode steps inherits it. By the rule for this pass (keep the default if the signed mean stays at the floor and wikitext NLL is
+unchanged) the fused kernel stays on. **Follow-up item** (not done here): measure whether an fp32 P K accumulation in the
+attention kernels, or XLA's reduction order for the softmax statistics, closes the per-token jitter (mean |d| 0.042 in
+prefill); the selection itself is exact against its emulation and is not a source.
+
+**Follow-up closed: the jitter is XLA's bf16 scores, not the kernels** (2026-10-05, kiln-pf-k1 trn1.2xlarge, SDK 2.32,
+nki 0.6.0, feat/prefill-mfu 9ba9e42; `python tools/probe_dsa_numerics.py --qscale 1 4 16`, log s3
+logs/kiln-pf-k1/20261005T165030Z-probe_dsa_numerics.log). Each form of the pooled-DSA prefill attention core at the rank shape
+(1024 queries over 8448 keys, 8 heads, latent 512, 512 random selected pools of 4 plus the tail, causal) against an fp64
+softmax attention on the same bf16 inputs, ||o - ref|| / ||ref|| of the latent-space output:
+
+| q scale (softmax) | XLA expand (what _core ran) | XLA absorbed | XLA absorbed with fp32 operands | static kernel (dsa_prefill) | CPU emulation (P rounded after normalising) |
+|---|---|---|---|---|---|
+| 1 (flat: max p 0.002, 28 keys > 1e-3) | 1.48e-3 | 1.39e-3 | 1.39e-3 | **1.38e-3** | 1.39e-3 |
+| 4 (max p 0.027, 230 keys > 1e-3) | 2.07e-3 | 1.15e-3 | 1.15e-3 | **0.91e-3** | 1.15e-3 |
+| 16 (peaked: max p 0.56, 24 keys > 1e-3) | 4.79e-3 | 1.47e-3 | 1.47e-3 | **0.41e-3** | 1.47e-3 |
+
+The kernel is the most exact form at every sharpness, up to 12x closer to exact arithmetic than the expand form the
+wikitext comparison used as its reference. The XLA forms round the scores to bf16: the einsum of two bf16 tensors returns
+bf16, and the expand form also rounds the decompressed keys. They round the normalised p to bf16 as well. The kernel keeps
+S in fp32 PSUM and rounds only the unnormalised P, then divides by an fp32 row sum. "fp32 operands" changes nothing on the
+device: the graphs compile with the bf16 auto-cast (neuronx_cc_args), so XLA's matmuls round their operands to bf16 whatever
+their dtype. The kernel's remaining error (0.4-1.4e-3) is at the level of rounding o to bf16 after it (models/mla.py
+`.to(model.dtype)`; a bf16 rounding is ~1.1e-3 rms relative). So an fp32 or hi/lo-split P K accumulation would buy nothing
+visible and would cost the kernel's tensor-engine time (P K and the P^T transposes doubled). The per-token |d| of 0.042
+against XLA is XLA's own rounding, and no kernel change follows.
+
+**Quality of the best opt-in (EPLB):** wikitext is the defaults' by construction (the farm's wt-DP4-EPLB capture is
+key-identical to wt-DP4, so no redundant slot enters check_ppl's graphs).
+Greedy text through 25a45c9's G64-EPLB graphs (the initial placement: check_mixed does not rebalance; logs cm-eplb-*,
+cm-cmp-eplb-*, cm-cmp-def-VS-eplb-*):
+
+| prompts | against | outputs equal | decode-path signed mean +/- SE | mean / p99 / max \|d\| | first-difference margins |
+|---|---|---|---|---|---|
+| LONG_TEXT | ebe237e base | 28 / 32 | -0.00007 +/- 0.00040 (n = 1825) | 0.0016 / 0.036 / 0.39 | 0, 0, 0.375, 0.5 |
+| LONG_TEXT | f70c14b defaults | 28 / 32 | +0.00010 +/- 0.00021 (n = 1813) | 0.0009 / 0.020 / 0.22 | |
+| wikitext-2 | ebe237e base | 2 / 32 | -0.00273 +/- 0.00255 (n = 825) | 0.035 / 0.31 / 0.74 | 30 flips: 25 at <= 0.25, 0.375 twice, 0.5, 0.5625, 0.75 |
+| wikitext-2 | f70c14b defaults | 7 / 32 | -0.00004 +/- 0.00199 (n = 973) | 0.029 / 0.25 / 0.54 | |
+
+EPLB against the defaults moves no mean on either text (+0.0001 +/- 0.0002 on LONG_TEXT) and adds per-token jitter the
+size of one more numerical change (a replicated expert's rows summed on its copies).
+
+## Long context (1M)
+
+### Kernels (feat/lc-kernels, 2026-10-05, SDK 2.32, nki 0.6.0, neuronx-cc 2.27, trn1.2xlarge kiln-lc-k1)
+
+Two NKI kernels for the long-context DSA path (models/dsa_long.py), each with a torch emulation that is the host
+path, checked against it on one NeuronCore by `tools/probe_dsa_long.py` (logs under /opt/kiln/logs on kiln-lc-k1) and
+on the host by `tests/test_dsa_long_kernels.py`.
+
+**Selection primitives on trn1** (`python tools/probe_lc_prims.py`, each against the host's definition):
+`nisa.max8` (the 8 largest of each partition, duplicates included), `nisa.nc_find_index8` (the first position of each
+of 8 values, duplicates paired with ascending positions), `nisa.nc_match_replace8` WITHOUT `dst_idx` and
+`nisa.nc_n_gather` (GpSimd, within a partition) all run and are exact. `nc_match_replace8(dst_idx=...)` does not
+compile: `[NCC_INLA001] Codegen: Unimplemented instruction ... with OpCode MaxIndexAndMatchReplace`. Rounds of max8 +
+find_index8 + match_replace8 extract a row's top-k in (value descending, position ascending) order, which is the DSA
+tie rule: 64 rounds (top 512) over [128, 512 / 8192 / 16384] fp32 took 0.35 / 1.68 / 3.10 ms (one call each, the launch
+floor ~0.15 ms included). An indirect DMA takes ONE index per partition per instruction (a 2-D `vector_offset` is
+rejected: "'src_index' free dimensions total elements must be 1"), and on trn1 it is software DGE on the GpSimd queue:
+512 such gathers of one row per partition cost 0.98 / 1.21 / 1.72 ms for rows of 2 / 8 / 32 fp32.
+
+**What paces the pooled indexer's score** (`python tools/probe_lc_score.py`: 32 heads x 512 pools x 128 queries per
+chunk, per head a bf16 matmul, relu x scale and the weighted add into an fp32 accumulator; ns per head and chunk): PE
+matmuls alone 225, the ACT relu alone 250, the DVE weighted add alone 1004 with one accumulator and 687 with two
+(each add no longer waits for the previous one), ACT + DVE together 1121-1324 whether the relu writes in place, to
+another PSUM bank or to SBUF: the two engines interfere. A DVE `scalar_tensor_tensor` on GpSimd does not compile. An
+ACT activation whose scale or bias is an immediate costs two DVE memsets per instruction (1.7 ms of a 23.5 ms
+selection call at 262,144 pools, from the profile); a copy activation only takes an immediate bias (NCC_IBVF043).
+
+**kernels/dsa_long_select.py**: the exact top-keep pools of N queries sharing one context's pool keys (a prefill
+chunk), candidates a prefix p < npool(q). Queries on the partitions, 128 per tile in a device loop; per 512-pool chunk
+(its prologue issued one chunk ahead): pool keys by DMA, PE transposes, 32 head matmuls, relu in PSUM, the head sum in
+two fp32 chains (even / odd heads; `emulate_scores` follows that order), scores to an HBM scratch and sub-block maxima
+into SBUF; level 1 the top-keep sub-blocks by extraction rounds, their indices sorted ascending, their scores gathered
+back (one indirect DMA per sub-block column), level 2 the top-keep candidates by extraction, mapped to pools by
+`nc_n_gather`, then pools ascending with their scores. The sub-block size (`pick_sub`) minimises the extracted values
+(16 at 262,144 pools; one level up to 8,704). Output (pools [N, keep] ascending, 0 past the count; count; the exact
+fp32 score each selected pool compared, NEG_INF past the count).
+
+Exactness gate (`python tools/probe_dsa_long.py select --rows 8 128 --pools 2112 8448 32768 131072 262144 --diag`, log
+20261005T182059Z-probe_dsa_long.log; kinds pooled / randn / ties / zeros / equal / wide / ulps / short, npool per query
+cycling over 0, keep - 1, keep, keep + 1, P / 2, P and random): the device's selected pools equal emulate's on every
+kind at every P and N except the "ulps" kind (scores a few ulps apart) at P <= 32,768, 1-7 rows of 128, where the PE's
+dot-product summation order moves a score's last bits and flips a near tie (device scores differ from emulate_scores'
+in most values, max relative difference 1.4e-6 to 2.8e-4 on that kind, 1.8e-5 elsewhere); on every such row the device
+selection equals the exact top-keep of the device's OWN scores (dumped through the kernel's dbg output). So the
+selection is exact and the score arithmetic matches the emulation to the last bits of each dot product, as for
+kernels/dsa_topk.py.
+
+| N = 128 queries, keep 512, 32 heads | 2,112 pools | 8,448 | 32,768 | 131,072 | 262,144 |
+|---|---|---|---|---|---|
+| p50 per call (ms) | 1.97 | 2.65 | 4.73 | 11.91 | 21.02 |
+| ns per (query, pool) | 7.28 | 2.45 | 1.13 | 0.71 | 0.63 |
+
+(N = 8 takes the same time: the kernel is per 128-row tile. 1.37 ns per pair for dsa_topk.score_select at 1024 x 2112
+pools, docs above, is the bucketed path's number.) Profile at 262,144 pools (`tools/prof_attn_kernels.py dsa_long`,
+KILN_PROF_POOLS=262144, before the two accumulators): kernel 25.3 ms, DVE busy 15.2 ms (the head-sum adds 10.7, max8 /
+match_replace8 / find_index8 4.4), ACT 12.5, PE 11.0, GpSimd 0.1: the selection is ~1/4 and the score ~3/4, bound by
+the ACT + DVE pair above. At 1M the indexer's 1.51e12 (query, pool) pairs per sequence and 11 layers cost ~950
+NeuronCore-seconds at 0.63 ns, ~30 s of a trn1.32xlarge when context parallelism spreads them over its 32 cores.
+
+**kernels/dsa_slots.py**: kernels/dsa_decode.py's absorbed-MLA attention over each row's own slots (pool rows of 4
+tokens, an additive bias), for N rows (a prefill chunk's queries), with an optional per-(row, head) log-sum-exp to
+combine context-parallel partials (o = sum_r exp(lse_r - LSE) o_r). The rows run in a device loop, 4 per iteration;
+every per-row input and output is a DMA at the loop register's offset; the bias sits on one partition and enters the
+scores' PSUM through a K = 1 fp32 matmul; the scores are 512 tokens per matmul over the row's whole K^T tile; P and its
+fp32 sum come from one ACT instruction. Gate (`python tools/probe_dsa_long.py slots --rows 8 128 1024 4096 --heads 8 64
+--kv fp8 bf16`, log 20261005T183508Z-probe_dsa_long.log; 640 slots per row over a 4096-page cache, 512 random selected
+pools, a partial tail, padding, one row with every slot masked): max |o - emulate| / max |o| 2.2e-3 to 3.0e-3 in every
+case (dsa_decode's own kernel 2.2e-3 / 2.3e-3 on the same rows: the bf16 P), lse within 3.4e-5, the all-masked row
+finite with lse ~NEG_INF.
+
+| us per row (outputs reduced on the device) | N = 128 | 1,024 | 4,096 |
+|---|---|---|---|
+| H 8, fp8 latent | 40.9 (dsa_decode 43.7) | 38.4 | 38.9 |
+| H 64, fp8 | 41.8 | 39.6 | 40.1 |
+| H 8, bf16 latent | 34.8 (dsa_decode 36.3) | 32.2 | 32.8 |
+| H 64, bf16 | 36.6 | 32.9 | 33.8 |
+
+Rows per iteration (1024 rows, fp8, H 8 / 64): 1 row 45.9 / 48.3, 2 rows 41.0 / 43.6, 4 rows 39.0 / 39.5, 8 rows 40.3
+/ 39.2 us. A row costs the same at 8 and 64 heads: it is the per-row K^T work (80 PE transposes of [128, 128] latent
+blocks, each loading its block as the stationary, and their PSUM -> SBUF copies), not the heads, so the attention
+costs ~8x less per (query, head) with all 64 heads of a query on one rank than with attention TP 8. A 4096-query chunk
+is ~160 ms per layer per rank head-split, against ~20 ms per layer when each of 8 ranks takes 512 queries with all heads.
+Trap: an earlier probe timed the call with its [N, H, R] output read back to the host, which made H = 64 look 1.5-2x
+slower at N >= 1024 (82 us per row); reduce the output on the device before timing.
+
+### What stopped 1M, and the arithmetic (2026-10-05, engine-v0 70ddc1b, from code and config.json eb9eb208)
+
+GLM-5.3-Flash's max_position_embeddings is 1,048,576 (W1M: 1,044,480 in + 4,096 out). On engine-v0 nothing past the
+dense-masked buckets ran: decoder.prep_prefill built the visibility `j <= pos` as [C, L] and `_bias` made it fp32 (16 GB
+at C = 4096, L = 1M); mla.attention `_load`ed the whole context's latent, indexer rows and pool keys per DSA layer and
+call (1.5 GB per layer at 1M in bf16); mla.bind_scratch allocated the selection scratch [rows, max_keys] bf16 at bind
+time (8.6 GB at 4096 x 1M: the engine died at start-up); pooled_selection / block_mask / pool_index made [B, Q, L] masks
+and a [C, 32, P] fp32 score tensor (137 GB at C = 4096, P = 262,144); kernels/dsa_topk.py holds MAX_W = 4096 scores per
+partition (decode P <= 65,536 at 8 rows, score_select and dsa_fused P <= 4096); dsa_prefill is a dense masked attention
+over all L keys with a [C, L] mask input, and the prefill MLA mode "expand" decompresses every context key in every
+chunk (O(L^2 / C)); no context-parallel layout existed (the latent is replicated by MLA design, DP attention divides it
+by groups only); page buckets are a geometric ladder to 32,768 pages and every DSA graph's shapes scale with the bucket.
+KDA, the NoPE DSA layers' (absent) RoPE tables, positions in fp32 (< 2^24) and the host tier had no length limit.
+
+Bytes and FLOPs (`/tmp/lc/arith.py`-style arithmetic from the config, checked in tests/test_dsa_long.py's byte test):
+- KV: today 9,152 B/token under FP8 KV (latent 512 + indexer key and gates 256 in fp8, + the separate bf16 pool-key
+  pieces 64; x 11 DSA layers) = 9.60 GB per 1M sequence on every rank of an attention group; the minimal layout (latent +
+  fp8 pool key pieces) 5,984 B/token = 6.27 GB. KDA state 0.148 GB per sequence (34 x 64 x 128 x 128 fp32 + conv).
+- Prefill: 16.07 B active parameters per token (KDA 4.68, DSA 1.37, MoE 9.56, dense 0.45) = 32.1 GFLOP, + sparse
+  attention over 2,052 keys 3.3, + the indexer 0.09 at 8k (0.19 as the bucketed path computes it, every pool of the
+  bucket) and 11.81 GFLOP/token averaged over a 1M prompt (23.6 at its end): 35.6 / 47.3 GFLOP per token.
+- The indexer over a 1M prompt: sum over queries of their candidate pools = 1.37e11 per layer, 1.51e12 (query, pool)
+  pairs per sequence. At score_select's 1.37 ns per pair (1024 x 2112, the score's DVE head sum is most of it; the 47
+  radix rounds alone are 0.37 ns) that is 2,070 NeuronCore-seconds, against ~4,600 for the GEMMs at the 8k serving
+  efficiency (G64: 6,917 prefill tok/s on a trn1.32xlarge), and x 8 when every rank of an attention group computes the
+  same selection (engine-v0's replicated indexer).
+- Decode at 1M: 0.74 GB of bf16 pool keys per row per step (0.37 in fp8) + 11.6 MB of selected latent; 23.6 GFLOP of
+  indexer per row per step.
+
+### The long path (models/dsa_long.py, models/mla.py attention_long / attention_cp, 2026-10-05)
+
+A pooled DSA bucket past `KILN_DSA_LONG_KEYS` (16,384) keys never forms anything of the context's size per query:
+- candidates: a query at pos may select the complete pools p < npool = floor((pos + 1) / 4), a prefix (no mask);
+- selection: the exact top 512 (ties to the lowest pool index, all when fewer) as a list of pools and a count; on the
+  host select_two_level (proof in the module docstring: the exact selection lies in the top-512 sub-blocks by maximum
+  under the same rule, gathered in index order), select_reference the dense definition; a chunk on the device through
+  kernels/dsa_long_select.py (above), a decode batch through dsa_topk in row groups that fit MAX_W plus a sqrt(P)-sized
+  fp32 count compaction (dsa_long.compact), or with `KILN_DSA_LONG_SCORER=index` the decode agent's kernels/dsa_index.py
+  for the scores (copied from feat/decode-scale 2fbe874);
+- attention: the selected pools' tokens and the query's tail pool as 640 slots of pool rows with a 0 / NEG_INF bias,
+  absorbed MLA over the gathered latent (kernels/dsa_slots.py for a chunk's rows, kernels/dsa_decode.py for a decode
+  batch); the prep graphs pass a [*, 1] placeholder bias (made from the block table, see the MPMD trap below), and the
+  selection scratch is capped at LONG_KEYS wide.
+- `KILN_DSA_QSHARD=1` (opt-in): a chunk's rows are split over the attention group and each rank attends its C / A rows
+  with all 64 heads (whole-head q_b, W_UK, W_UV, o_proj copies, ~1.2 GB per rank in FP8): dsa_slots costs the same per
+  row at 8 and 64 heads, so per (query, head) this is 8x cheaper than attention TP 8. Without it the chunk's selection is
+  still split over the group (each rank C / A queries, gathered by a zero-padded fp32 group all-reduce).
+- `KILN_DSA_CP=1` (opt-in): each rank of an attention group of A holds context pools c = m A + rank (page_size / A local
+  slots per page; the host's pages, prefix cache and admission unchanged), writes only the tokens it owns (unowned and
+  padded tokens to a dump slot nothing reads: duplicate scatter destinations are nondeterministic), selects its exact
+  local top 512, merges the ranks' (score, context pool) lists exactly (dsa_long.cp_merge: the threshold from dsa_topk's
+  selection, then a binary search for the smallest context pools among its ties) and attends its own selected pools with
+  every head; the partials are combined by log-sum-exp (dsa_slots / dsa_decode lse) with a group reduce-scatter onto each
+  rank's heads. KV per rank is 1 / A. Use page_size = 32 x A (256 at A = 8): a rank's pools of a page are then 8
+  contiguous pools, one 2 KB descriptor (the decode agent's scorer measured one 256 B pool per descriptor at 20 GB/s).
+- `KILN_DSA_KV=minimal` (opt-in): V is the pool-key pieces in the KV dtype (5,984 B/token under FP8 KV), each request's
+  open pool keeps its indexer rows in a per-request state row (hybrid.aux_state_shapes, write_pool_keys_minimal); not
+  with MTP, verify, mixed batches or CP yet. Quality gate pending.
+
+CPU (tests/test_dsa_long.py, transformers 5.18, fp32): two-level == the dense rule == the rule written out on adversarial
+ties (plateaus across sub-block boundaries, block-maximum ties, exact zeros, signed zeros, subnormals, npool 0 / keep /
+keep + 1) at sub 1-32, the proof's corner as its own test; slots == glm5_next.block_mask + causal visibility (pages of 4
+and 8, chunk and decode forms); the engine on the long path == transformers' greedy tokens and the bucketed path's
+logprobs (2e-5) through chunks that cut pools, a prefix hit, separate / inplace / off pool caches and FP8 KV, also at
+1,500 tokens (375 pools vs 4 kept); tp=2 sharded selection, QSHARD at tp=2 and CP at tp=2 / 4 == tp=1; minimal KV ==
+full in fp32 on both paths; cp_merge == the global rule at A = 2 / 4 / 8; the index scorer's layout == dsa_long.scores.
+
+Device traps found on the way (trn1, SDK 2.32, neuronx-cc 2.27):
+- **A concatenate of small int64 / bool pieces failed neuronx-cc with `[NCC_IFML902] FlattenMacroLoop error: Pelican
+  exception: Cannot remove an edge that is not found`**: the slots' `torch.cat([pools, tail, zeros])` and its bool mask
+  at keep 8 (index_topk 32), and engine-v0's own glm5_next.decode_slots at the same config (random GLM-5.3-Flash,
+  KILN_DSA_DECODE_KERNEL=nki). dsa_long.slots now builds rows and bias by broadcasting (gather + where), no concatenate.
+- **An `importlib.util.find_spec` inside a traced function breaks dynamo** ("skip reason: <missing reason>"): module
+  constants only.
+- **Float-literal comparisons (`s > VISIBLE`) lowered to f64 again (NCC_ESPP004)** in the CP merge: compare against
+  `torch.full_like`.
+- **`MPMD execution is not supported. Most likely some ranks recompiled/reloaded a graph`** at tp=2 in
+  tools/check_device.py's teacher-forced pass, on engine-v0's bucketed path too (KILN_DSA_DECODE_KERNEL=xla): a prep
+  graph identical for the plp and non-plp prefill callables is one cache key loaded twice, and the two loaded copies'
+  collective barrier fails. The long path's prep graphs are now made from their block table (a graph per bucket), and
+  multi-rank device checks compare `--no-reference --out-json` against a `--host-reference-only` file.
+
+Random GLM-5.3-Flash (tools/build_random_hybrid.py --sparse, index_topk 32), bf16 on trn1.2xlarge against Kiln's fp32 host
+path, KILN_DSA_LONG_KEYS=64: tp=1 teacher-forced max |dlogprob| per prompt 0.491 / 0.749 / 0.498 / 1.184 / 0.468 / 1.730 /
+0.159 / 0.501 on the long path and 0.491 / 0.749 / 0.498 / 1.185 / 0.468 / 1.730 / 0.159 / 0.501 on the bucketed path
+(XLA decode); tp=2 (page 64) greedy tokens matched 2 / 17 / 32 / 25 / 0 / 6 / 12 / 13 of 32 with CP and 2 / 17 / 32 / 26 / 0
+/ 6 / 12 / 13 replicated (a random model in bf16 diverges early at margins 0.006-0.24 either way).
+
+### Real weights on trn1 at 16k and 128k (2026-10-05, trn1.32xlarge kiln-lc-32 spot, SDK 2.32, feat/long-context bb0deaf)
+
+GLM-5.3-Flash (eb9eb208, FP8 weights and KV), tp=32, DP attention 4, the trn1 serving env (KILN_CC_ARGS=--model-type=
+transformer KILN_DSA_SELECT=nki KILN_LINEAR_ATTN_KERNEL=nki KILN_MOE_KERNEL=nki KILN_MOE_PREFILL_KERNEL=nki
+KILN_MOE_PREFILL_SKIP=20 KILN_PIECEWISE_MOE_GROUP=12 KILN_PIECEWISE_PREFILL_MOE_GROUP=12 KILN_PREFILL_SP=1
+KILN_SP_ROUTE=1), prefill 512 tokens per step (128 per group), every graph from farm queue q/lc-trn1-a with
+NEURON_LIBTORCH_ASSERT_CACHE_HIT=1. Text: tools/fetch_long_text.py (Project Gutenberg: War and Peace first, 2.94M GLM
+tokens in all). Logs and exact commands: s3://<your-bucket>/logs/kiln-lc-32/lc-<run>.log, .log.cmd, .json.
+
+- **Long path vs the bucketed path** (`python tools/check_long.py nll ... --max-tokens 16320`, A `--page-buckets 512`,
+  B `KILN_DSA_LONG_KEYS=4096 --page-buckets 128 512`; per-position logprobs from the .json): positions < 4096 identical
+  (both bucketed); 4096-8191 mean(B - A) +0.00009 nats, mean |d| 0.0141, |d| > 0.01 at 9.8%; 8192-16319 -0.00056,
+  0.0144, 10.2%; max |d| 1.93 / 2.06. For scale, two compiles of one model differ by mean |d| ~0.05 (the DSA top-k
+  section above). Mean NLL 0.0878 (A) / 0.0881 (B). The bucketed path cannot run past 16,384 keys (its kernels' limits),
+  so this is the longest equality check against it.
+- **NLL at 128k on the long path** (lc-128kN, 131,008 tokens, `--page-buckets 512 1024 2048 4096`): mean 0.1220; by
+  position band [0, 1k) 0.0670, [1k, 4k) 0.0632, [4k, 16k) 0.0958, [16k, 64k) 0.1341, [64k, 131k) 0.1214; 571 s (one
+  sequence in one group, 128 tokens per call: a correctness configuration). The book is likely memorised (NLL ~0.1).
+- **Needle** (lc-128kH, `tools/check_long.py needle --lengths 32000 130900 --depths 0.1 0.5 0.9`, the GLM chat format
+  with an empty think block, a 7-digit number in the book): 6 / 6 at 32,000 and 130,900 tokens, 712 s for the six.
+
+**Does the long path use the long context?** (lc-64kS: the same book tokens 65,536-131,007 scored with
+`--skip-tokens 65536`, i.e. without the 64k before them, against lc-128kN's same positions with them; mean NLL
+0.1678 alone vs 0.1214 with the prefix.) In 2k-token windows of the span, the two agree within the text's own
+variation for the first ~20k (8k-20k: 0.100 / 0.104, 0.111 / 0.111, 0.136 / 0.140, 0.097 / 0.107, 0.104 / 0.105,
+0.123 / 0.131, 0.099 / 0.089), and from ~22k of the span on the run with the 64k prefix is 0.02-0.045 lower (0.156 /
+0.135, 0.157 / 0.112, 0.139 / 0.117, 0.150 / 0.130): the earlier context pays off where the book refers back to it.
+Neither run shows a step at 16,384 keys, where the long path takes over from the bucketed one.
+
+**The minimal KV layout against the full one** (lc-16kM: `KILN_DSA_KV=minimal KILN_DSA_LONG_KEYS=4096`, the same
+16,320 tokens, farm queue q/lc-trn1-m, kiln-lc-32b): positions < 4096 (the bucketed path reading fp8 pool keys) mean
+(minimal - full) -0.00002 nats, mean |d| 0.0048, |d| > 0.01 at 3.1%; 4096-16319 (the long path) +0.00068, |d| 0.0152,
+10.0% (full long path vs the bucketed one: 0.0141, 9.8%). Mean NLL 0.0954 against 0.0961 (full, long) and 0.0958
+(bucketed). The fp8 pool keys move no mean and add no spread beyond the path's own.
+
+**The selection kernel's device loop over query tiles is wrong past the first tile** (kiln-lc-k3, nki 0.6.0,
+`tools/probe_dsa_long.py select --rows 128 1024 --pools 512 2048 --keep 512`): N = 128 exact, N = 1024 112 / 496 of
+1024 rows differ (rows of later tiles miss most of their pools). The kernel gate had used N <= 128 only, and the
+non-CP long path splits a chunk's queries over the attention group (128 rows per rank at C = 1024, A = 8), so every
+real-weight run above was one tile. The context-parallel path selects all of a chunk's queries on every rank and its
+first W1M run died with `Out of bounds access` in the prefill graphs. models/mla.py `_select_tiles` now calls the
+kernel once per 128 queries (`tools/lc_probe_tiles.py`: 0 of 1024 / 1024 / 384 rows differ at 512 / 2048 / 8448
+pools); a call of <= 128 rows traces as before.
+At 128k with the minimal layout (lc-128kHM / lc-128kNM, `KILN_DSA_KV=minimal`, q/lc-trn1-m, kiln-lc-32b): needle 6 / 6
+at 32,000 and 130,900 tokens (721 s); NLL by band [0, 1k) 0.0670, [1k, 4k) 0.0632, [4k, 16k) 0.0947, [16k, 64k) 0.1337,
+[64k, 131k) 0.1213 against the full layout's 0.0670 / 0.0632 / 0.0958 / 0.1341 / 0.1214.
+
+**The minimal layout's 8k G1 gates** (feat/long-context 9656235 = engine-v0 c7c43e9 merged; the G64 serving graphs and
+check_ppl's, full and `KILN_DSA_KV=minimal`, farm queue q/lc-g1m, one box kiln-lc-32c, `tools/hv_quality.sh <ppl|long|
+wiki> <def|min>`; logs s3 logs/kiln-lc-32c/hv-q-*, comparisons lc-g1-cmp-{ppl,long,wiki}.txt):
+- Wikitext-2 slice (check_ppl, 3071 tokens): full -0.5475, minimal -0.5474 (difference -0.0001), |dlogprob| mean
+  0.0134, max 1.58, greedy agreement 0.9958; both within 0.01 of the -0.551 reference.
+- check_mixed LONG_TEXT (32 prompts of 700-8192 tokens, 64 greedy tokens): 29 / 32 equal; decode-path signed mean
+  (minimal - full) -0.00032 nats (n = 1898), mean |d| 0.0023; prefill chunks -0.0051 (n = 32), mean |d| 0.015.
+- check_mixed wikitext-2: 3 / 32 equal; decode-path signed -0.00033 (n = 848), mean |d| 0.033; prefill chunks -0.0042
+  (n = 32); every first difference at a margin of 0.25 or less (eight at 0.125 or less).
+- Against the floors of "The final combined measurement" and the NKI-gather section (two numerically neutral engines:
+  LONG_TEXT 28-30 / 32, wikitext 4-18 / 32 at mean |d| 0.015-0.034): no bias, the flips at the floor's margins.
+
+**The G64 default graph keys on the merged tree** (compile_farm capture, ranks 0, 8, 16, 24, the G64 argv of
+tools/hv_ab.sh): engine-v0 c7c43e9 and feat/long-context 9656235 give the same 15 keys on each rank (33 distinct over
+the 32 ranks, every one already compiled in the trn1 cache).
+
+### 1M on the device: W1M measured (2026-10-05/06, SDK 2.32, every graph from the farm, NEURON_LIBTORCH_ASSERT_CACHE_HIT)
+
+W1M = 1,044,480 input + 4,096 output tokens per request (max_position_embeddings 1,048,576), bench/serve_sweep.py, one
+request per DP-attention group, so a level of 4 per engine. Logs and exact commands: s3 logs/<box>/<log>(.cmd).
+
+| | trn2.48xlarge half (cores 32-63, kiln-t2-cb) | trn1.32xlarge (kiln-lc-32) |
+|---|---|---|
+| layout | minimal KV 6.0 GiB per rank, replicated over the attention group | full KV 1.5 GiB, CP over 8 (page 256) |
+| tree / queue | e5ff256 / q/lc-trn2-m | e5ff256 + 51afd8a / q/lc-trn1-cp3 |
+| log | lc-t2-W1M-M | lc-W1M-CP3 |
+| warm-up request (one 1M request alone) | 2266.7 s | 2173.5 s |
+| level: 4 requests, wall | 2237.2 s | 2166.3 s |
+| TTFT p50 / p90 | 1650.6 / 1650.9 s | 1938.4 / 1938.8 s |
+| ITL p50 at ~1M | 143.1 ms | 55.4 ms |
+| out tok/s (all-in) | 7.3 | 7.6 |
+| input tok/s (4 x 1,044,480 / TTFT) | 2,531 per engine | 2,155 per box |
+| $ / 1M input at spot | 0.81 ($7.40/h per half box) | **0.277** ($2.15/h) |
+| decode tok/s at 1M (1 per group fits) | 4 / 143.1 ms = 28 per engine | 4 / 55.4 ms = 72 per box |
+| all-in $ / request at spot | 1.15 ($7.40/h half) | **0.323** |
+
+Four concurrent 1M requests take the wall time of one: a lone request already runs its group's 1024 rows per call, and
+the four groups run in parallel. trn2 HBM at 1M (neuron-monitor during the run, cores 32-63): 23.91-24.26 GB per
+logical core (tensors 19.06, model code 2.74-3.10, shared scratchpad 1.88, runtime 0.04); the full layout replicated
+had failed to load (23.857 GB used at the allocation failure, above).
+
+**Where a trn1 CP call goes, by position** (lc-1M-TL on kiln-lc-32b: the CP3 configuration with one request and
+KILN_TIMELINE, host-side only; tools/lc_timeline.py; the measured request, after the warm-up):
+- Prefill call (1024 rows): 1.766 s at every position in the 1024-page bucket (local pools 8,192 per rank, contexts up
+  to 256k) and 1.955 s in the 4096-page bucket (32,768 local pools): flat inside a bucket, because the scores and the
+  selection run over the bucket's pools, masked past the context. The bucket step, 0.19 s for 24,576 more local pools
+  per rank, is 11 x 1024 x 24,576 x 0.68 ns: the selection kernel's own rate (0.63 ns per pair at N = 128).
+- The rest is fixed, 1.70 s against the G1 call's 0.47 s. At the kernels' measured rates, slot attention is 0.445 s of
+  it (kernels/dsa_slots.py, 1024 rows x 64 heads x 640 slots: 39.5 us per row, x 11 layers); ~0.79 s is not yet
+  attributed (the CP collectives: q_all gather 67 MB and fp32 partial reduce-scatter 134 MB per layer, the merge's
+  dense tie search, the pool-key writes). A util_report replay of call prefill:600 is the measurement in progress.
+- Decode step at ~1M: 54.4 ms median (55.3 at the end), 4096 steps.
+- Longest host-blocked section: 1.96 s (a prefill read-back). The 143.5 s, 87.6 s and 45.0 s steps are graph first
+  loads in the warm-up, which the exec watchdog does not watch, so the 300 s default holds for 1M.
+
+**Needle at 1M** (lc-needle-1M-CP, kiln-lc-32: `tools/check_long.py needle` with the W1M-CP3 engine configuration,
+`--max-model-len 1048576 --decode-buckets 1 --state-checkpoints 0 --overlap`, its graphs from q/lc-trn1-cp3 under
+ASSERT_CACHE_HIT, the key check by `compile_farm.py capture --tool check_long` + `check`: 54 graphs, 0 missing): **9 / 9**
+at 131,072 / 524,288 / 1,044,480 tokens x depths 0.1 / 0.5 / 0.9, 3448.8 s for the nine (four groups, one 1M request
+per group). The answers are the 7-digit numbers, then the model's own continuation.
+
+**Where the trn1 CP call goes inside, from a replay** (KILN_CAPTURE_INPUTS of call prefill:600, ~600k tokens into a lone
+1M request, the 4096-page bucket; `tools/util_report.py replay` on every rank with its own inputs, rank 0 profiled, then
+`bins`; kiln-lc-32b, s3 logs/kiln-lc-32b/lc-bins1m.tgz). Pieces: prep 3.9 + 510 + 540 + 542 + 376 + post 5.3 ms = 1.98
+s (serving: 1.955). One CP DSA layer is ~108 ms (107.9 / 107.7 / 108.9 in piece 1), by segment between collectives:
+- 38.5 ms (vector-heavy): projections, indexer, the K / V / pool-key writes, and the local selection kernel, whose rate
+  puts ~21 ms of it there (8 tiles x 128 queries x 32,768 local pools x 0.63 ns).
+- 3.1 ms: the CP gathers (vals, cpool, q_all as zero-padded all-reduces of 8-16 MiB).
+- 60.7 ms (tensor 18.5, vector 17.1, scalar 11.9): cp_merge, the local list's compaction, slot rows, the q_lat einsum
+  and dsa_slots (~40.5 ms at its measured rate, 1024 rows x 64 heads x 640 slots).
+- 1.2 ms the lse gather, 4.3 ms the combine (the fp32 partial's reduce-scatter, 128 MiB in 2.06 ms) and o_proj's.
+
+Per call (11 DSA layers, 1.19 s): slot attention 0.445 s, the local selection 0.23 s (0.06 in the 256k bucket),
+merge + compaction + slot rows + q_lat 0.22 s, projections + indexer + writes 0.19 s, CP collectives 0.07 s. A KDA
+mixer is 3.0 ms and a MoE FFN segment ~13.9 ms. The non-DSA ~0.76 s per call is a configuration difference: the
+automatic expert-parallel default (models/decoder.py) is off below 16 sequences at DP attention 4, and W1M runs
+--max-num-seqs 4, so its MoE is tensor-parallel; the default's own G16 measurement had the prefill call 0.895 s (TP)
+against 0.592 s (EP v2).
+
+**The CP configuration at 300k** (lc-300k-CP8, kiln-lc-32c, feat/long-context f997d35, q/lc-trn1-cpc, one request of
+307,200 tokens, `--max-model-len 1048576` for the W1M engine): TTFT 538.0 s, ITL p50 50.0 ms.
+
+**Expert parallelism for W1M** (the same box and request, `KILN_MOE_EP=1`, lc-300k-CP8E): TTFT **436.7 s** against
+538.0 s (-18.8%; the prefill call 1.79 -> 1.46 s, the -0.3 s of the EP rule's own G16 measurement), ITL 60.5 ms
+against 50.0 (+10.5 ms: the EP decode kernel at one row per group). For a W1M request (1,020 prefill calls, 4,096
+decode steps) that is -347 s of TTFT against +43 s of decode, so a colocated W1M engine wants EP; a PD decode-only
+engine at one row per group does not.
+
+**TTFT by prompt length, one request alone** (the measured lone requests on trn1; on trn2 the cumulative prefill wall of
+W1M-M3's timeline, whose four groups each prefill their own request in the same calls):
+
+| prompt | trn1 CP over 8 (f997d35, TP experts) | trn2 one engine, minimal KV |
+|---|---|---|
+| 131,072 | 225.8 s (lc-ttft-131072-CP8; ITL 46.0 ms) | 185 s |
+| 307,200 | 538.0 s (lc-300k-CP8; with EP 436.7 s) | |
+| 524,288 | 952.4 s (lc-ttft-524288-CP8; ITL 50.0 ms) | 806 s |
+| 1,044,480 | 1938.4 s (lc-W1M-CP3) | 1650.6 s (t2-W1M-M), 1651.7 s (t2-M3-A) |
+
+**trn2: the minimal layout's 1M decode through the fp8 index scorer** (t2-M3-A, kiln-t2-cb cores 0-31, feat/long-context
+d1378cf, q/lc-trn2-m3: 18 new graphs, the decode graphs; `KILN_DSA_LONG_SCORER=index` now takes V's fp8 pool-key pieces,
+the decode agent's REV8 kernel; 4 x 1M requests, `--skip-warm-request`): ITL p50 **92.2 ms** against 143.1 ms with the
+XLA scores (-36%), TTFT unchanged (1651.7 s). Decode at 1M: 4 rows / 92.2 ms = 43 out tok/s per engine. The prefill
+call (1024 rows per group, every group busy) by position: 0.97 s at 4k, 1.22 at 16k, 1.50 at 64k, 1.53 at 128k, 1.58
+at 256k, 1.66 from 512k on (the dense part is the G1 call's 1.00-1.05 s).
+
+**Needle at 1M on trn2** (lc-t2-needle-M3 on kiln-t2-cb, the same minimal-layout engine with the fp8 index
+scorer: feat/long-context d1378cf, graphs q/lc-trn2-m3 under `NEURON_LIBTORCH_ASSERT_CACHE_HIT=1`, LNC=2,
+`KILN_DSA_KV=minimal KILN_DSA_LONG_SCORER=index KILN_SP_GATHER=xla`, tp 32, DP attention 4, KV 6.0 GiB fp8,
+page buckets 512 / 2048 / 8192 / 32768, `--max-model-len 1048576`, 2026-10-05 23:10 UTC; log and .json in
+s3 logs/kiln-t2-cb/): **9 / 9** at 131,072 / 524,288 / 1,044,480 tokens x depths 0.1 / 0.5 / 0.9, 2391.9 s
+for the nine. The .json's `passed` is 9 and every case's `ok` is true, each answer the 7-digit number
+followed by the model's own continuation. So the 1M needle passes on trn2's minimal KV plus fp8 scorer as
+well as on trn1's context-parallel layout.
+
+**Two 1M engines do not fit one trn2.48xlarge's host memory.** Both halves of kiln-t2-cb at once (two serve_sweep
+processes) ended in OOM kills (dmesg 03:28-03:29 and 04:35-04:36, rank processes of 33-37 GB anon RSS); the surviving
+ranks reported "Failed to schedule neff execution status=2 message=Invalid" or gloo "Connection closed by peer". A rank
+of this configuration holds ~34.6 GB host RSS in serving (smaps: 34.6 GB private dirty anon, two heap regions of 21.3 and
+8.6 GB), so 32 ranks are ~1.1 TB of the box's 2 TB; a G1 rank holds ~4 GB (the disaggregation agent's PD boxes). It is
+not the load: with `KILN_MALLOC_TRIM=1` (new, opt-in) a rank prints 0.8 GiB after loading its weights (0.7 after the
+trim), and the RSS then grows while its graphs load and first run (15.6 GB at 704 graph loads). neuron-monitor puts it all
+under the runtime's host application memory (34.0-35.5 GB per runtime); the rank's NEFFs are 1.0 GB. Not attributed
+further; the graphs of the large page buckets (up to 32,768 pages) are the suspects.
+
+**CP slot classes: the first form loses, the vorder form** (tools/probe_cp_parts.py, trn1, one core, 1024 rows, A = 8, keep
+512, 32,768 local pools): cp_merge 6.46 ms (its dsa_topk 2.39), slot rows + bias 7.81, q_lat 0.21, dsa_slots 40.7. The
+first slot-class form's prep (compact of each row's selected local pools, then gathers) took 81.0 ms per layer: compact
+of [1024, 512] to 512 outputs 18.1 ms (to 128: 4.7), and the per-element `torch.gather` of [1024, 512] the rest (~60 ms:
+one DMA descriptor per element); against ~26 ms the classes save. The vorder form (fbadaa7) needs neither: the selection
+kernel returns its extraction order (score descending, pool ascending) without the final sort by pool (device sets equal
+to the emulation's at P = 2112 / 32768, every kind; 1-2 rows of 128 order a device-side fp32 tie differently), the merge's
+selected entries then lead each rank's list, and the small buffer is the list's first 127 slots and the tail, a slice.
+The local selection is ~0.42 s per call, not 0.23: a 128-query tile at 32,768 local pools takes 4.76 ms (1.13 ns per
+pair; 0.63 ns holds at 262,144), and CP runs 8 tiles per rank per layer where the replicated path runs one over all pools.
+
+**The vorder slot classes on the device** (feat/long-context 6b7f0e9 = fbadaa7 + engine-v0 2143e0b, q/lc-trn1-m2, 108
+graphs compiled clean; kiln-lc-32d, the same box for both arms, EP on in both):
+
+| | CP8E-m (EP) | CP8CE-m (EP + `KILN_DSA_CP_SLOT_CLASSES=1`) |
+|---|---|---|
+| 300k lone request: TTFT / prefill call / ITL | 436.7 s / 1.46 s / 60.5 ms | **320.1 s** / 1.07 s / 60.3 ms |
+| W1M, 4 x 1M one per group: TTFT p50 | 1573.6 s (lc-W1M-CP8E, f997d35 tree) | **1177.1 s** (lc-W1M-CP8CE-m) |
+| input tok/s per trn1.32xlarge, $ / 1M input at spot | 2,655, $0.225 | **3,549, $0.168** |
+| needle 128k / 512k / 1M x depth 0.1 / 0.5 / 0.9 | | **9 / 9** (lc-needle-1M-CP8CE, 2202.4 s) |
+
+CP8E-m at 300k reproduced the f997d35 tree's CP8E to the millisecond (436.68 / 436.65 s). The classes cut 0.39 s per
+call, more than the slot attention alone (~0.28 s): the vorder kernel also skips its final sort by pool, inside the 8
+selection tiles per layer.
+
+**Lone-request TTFT on one trn1.32xlarge** (the CP8CE-m engine, its 1024 / 4096-page buckets of page 256; logs
+lc-ttft-<n>-CP8CE-m on kiln-lc-32d): 8,192 tokens 8.32 s, 32,768 33.2 s, 131,072 133.0 s, 307,200 320.1 s, 524,288
+581.1 s, 1,044,480 1177.1 s (the W1M level's p50: one request per group, which a lone request's group times exactly);
+ITL 56.6-60.3 ms short of 1M, 64.1 at 1M. Every length pays the 256k bucket's selection at least: a short prompt belongs
+on the G1 engine, whose G64 graphs give a lone 8,192-token request 3.98 s (lc-ttft-8192-G64; ITL 86.4 ms at decode
+bucket 16), the 8 calls of one group's 1024 rows.
+
+**Not measured, and why:**
+- Lever 1 for a lone request (DP attention 1, CP over 32 ranks, page 1024, EP, slot classes; q/lc-trn1-m3): its prefill
+  pieces at 4096 rows per group need more than a c8i.48xlarge gives. 12-MoE-layer pieces were killed at ~220 GB
+  (returncode 70); 6-layer pieces ran 2+ hours, one killed by F137 after 73 min, the rest not done by the end of the
+  block. A first measurement wants 2048 rows per group or 3-layer pieces.
+- The 1M long-document NLL: the prompt-logprob graphs at 4096 rows per call fail to load ("Could not load the model
+  status=4 message=Allocation Failure") next to the CP KV at 1.5 GiB and at 1.3 GiB. It needs smaller prompt-logprob
+  calls. The needle at 1M (9 / 9 on each of three engines: trn1 CP3 lc-needle-1M-CP, trn1 CP8CE-m
+  lc-needle-1M-CP8CE, and trn2 minimal + fp8 scorer lc-t2-needle-M3) and the NLL bands at 128k stand.
+- The layer pipeline on the device: the stages' own prep graphs, loading only a stage's layers, and a multi-box EFA run.
+
+**trn2: the 1M decode call with the fp8 scorer, from a replay** (KILN_CAPTURE_INPUTS of decode call 100 of a lone 1M
+request on the W1M-M3 engine, all 32 ranks' inputs, rank 0 profiled; s3 logs/kiln-t2-cb/lc-dec1m-bins.tgz): pieces 0.33 +
+20.77 + 26.71 + 26.80 + 19.40 + 1.20 = 95.2 ms (ITL measured 92.2). The 11 DSA layers are ~3.5 ms each (38.7 ms, 41%),
+the other 34 layers 0.55-0.85 ms segments: past the fp8 scorer the long path is the smaller half of the 1M decode step.
+
+**One long prefill over several engines, the layer pipeline** (engine/pp.py, `pp_stages > 1`, prefill and piecewise only):
+stage engines run contiguous layer ranges of the piecewise plan (the split by measured time, a DSA layer weighing
+`KILN_PP_DSA_WEIGHT` = 6), a later stage takes the previous stage's hidden stream ([rows, hc 4 x 4096] bf16, 32 KB per
+token) instead of the embedding over disagg.py's frames, and every layer's KV, DSA history and KDA state stay on its
+stage. CPU (tests/test_pp.py): 2 and 3 stage processes give one engine's first tokens, logprobs and prompt logprobs (atol
+2e-5) on the long path. Not yet on the device: the stages' own prep graphs, loading only a stage's layers, the
+multi-box run.
+
+**The tie search over the bucket's bits** (`KILN_DSA_CP_MERGE_BOUND=1`, dsa_long.merge_bits): ceil(log2(context pools))
+steps instead of 21 (12 at a 64-page decode bucket of page 256), exact (tests/test_dsa_long.py
+test_cp_merge_bounded_bits); with the decode agent's row pieces for decode batches only (2e6e2b2: a prefill chunk's merge
+stays one piece) and its identity local selection when a rank's pools fit keep (KILN_DSA_CP_ALL_LOCAL, 0079633).
+
+## Collectives issued from an NKI kernel on trn1, and the prefill world gather as one (2026-10-05, SDK 2.32, nki 0.6.0, trn1.32xlarge)
+
+feat/prefill-mfu. GLM-5.3-Flash real weights, tp=32, DP attention 4, every graph from the compile farm with
+`NEURON_LIBTORCH_ASSERT_CACHE_HIT=1`. Boxes kiln-pf-32 / kiln-pf-32b (trn1.32xlarge spot), kiln-pf-k1 (trn1.2xlarge).
+Logs: s3://<your-bucket>/logs/kiln-pf-32/, logs/kiln-pf-32b/, logs/kiln-pf-k1/, each serving log with a `.cmd`.
+
+**Where the 4096-row prefill call went first** (engine-v0 70ddc1b defaults; `KILN_CAPTURE_INPUTS` at prefill:20 of a G64
+level, `tools/util_report.py replay --profile-all`, then `report`; logs rp-base.log, rp-base-report.txt). Rank 0 took 540 ms
+replayed (the serving fit is 520), MFU 8.8%, and every engine sat idle with a collective in flight for 180 ms.
+
+| part, per call | ms | what it is |
+|---|---|---|
+| world reduce-scatter, 45 x 32 MiB | 112 | ~16 ms of transfer; the rest is waiting for the busiest EP rank (EPLB's target) |
+| world row gather, the zero-padded all-reduce as 4 x 8 MiB per FFN block (180 of the 233 all-reduces) | ~73 | wait 0.107 + transfer 0.298 ms each, plus 0.11 ms of compute between chunks |
+| token-mixer segments, 45 (KDA 34 x ~3.1 ms, DSA 11 x ~6.5) | 175 | KDA layer 4 alone at 1024 rows (`profile_layer.py --what laparts`): delta-rule kernel 1.55, in_qkv 0.69, short conv 0.29, out 0.29, gates 0.25 ms |
+| FFN segments (EP kernel, shared expert, router), 45 | 126 | the EP kernel's 9 static passes each dequantize their expert's 1536 fp8 tiles (~1 ms per layer); shared expert 0.47 ms at ~10% of the tensor engine |
+| attention-group gather + reduce-scatter | ~25 | |
+| prep, post, end of graphs | ~12 | |
+
+**nki.collectives works on NeuronCore-v2 inside an LNL graph** (`tools/probe_nki_cc.py`). nki 0.6.0's
+nki/collectives/__init__.pyi lists all_reduce, all_gather, reduce_scatter, all_to_all, collective_permute(_implicit),
+rank_id and ReplicaGroup, and names no NeuronCore-v2 restriction for the first four.
+- At 2 ranks (one chip, trn1.2xlarge) and at 32 ranks (trn1.32xlarge), all_gather, reduce_scatter and all_reduce give
+  the host's values exactly (gather) or within bf16 summation (sums), on every rank.
+- A cached NKI all_gather NEFF reloads in a later process, at 32 ranks too ("Local cache hit", exact values on every
+  rank). The XLA all-gather does not ("A cached all-gather NEFF breaks in the next process").
+- Constraints. The neuronx-cc 2.27 verifier (birverifier checkCollective) refuses both directions: "Collective
+  instruction cannot read IO tensors" and, from an internal shared_hbm copy into the kernel's output, "Collective
+  instruction cannot write IO tensors". nki's frontend asserts "All src & dst tensors must have the same buffer type".
+  SBUF collectives fail with NCC_IBIR428 "SB CC is only supported on trn2+". So the rows are copied into
+  `nl.private_hbm` scratch, gathered there and copied to the output by HBM -> HBM DMAs.
+- The ReplicaGroup takes list literals (`list(range(n))` fails the tracer: "'list' expected ... got (range)").
+
+At 32 ranks, 32 MiB per gather, a standalone graph each (p50 of 20 calls, a 4-byte sum read back). The barrier-off
+numbers isolate the transfer (`NEURON_RT_DISABLE_EXECUTION_BARRIER=1`; not safe to serve with, it deadlocked a stress test).
+
+| | XLA zero-padded all-reduce (served) | NKI all_gather + copies (kernels/sp_gather.py) | XLA reduce-scatter | NKI reduce_scatter + copies |
+|---|---|---|---|---|
+| barrier on (default) | 5.46 ms | 6.14 (copies through SBUF) | 5.91 | 6.16 |
+| barrier off | 2.27-2.78 | **1.16** (copies HBM -> HBM) | 1.38 | 1.45 |
+
+**A kernel's engines compute while its own collective is in flight**, unlike XLA's graphs (0 ms in 9 shapes, "Accelerator
+utilization"). `probe_nki_cc.py --cases ovl --reps 256` runs, at 32 ranks with the barrier off:
+- 4 all_gathers of 8 MiB row slices alone: 1.90 ms.
+- 8192 bf16 matmuls on SBUF-resident operands alone, with no dependency on the gathers: 1.89 ms.
+- Both in one kernel: **1.86 ms**, i.e. max, not sum.
+So two-batch overlap is possible on this compiler, but only for compute inside the same kernel as the collective.
+
+**KILN_SP_GATHER=nki: the sequence-parallel world row gather as an NKI all_gather** (kernels/sp_gather.py,
+models/decoder.py _sp_gather; ca256b7 makes it the trn1 default).
+- It applies from 16 rows per rank (prefill chunks; decode SP's 2 rows keep their graphs) and from 256 columns. So the
+  routing's [r, 16] fp32 gathers stay the zero-padded all-reduce (c0c8074). In the replay below, the kernel form waited
+  0.218 ms to start each of them (9.9 ms per call) against 0.024 ms. In serving the choice is neutral: G64 164.7 with the
+  kernel, 164.2 without, prefill call 0.4765 / 0.4782 s. The wait was rank skew, which the next collective waits out
+  otherwise, so a replay's per-collective wait is not a saving by itself.
+- The 8-rank attention-group gather stays XLA too. As a kernel it was slower: the SP attention block went 8.86 -> 10.09
+  ms (layer 3) and 6.14 -> 7.10 ms (layer 4) in `profile_layer.py --what hcblocks --part-layers 3 4 --sp`, barrier on.
+  The SP FFN block went 14.24 -> 13.22 and 14.34 -> 13.37 ms. `nki-all` keeps the group form for experiments.
+- The gathered rows are identical to the zero-padded all-reduce's (max |err| 0 at 32 ranks).
+
+Serving A/Bs (128 requests; base = engine-v0 70ddc1b with q/final-f70c14b, or final-25a45c9 for EPLB; test = 3a39ec8 with
+q/pf-spw-3a39ec8 / pf-eplbspw-3a39ec8; each pair on one box, back to back):
+
+| config | base out tok/s | NKI gather | prefill call | TTFT p50, ITL p50 | spot $ / 1M out |
+|---|---|---|---|---|---|
+| G64 (kiln-pf-32b) | 156.1 | **164.7 (+5.5%)** | 0.5195 -> 0.4765 s | 5.82 -> 5.44 s, 363 -> 343 ms | 3.83 -> 3.63 |
+| F0 (kiln-pf-32b) | 133.6 | **140.1 (+4.9%)** | 0.5215 -> 0.4781 s | 5.61 -> 5.23 s, 214 -> 205 ms | 4.47 -> 4.26 |
+| G64 + EPLB, level 1 / 2 (kiln-pf-32b) | 166.5 / 167.1 | **177.3 / 177.3 (+6.5 / +6.1%)** | 0.458 -> 0.416 / 0.413 s | 5.29 -> 4.91 s, 339 -> 317 ms | 3.57 -> **3.37** |
+
+The prefill call is 42-45 ms shorter in every row, so the gather saving stacks with EPLB. The decode call does not move,
+because no decode graph changes. MFU of the prefill call at 0.413 s (G64 + EPLB + NKI gather): 11.0%.
+
+**The call with the NKI gather** (the same replay on 3a39ec8; rp-spw.log, rp-spw-report.txt): rank 0 took 496 ms (540
+before). The world gathers are now 45 all_gathers of 1 MiB per rank (wait 0.065 + transfer 0.274 ms), and every engine
+sat idle with a collective in flight for 146 ms (180 before).
+
+**Quality** (the gather moves bytes, but the graphs around it compile differently, so the outputs are not bit-identical):
+- Wikitext-2 through the gather. check_ppl's default 64-row chunks give 8 rows per rank, below the kernel's gate, so
+  `tools/check_ppl.py --chunk 1024` (new) runs 256 rows per group = 32 per rank (q/pf-wtc-cb91773, configs wtc-XLA /
+  wtc-SPW, kiln-pf-32, logs ppl-wtc-xla / ppl-wtc-spw with .json). XLA gather -0.54759, NKI gather -0.54730 over 3071
+  tokens: signed +0.00029 +/- 0.00054, mean |d| 0.0089, max 0.473, greedy agreement 0.9954. Both are within 0.01 of the
+  -0.5515 reference.
+- Greedy text (`tools/check_mixed.py` through the G64 graphs, 32 prompts, 64 tokens, against the f70c14b defaults' dumps
+  from kiln-ak-32; logs cm-spw-*, cm-cmp-spw-*). LONG_TEXT: 28 / 32 equal, decode-path signed +0.00001 (n = 1870), mean
+  |d| 0.0025. Wikitext-2: 4 / 32, decode-path signed -0.00102 (n = 743), mean |d| 0.034, prefill chunks +0.0073 (n = 32).
+  Both are the two-numerically-neutral-engines floor of "The final combined measurement" (EPLB against the defaults:
+  wikitext mean |d| 0.029, signed -0.00004).
+
+**Mixed batches use the fused and decode kernels again** (models/mla.py attention_joint, models/linear_attn.py
+_mix_joint; `KILN_MIXED_KERNELS`, default 1; 47e3806).
+- A mixed call's chunk rows take the fused DSA kernel wherever an unmixed chunk would (fused_kernel_takes).
+- Its decode rows take the DSA decode kernel and the KDA decode kernel. The KDA kernel updates the state pool in place,
+  so the chunk's row is written first.
+- CPU (tests/test_mixed_batch.py test_glm5_next_mixed_dsa_kernels, both pool-key forms, at the fused kernel's shapes):
+  mixed equals unmixed with both kernels' emulations, tokens equal, max |dlogprob| 3.1e-6, and each branch ran.
+- Device A/B (kiln-pf-32, q/pf-mx-47e3806 against q/final-f70c14b): G64 + MX 152.0 -> **157.5** (+3.6%, above plain G64
+  156.1). F0 + MX 128.7 -> **132.0** (+2.6%, still below plain F0 133.6).
+- The cause named in "The final combined measurement" was the right one. With the NKI gather (q/pf-mxspw-3a39ec8,
+  compiled) the mixed path is not yet measured.
+
+**Prefill piece and chunk size, with the 15M / 30M instruction limit** (`--internal-max-instruction-limit`, lifting
+neuronx-cc's 5M NCC_EBVF030 cap; NxDI's qwen3_moe sets it). Estimates from tools/hbm_estimate.py summed over the 4
+attention groups' graphs (read the deltas: its absolute totals overestimate):
+- P = 24 (2 pieces per call; q/pf-p24-3a39ec8, kiln-pf-32): G64 156.0 against 156.1, prefill call 0.5176 s. The fixed
+  cost per graph execution is not a prefill lever. Spill rings 7.68 -> 4.72 GiB and code 0.71 -> 0.53 GiB, so it frees HBM.
+- Prefill 6144 (1536 rows per group, P = 12; q/pf-p6-3a39ec8): the prefill pieces' instance spill runs grow ~65% (rings
+  7.68 -> 11.80 GiB). Not tried on a device.
+- **Prefill 8192 as ONE 45-layer piece** (2048 rows per group, 30M limit, with the NKI gather; q/pf-p8k45-3a39ec8).
+  It compiles, and its single piece has 2.97M spill runs against ~4.5M for a group's four 1024-row pieces. Estimate:
+  rings 6.24 GiB, total 20.65 against the default's 22.11. It loads at KV 1.5 fp8. At G64 (kiln-pf-32b,
+  pf-g64-p8k45.log): **171.4 out tok/s**, against 164.7 for the NKI gather alone and 156.1 for the base; prefill call
+  0.938 s per 8192 rows (0.469 s per 4096, -1.6%), decode call 0.1115 s (0.118), 128 prefill calls instead of 256, TTFT
+  p50 / p90 5.34 / 55.5 s. P = 24 at 8192 tokens is the worst layout: 14.6 GiB of rings.
+
+**The 8192-token prefill as ONE piece, on engine-v0 8229c3d** (the hardware execution barrier on), as a serving
+configuration: `--prefill-tokens 8192 --prefill-buckets 2048 KILN_PIECEWISE_PREFILL_MOE_GROUP=45`.
+- Prefill pieces of more than 12 MoE layers take `--internal-max-instruction-limit=30000000` themselves
+  (model_runner.prefill_cc_args, `KILN_PREFILL_CC_ARGS`; f04ad96), so every decode graph keeps its key: the farm
+  captured G64 / F0 / G16 with it and only the 4 prefill pieces and the post graph were new (q/pf-p8-7ce6a12).
+- Same box, same tree, back to back. Base = engine-v0 8229c3d (q/pf-spw2-c0c8074, the default's keys; for EPLB at
+  KV 1.2 + CK4 q/pf-p8-7ce6a12's G64-EPLB-KV12CK4). Test = feat/prefill-mfu-merge (q/pf-p8-7ce6a12). 128 requests;
+  logs s3 logs/kiln-pf-32c/pf-g64-{b2,m2,eplb-b2,eplb-m2}.log, logs/kiln-pf-32/pf-{f0,g16}-{b2,m2}.log, each with .cmd.
+
+| config | base out tok/s | one-piece 8192 prefill | prefill call per 4096 rows | decode call | TTFT p50 / p90 | spot $ / 1M out |
+|---|---|---|---|---|---|---|
+| G64 | 167.8 | **174.3 (+3.9%)** | 0.476 -> 0.472 s | 0.118 -> 0.114 s | 5.37 / 59.9 -> 5.34 / 54.4 s | 3.56 -> 3.43 |
+| F0 | 144.8 | **147.8 (+2.1%)** | | | 5.17 / 22.1 -> 5.21 / 20.6 s | 4.12 -> 4.04 |
+| G16 | 110.5 | **112.2 (+1.5%)** | | | 5.02 -> 5.13 s | 5.40 -> 5.32 |
+| G64 + EPLB at KV 1.2 + CK4, level 1 / 2 | 180.2 / 180.8 | **191.3 / 190.8 (+6.2 / +5.5%)** | 0.415 -> 0.403 / 0.413 -> 0.400 s | 0.122 -> 0.119 s | 4.83 / 53.6 -> 4.64 / 47.2 s | 3.30 -> **3.12** |
+
+- KV 1.2 + CK4 is neutral for EPLB: on b8814ab (before the barrier) EPLB served 176.1 / 176.8 at KV 1.5 and
+  176.1 / 176.8 at KV 1.2 + CK4 (kiln-pf-32b, pf-g64-eplb-v / -c). With the one-piece prefill EPLB needs it: at KV 1.5
+  the load fails with "Allocation Failure" (c0c8074, kiln-pf-32, pf-g64-eplb-p8k45-spw2.log). KV 1.2 is 4399 pages per
+  group against the 4224 that 64 x 8448 tokens need.
+- Prefill MFU of the EPLB + one-piece call: 2 x 138.6 TFLOP / (0.800 s x 32 x 95 TFLOPS) = 11.4% (8.8% at the start of
+  this work).
+- Most of the gain is outside the prefill call's per-token time (-1% to -3%). The step count falls (647 -> 579 at G64,
+  half the prefill calls) and the decode call is 2-4% shorter in the fit. The EP kernel's static passes amortise
+  better only where the routing is balanced, which EPLB does: +3.9% alone, +5.5 to +6.2% with it.
+
+Quality of the one-piece prefill:
+- Greedy text (`tools/check_mixed.py` through G64's graphs, engine-v0 b8814ab against 7ce6a12 with the one piece,
+  kiln-pf-32, logs cm-v-* / cm-p8k-*, cm-cmp-p8k-*). LONG_TEXT: 28 / 32 equal, decode-path signed -0.00005 (n = 1813),
+  mean |d| 0.0010. Wikitext-2: 5 / 32, decode-path signed +0.00015 (n = 871), mean |d| 0.038, prefill chunks +0.0020.
+  That is the floor.
+- Wikitext-2 NLL through check_ppl --chunk 1024 at P = 12 and at one 45-layer piece (q/pf-p8w-7ce6a12, with
+  `KILN_SP_GATHER_MIN_WIDTH=16`, which compiles check_ppl's tensor-parallel-expert pieces with the NKI gather; logs
+  ppl-wtc-p12w / -p45w): -0.5473 and -0.5477, signed -0.00044 +/- 0.00335, greedy agreement 0.978. The per-token
+  jitter is larger than any gather change's: mean |d| 0.057, one token at 3.68. The piece boundaries every 12 layers
+  were where the streams rounded to bf16 as graph outputs; inside one graph that rounding is the compiler's.
+
+**The NKI world gather with tensor-parallel experts: NCC_ISCH719, so those keep the XLA gather** (e40befb).
+- The decode agent's G64-ST (`KILN_MOE_EP=0`, q/dc2-st) and this work's check_ppl --chunk 1024 configs (EP's automatic
+  default is off at check_ppl's 4 sequences) failed neuronx-cc 2.27 on 4 of 12 prefill pieces with
+  `[INTERNAL_ERROR] [NCC_ISCH719] topological order violations`.
+- Reproduced: G64 with `KILN_MOE_EP=0` on engine-v0 8229c3d (q/pf-tp-8229c3d), the same 4 keys of 4 enqueued fail
+  (5ac8a791, 4b4fca2d, ba120ca2, 66775c49).
+- The same configs compile when the routing's small gather is also the kernel (cb91773's form). They also compile with
+  `KILN_SP_GATHER=xla` (the decode agent's G64-STb, 23 of 23 graphs).
+- The rule, DecoderForCausalLM._sp_gather_kernel_ok (tests/test_glm5_next.py
+  test_sp_gather_kernel_needs_expert_parallel_experts): the world gather runs as the kernel only when the model's
+  routed experts are expert-parallel or there are none.
+- Checked on the farm, from e40befb's tree:
+  - The same G64 + EP=0 capture compiles 12 of 12 new pieces (q/pf-tp-e40befb).
+  - Its default G64 (EP) keys are set-equal to q/pf-spw2-c0c8074's (33 of 33).
+  - The check_ppl --chunk 1024 keys are set-equal to cb91773's `KILN_SP_GATHER=xla` capture (38 of 38).
+
+**Measured and set aside (2026-10-05, code on feat/prefill-mfu, not in this tree):**
+- *The world gather inside the expert-parallel kernel* (`KILN_MOE_EP_AG=1`, kiln_moe_ep_ag_kernel). It is a copy of
+  the dequantize-first kernel that takes this rank's rows, all_gathers them into private HBM and copies them out for
+  the shared expert, so the gather can run under the plan, the output's zeroing and the first weight loads.
+  - Bit-identical on all 32 ranks (`profile_layer.py --what hcblocks --part-layers 3 4 --sp` with
+    `KILN_PROFILE_AG_CHECK=1`: max |d| 0).
+  - Slower. The SP FFN block went 12.04 -> 13.17 ms (layer 3) and 12.65 -> 13.48 ms (layer 4) with the copy-out after
+    the zeroing, and 12.04 -> 13.47 / 12.60 -> 13.32 ms with it after the passes (kiln-pf-32b, standalone block
+    graphs).
+- *A bf16 split of the delta-rule kernel's fp32 matmuls.* The primitives at its [128, 128] shape, one NeuronCore
+  (`tools/probe_engine_rates.py 28-35`, kiln-pf-k3 trn1.2xlarge):
+
+  | instruction | ns |
+  |---|---|
+  | fp32 x fp32 matmul | 192 (bf16 x bf16: 38) |
+  | bf16 x fp32 or fp32 x bf16 matmul | does not compile |
+  | nc_transpose of fp32 / an fp32 identity matmul | 208 / 232 |
+  | hi = bf16(x): DVE / ACT | 165 / 117 |
+  | lo = bf16(x - hi), DVE | 387 |
+
+  A 3-pass bf16 product saves 192 - 3 x 38 = 78 ns of tensor engine per matmul. Splitting its two fp32 operands costs
+  ~0.5 us each of ACT and DVE, and the kernel's vector engine is already as busy as its tensor engine (0.68 / 0.70 ms
+  of a 1.2 ms chunk at 1024 rows). Transpose mode is no cheaper than the identity matmul in fp32. So no split form pays
+  on trn1. Single-pass bf16 operands would round the recurrence's inputs; not tried.
+- *A replay profile of the one 45-layer, 8192-row prefill piece.* `util_report.py replay --profile-all` holds 8
+  workers' captured inputs per neuron-explorer process (~125 GB RSS each). One process was OOM-killed on the 495 GB
+  host, and the other three then hung in the collectives.
+
+**The fused DSA kernel priced by deletion: harvest item C's attention tricks (2026-10-05, kiln-pf-k4 trn1.2xlarge).**
+`tools/probe_dsa_fused.py --forms fused --rows 1024 2048 --iters 20` at the attention-TP-8 rank shape (8 heads, latent
+512, 8448 keys, keep 512), one NeuronCore, from exp/dsa-cmax 7d0e040. That branch's `KILN_DSA_VAR` deletes one part of
+the kernel's attention at a time. It is scratch code for timing, not for merge: every variant except 0, 3 and 5 gives
+wrong outputs. Logs: s3://<your-bucket>/logs/kiln-pf-k4/cm-<var>.log. p50 ms:
+
+| KILN_DSA_VAR | what is deleted or changed | C=1024 | C=2048 |
+|---|---|---|---|
+| 0 | nothing (the kernel) | 4.881 | 9.483 |
+| 1 | the running max: no block-max reduces and no max update; bias 0 and alpha 1 (a constant max) | 4.485 | 8.708 |
+| 4 | the acc update `acc = alpha acc + P K` (DVE, [128, 512] fp32, reads PSUM), exact max | 3.980 | 7.687 |
+| 5 | the l update (ACT, [128, 1]) | 4.885 | 9.468 |
+| 3 | nothing deleted: ACT copies P K from PSUM to SBUF before the acc update | 5.095 | 9.895 |
+| 6 | the 8 P transposes and the P^T copy per unit (P K reads P as stationary: the K-stationary ceiling) | 4.517 | 8.770 |
+| 7 | 6 and 1 | 4.176 | 8.066 |
+| 8 | 7, and the acc update on every second key block only (P K summed in PSUM over a block pair) | 3.811 | 7.279 |
+| 2 | 1, the acc update and the l update (an accumulator held in PSUM for the whole key range) | 3.450 | 6.579 |
+
+- The acc update is the largest item, 0.90 / 1.80 ms (18-19% of the kernel). Moving its PSUM read onto ACT costs more
+  (variant 3, +0.21 / +0.41), so ACT has no room for it. The running max is 0.40 / 0.78 ms (8%). The P transposes and
+  the copy are 0.36 / 0.71 ms (7.5%). The l update costs nothing measurable.
+- Each trick depends on the one before it:
+  - K-stationary QK yields S^T with the keys on partitions. A row max over S^T needs a reduction across partitions, so
+    K-stationary needs a constant max.
+  - Summing P K in PSUM across key blocks needs one fixed scale per sum (a constant max, or a block pair's max taken
+    before its exp). It also needs a PSUM bank per head: 8 heads per rank, and the kernel already uses all 8 banks
+    (scores 2 units x 2, P^T 2, P K 1, selection scores 1). So variant 2 cannot be reached, and variant 8 is the most
+    that can.
+- Per 8192-row prefill call (11 DSA layers at C=2048, the 0.938 s G64 call):
+  - Constant max alone: -8.5 ms (0.9%).
+  - Plus K-stationary: -15.6 ms (1.7%).
+  - Plus pair accumulation: -24.2 ms (2.6%).
+  - With the exact max, pair accumulation alone would save half the acc update, an estimated -9.9 ms (1.1%). That
+    needs 4 key blocks in SBUF (KR = 4) and a pipeline with the QK of the next pair issued after the current pair's
+    exps.
+- The 2.6% depends on a safe per-row constant m0, and none has been measured. GLM-5.3-Flash's MLA scores are not
+  normalized, so the only cheap bound is Cauchy-Schwarz, |q| max |k|. exp(s - m0) underflows for a key once
+  m0 - s > ~87 in scaled units. If the bound overshoots the true row max by a gap g, every key whose weight relative to
+  the max is below e^-(87 - g) is dropped. Once g > 87, the whole row is 0 / 0. The first step is to measure g on real
+  activations, before any kernel work.
+
+**`KILN_DENSE_FP8=0` at prefill (same box, logs df-1.log / df-0.log).** `profile_layer.py --model zai-org/GLM-5.3-Flash
+--tp 32 --dp-attention 4 --ranks 2 --prefill 1024 --pages 264 --sum-readback --layers 4 --what hcblocks --part-layers 0
+3`, the serving kernels, engine-v0 c7c43e9. Results with FP8 dense weights dequantized in-graph vs bf16 at load:
+- DSA token mixer with its all-reduce: 7.376 -> 7.158 ms.
+- SP attention block: 11.572 -> 11.367 ms.
+- Shared expert: 0.491 -> 0.448 ms.
+- Dense MLP: 1.648 -> 1.613 ms.
+- KDA token mixer: 4.570 -> 4.550 ms. The KDA projections are bf16 in the checkpoint, so nothing changes there.
+
+The prefill DSA layer saves 0.21 ms, about half of the 0.40 ms measured at decode, because the dequantization overlaps
+the prefill layer's other work. That comes to about 4 ms per call (0.4%), for +0.24 GiB per rank, so it was not taken
+to a serving A/B.
+
+The routed-expert rows (4.37 -> 9.16 ms) are not comparable between the two runs. `random_fill` draws every
+parameter from one generator, and dense FP8 weights draw bytes where bf16 ones draw normals, so the router weights
+after them differ, and with them the routing and the kernel's distinct-expert work. In the real model the routed
+experts are the same FP8 blob either way.
+
+**So items 1 and 2 have no measured lever above ~1% of the prefill call with exact numerics.** The KDA mixer's XLA
+parts (in_qkv / short conv / out / gates, 0.69 / 0.29 / 0.29 / 0.25 ms standalone at 1024 rows, each including the
+~0.15 ms launch) are each under 2% of the call. Not profiled further.
+
+## Upstream harvest (2026-10)
+
+What the newest public AWS Neuron code had that Kiln did not, read 2026-10-05 against SDK 2.32 (still the newest SDK;
+Kiln already ran the newest pip builds, so every delta is code). Sources, fresh clones of 2026-10-05:
+aws-neuron/nki-library main 92d11f6 plus branches zifan/deepseek_v4_csa (2026-09-14) and
+viekash/ncc-9479-qkv-oob-skip (2026-09-23) (the nkilib bundled in SDK 2.32 is byte for byte its origin/2.32_release,
+"NKI Lib 2026-08-17"); aws-neuron/nki-moe beb4b63 and the three winners' repos it links; aws-neuron/nki-samples 44d126f;
+neuronx-distributed-inference 4bcdc54 (no commit since 2026-07-28); vllm-project/vllm-neuron release-0.24.0.1.1.0 f8abae6
+(the build in Kiln's venv); aws-neuron/nkipy, every branch; aws-neuron/torchtitan-neuron 45c6f395; aws-neuron-sdk a6be966.
+Device runs: kiln-hv-32 and kiln-hv-32b (trn1.32xlarge spot, us-east-2c, DLAMI SDK 2.32, aws-neuronx-runtime-lib
+2.34.10), engine-v0 70ddc1b, GLM-5.3-Flash real weights, every serving graph from the farm queue q/final-f70c14b under
+`NEURON_LIBTORCH_ASSERT_CACHE_HIT=1` (0 device compiles). Logs s3://<your-bucket>/logs/kiln-hv-32/ and
+kiln-hv-32b/, each with its `.cmd`; drivers tools/hv_*.sh.
+
+### The runtime's per-execution barrier is the ~5 ms "fixed cost per execution"
+
+The fixed ~5 ms per execution of a graph holding a cross-chip collective at 32 ranks ("Collectives across chips" above)
+is the Neuron runtime's per-execution barrier: a cross-rank rendezvous (`enc_barrier`, a barrier NEFF the runtime runs
+before each execution: "Loading barrier model for LNC", "Barrier EXECUTE" in libnrt.so.1) that the probe above never
+turned off. Three knobs, all strings in libnrt.so.1 of runtime 2.34.10: `NEURON_RT_DISABLE_EXECUTION_BARRIER` (what
+vllm-neuron 0.24 sets for serving, vllm_neuron/vllm/worker/neuron_worker.py:715-718, "the cross-rank rendezvous wait
+(enc_barrier) is the other major component of async-decode model-submit time", and what nkipy sets by default,
+nkipy/src/nkipy/runtime/__init__.py, commit 1089b54), `NEURON_RT_ENABLE_HW_EXECUTION_BARRIER` (runtime 2.27 release
+notes: NEFF start overhead "up to 50%" lower "with an on-device hardware barrier between ranks"), and
+`NEURON_RT_ENABLE_INTERNODE_EXECUTION_BARRIER` (multi-node, off by default).
+
+`tools/profile_layer.py --allreduce --ranks 32 --batch 4` with `KILN_PROBE_COLLECTIVES=1` (tools/hv_barrier_probe.sh;
+[4, 4096] bf16, ms per launch over 48 chained launches; logs hv-barrier-{base,off,hw}.log):
+
+| graph | barrier (default) | `NEURON_RT_DISABLE_EXECUTION_BARRIER=1` | `NEURON_RT_ENABLE_HW_EXECUTION_BARRIER=1` |
+|---|---|---|---|
+| null graph | 0.190 | 0.117 | 0.127 |
+| 1 all-reduce | 5.065 | **0.250** | **2.800** |
+| 12 all-reduces | 4.816 | 0.403 | 2.863 |
+| 12 adds (no collective) | 0.132 | 0.128 | 0.160 |
+| all-gather + local sum / reduce-scatter / all-to-all | 4.831 / 5.214 / 4.979 | 0.246 / 0.247 / 0.245 | 2.748 / 2.830 / 2.747 |
+| all-reduce over ranks 0-1 (one chip) / 0-7 | 0.198 / 1.868 | 0.229 / 0.235 | 0.245 / 1.815 |
+| every group of 2 / of 8 at once | 0.171 / 2.287 | 0.157 / 0.172 | 0.230 / 1.459 |
+
+The group sums the probe checks are identical in all three. So the transfer of a small collective is ~0.1 ms and the
+rest was the barrier; across chips the hardware barrier costs about half of the software one. Inside one chip it is
+slightly dearer (ranks 0-1 0.198 -> 0.245 ms, groups of 2 0.171 -> 0.230): on a tp=2 trn1.2xlarge it would cost
+~0.05 ms per execution, which is left as is (that box is for tests; the default follows the serving case).
+
+**In serving the barrier is mostly hidden** behind the previous execution (G64, F0 and G16 commands of "The final
+combined measurement", 128 requests, kiln-hv-32, back to back; tools/hv_ab.sh; logs hv-{G64,F0,G16}-*.log):
+
+| config | barrier (default) | barrier off | hardware barrier |
+|---|---|---|---|
+| G64 out tok/s (decode call / prefill call) | 156.1, again 156.2 (0.119 / 0.520 s) | 159.2 (+2.0%; 0.114 / 0.518) | **159.2, again 159.2 (+2.0%)** (0.117 / 0.518) |
+| F0 out tok/s | 133.8 | 137.8 (+3.0%) | **137.7 (+2.9%)** |
+| G16 out tok/s (ITL p50) | 105.3 (131.1 ms) | | **106.8 (+1.4%)** (128.8 ms) |
+| G64 + EPLB (25a45c9's opt-in, q/final-25a45c9 graphs), level 1 / level 2 | 166.5 / 167.1 ($3.57) | | **170.0 / 170.7 (+2.1%; $3.50 per 1M out spot)** |
+| G64 + hardware barrier + `NEURON_RT_DBG_DMA_PACKETIZATION_SIZE=65536` / F0 the same | | | 158.7 / 137.3 (no gain over the barrier alone) |
+
+About 0.8 ms per execution comes back, not 5: a decode call is 6 executions of 15-45 ms each.
+
+On the merged tree (engine-v0 b8814ab, whose trn1 default adds the NKI world gather `KILN_SP_GATHER=nki`; farm queue
+q/pf-spw2-c0c8074 G64-SPW2, the same keys because sp_gather.py's REV covers only its kernel section, unchanged since
+c0c8074; kiln-hv-32c, back to back, logs s3 logs/kiln-hv-32c/hv-G64-spw-*.log): G64 163.7 / 164.4 out tok/s with the
+default barrier, **167.8 / 167.8 with the hardware barrier (+2.3%, $3.56 per 1M out spot)**, prefill call 0.479 s.
+
+**Removing the barrier is unsafe; the hardware barrier is not.** The barrier is "the runtime's only mid-run detector of
+mismatched graphs across ranks" (nkipy 1089b54), and it also orders the ranks' NEFFs. `tools/probe_mismatch.py` builds
+both on purpose at 32 ranks (every case first warms every graph on every rank; tools/hv_mismatch.sh; logs hv-mm-*.log):
+
+| case | barrier (default) | hardware barrier | barrier off (`NEURON_RT_EXEC_TIMEOUT=30`) |
+|---|---|---|---|
+| none (control) | | | 32 ok, one value on every rank (-189.4558) |
+| shape: rank 0 all-reduces [4, H], the others [8, H] | 32 raise `nrta status=1206` at 31.6 s, "replica group signature mismatch ... likely caused by mismatched collectives between peers" | 32 raise at once (`Failed to schedule neff execution. status=2`), the same signature message | **32 return "ok" with 31 different values: silently wrong** (also without the timeout) |
+| kind: all-reduce against reduce-scatter | | 32 raise at once | 6 ok, 26 raise `nrta status=1200` |
+| group: world all-reduce against a group-of-8 one | | (see the log) | 24 ok (3 distinct values), 8 raise |
+| order: A then B against B then A | | (see the log) | **32 ok, 27 distinct values: silently wrong** |
+| missing: rank 0 skips one collective graph | **31 ranks blocked, no error, still at 120 s** (the probe's limit) | 31 ranks blocked in the next launch | 31 raise `nrta status=1200` after 62 s |
+| race: 3000 launches cycling world all-reduce, world reduce-scatter, group-of-8 all-reduce, world all-gather over 4 inputs each, queued 48 deep, every rank sleeping 0-3 ms before a quarter of its launches; every output against its synchronous reference | 0 mismatches on 32 ranks (14.97 s) | **0 mismatches** (14.40 s) | **deadlock** within the first 250 launches: "Failed to receive MODEL_STOP notification from all TOPSPs", ranks 8-15 in the group graph (1 TOPSP) and all others in a world graph (7), the runtime's execution timeout (30 s by default on this runtime) fires with `NRT_EXEC_HW_ERR_COLLECTIVES`, every rank SIGSEGV |
+| race, barrier off: world graphs only (ar, rs, ag) / no sleeps / one graph (ar) / world + group (ar, ar8) | | | 0 / 0 / 0 mismatches in 3000 (1.9 / 1.1 / 1.9 s) / **deadlock** |
+
+So without the barrier, a world collective graph and an attention-group collective graph in flight on different ranks
+at once can deadlock, given only host jitter, and Kiln's serving graphs mix exactly those (`KILN_SP_GROUP`, attention TP
+groups). The two serving runs without it finished cleanly (~900 calls each), which only says the window is narrow.
+nkipy's own Qwen-Image example forces it back on, "for correct multi-rank collectives (SPMD-with-collectives)"
+(examples/models/qwen_image/qwen_image.py:687-698, 0bc6ed1).
+
+**Taken:**
+- `NEURON_RT_ENABLE_HW_EXECUTION_BARRIER=1` by default on trn1 (kiln/platform.py `HW_BARRIER_FAMILIES`, set in
+  `configure_runtime_env` unless the environment chose; `=0` restores the software barrier). Quality through the G64
+  serving graphs against kiln-ak-32's f70c14b defaults (`tools/check_mixed.py`, the command of "The final combined
+  measurement"; tools/hv_quality.sh): LONG_TEXT and wikitext-2 prompts both 32 / 32 equal, every teacher-forced
+  logprob identical (max |d| 0 over 2016 decode positions and 32 prefill chunks each; logs hv-cmp-{long,wiki}-hw.log);
+  wikitext-2 at DP attention 4 (`tools/check_ppl.py`, ppl-wt-def's command) -0.5475 with every one of the 3071 token
+  logprobs equal to kiln-ak-32's (`tools/compare_ppl.py`: max |d| 0, hv-cmp-ppl-hw.log). Bit-identical, as a
+  synchronization change must be.
+- An exec watchdog (kiln/engine/watchdog.py): the missing case shows a hang with the barrier on that nothing reports.
+  Every rank marks the sections where it blocks on the device (a non-first call's launch in ModelRunner._exec, rank 0's
+  read-backs in LLMEngine._collect); one lasting longer than `KILN_EXEC_TIMEOUT_S` (default 300, 0 = off) prints the
+  rank's last 16 calls (name and key) and exits with code 86. On the device (probe_mismatch.py --case missing with
+  `KILN_PROBE_WATCHDOG=20`): 31 / 31 blocked ranks reported and exited 86 at 20 s, with the default barrier (blocked in the
+  read-back) and with the hardware one (blocked in the launch). A first call (compile or NEFF load) and the idle time
+  between calls are not watched.
+
+**trn2 keeps the runtime default** (kiln-t2-cb, trn2.48xlarge Capacity Block, ap-south-2b, LNC=2, logical cores 32-63
+while the trn2 agent ran cores 0-31; an engine-v0 70ddc1b tree, its farm queue q/t2f-base, 2026-10-05 20:05-21:12 UTC;
+tools/hv_t2_all.sh, logs s3 logs/kiln-hv-t2/):
+- Probe, ms per chained launch, default / barrier off / hardware barrier: one world all-reduce 3.939 / 0.221 / 2.460;
+  all-gather 2.826 / 0.212 / 2.365; reduce-scatter 2.914 / 0.209 / 2.421; but every group of 8 at once 0.399 / 0.173 /
+  **1.756**, and ranks 0-7 0.569 / 0.195 / 1.630: on trn2 the hardware barrier makes a group collective's graph dearer.
+- Race (3000 launches, the mix that deadlocks on trn1 without a barrier): 0 mismatches with both barriers; a shape
+  mismatch with the hardware barrier raises on all 32 ranks at once, as on trn1.
+- Serving, the trn2 agent's single-engine baseline at concurrency 64 (tools/hv_ab_t2.sh): default 94.1 / 95.5 out tok/s,
+  hardware barrier 95.3 / 96.0. +0.9%, inside the default's own run-to-run spread of 1.4, so `HW_BARRIER_FAMILIES` stays
+  `("trn1",)`.
+
+**Not taken:** `NEURON_RT_DISABLE_EXECUTION_BARRIER=1` (above). kiln/engine/engine.py build_shard says why next to the
+two knobs it does copy from vllm-neuron.
+
+### NxD Inference's collective/compute overlap compiler options: no win at probe scale
+
+NxDI compiles every context-encoding graph with `--tensorizer-options='--enable-ccop-compute-overlap
+--cc-pipeline-tiling-factor=2 --vectorize-strided-dma'` and every token-generation graph with tiling factor 1
+(neuronx-distributed-inference src/neuronx_distributed_inference/models/model_wrapper.py:85-107, 4bcdc54); Kiln passes
+none of them (only `--model-type=transformer` through KILN_CC_ARGS on trn1), and the utilization probe above tried
+other scheduler options only. `KILN_CC_ARGS` is now split the way a shell splits it (engine/model_runner.py
+neuronx_cc_args), so one quoted argument can carry the spaces these need; an unquoted value splits as before, so no
+existing key changes. `tools/probe_overlap.py --ranks 32` with each set (tools/hv_overlap.sh, default barrier, kiln-hv-32b;
+ms, 20 queued calls each; logs hv-ov-*.log):
+
+| case | `--model-type=transformer` | + overlap, tiling 2 | + overlap, tiling 2, strided DMA | + overlap, tiling 1, strided DMA |
+|---|---|---|---|---|
+| gather (zero-padded all-reduce, 4 x 8 MiB) | 5.386 | 5.763 | 5.066 | 5.570 |
+| mlp (no collective) | 11.990 | 11.988 | 11.988 | 11.992 |
+| gather -> mlp | 13.250 | 13.413 | 13.403 | 13.308 |
+| gather and an independent mlp | 13.585 | 13.139 | 13.139 | 13.578 |
+| two micro-batches | 12.704 | 12.279 | 12.241 | 12.749 |
+| layer (gather -> mlp -> reduce-scatter) | 13.539 | 13.769 | 13.728 | 13.567 |
+| layer on two half-batches | 13.268 | 12.660 | 12.678 | 13.309 |
+| rs 32 MiB alone | 4.450 | 5.567 | 4.606 | 5.434 |
+
+The option moves independent and two-half-batch graphs by -0.4 to -0.6 ms (-3 to -5%) and the one dependent layer, the
+shape Kiln's pieces have, by +0.2 ms; nothing here would show in serving, so no farm build was spent on it. If two-batch
+overlap is ever rebuilt in Kiln's graphs, re-measure with `--enable-ccop-compute-overlap`: it is the one setting under
+which this compiler ran half B's gather under half A's work at all (the utilization probe above found none without it).
+
+### Other upstream code, and where it goes
+
+Handed to the agents that own the area (through the lead), each with its source:
+- **Prefill groups past the 5M-instruction cap:** NxDI passes `--internal-max-instruction-limit=15000000` for graphs
+  "over 5 million instructions" (models/qwen3_moe/modeling_qwen3_moe.py:513-543; also qwen3_vl). Kiln's prefill group
+  size (P = 12) and chunk are bounded by NCC_EBVF030 at 5M ("Prefill layer groups and the instruction limit" above).
+- **DVE-bound DSA prefill attention** (the fused kernel: DVE 3.3 ms, PE 2.6 of 4.92 ms): nkilib
+  experimental/attention/attention_const_max.py:403-444 (P V against [V | 1] gives the row sum on the tensor engine;
+  K stationary in QK gives S^T, no P transposes; a constant max removes the online max and rescale, a numerics risk) and
+  core/attention/attention_cte.py:3113-3120, 3635-3767 (row max and exp-sum chained in the vector accumulator with
+  `reduce_cmd`, one read-out).
+- **1M context / DeepSeek-V4-style sparse attention:** nki-library branch zifan/deepseek_v4_csa (trn3-only as written:
+  DMA `priority=`): experimental/deepseek_v4_csa/csa_prefill_attention.py `nki_compressor_core_kernel` :446 (softmax-gated
+  pooling over 2 x ratio overlapped slots, close to GLM-5.3-Flash's pooled DSA keys), `nki_prefill_sparse_attn_kernel`
+  :1255 (an O(k) per-query gather instead of a masked dense pass), the bisection threshold mask :764-786;
+  csa_decode_attention.py :1552 (indexer score and top-k split over two cores, K-split gathered attention).
+- **Long-context settings NxDI turns on from 32k tokens:** compiler `--internal-disable-fma-on-ios` ("reduce dma rings
+  io") and `--disable-mixed-precision-accumulation` (model_wrapper.py:100-103; the compiler reference says disabling it
+  "may improve performance at the cost of reduced accuracy"), `--internal-enable-dge-levels spill_reload` ("reduction
+  in DMA rings memory for long context", config.py:592-593, model_wrapper.py:135-136), and the runtime's
+  `NEURON_RT_DBG_SCRATCHPAD_ON_SINGLE_CORE=1` plus `NEURON_SCRATCHPAD_PAGE_SIZE` (utils/runtime_env.py:7-18,
+  config.py:613-620); on trn1 the contiguous scratchpad is the default and makes the page size a no-op
+  (neuron-runtime/explore/device-memory.rst:167-190). None measured here.
+- **Decode MoE as one kernel with routing:** the MLSys nki-moe winner (github.com/thustorage/NKI-MoE 217759f,
+  Apache-2.0; Qwen3-30B-A3B, bf16, batch 1, trn2 / trn3): kernels/moe/moe_selective.py:42 fuses RMSNorm, router, softmax,
+  top-8 (`nisa.max8` + `nc_find_index8`, router_topk.py:430-456) and the experts, with Python-unrolled expert loops (no
+  `fori_loop`, so no per-iteration all-engine barrier), one fused gate+up DMA per expert and the down projection over 8
+  PSUM banks (selective_expert_impl.py:126-374). Kiln's decode v2 loops on the device and leaves routing to XLA.
+
+Measured or read and set aside:
+- Static DMA priority, `NEURON_RT_DBG_DMA_PACKETIZATION_SIZE=65536` (neuron-runtime/explore/compute-comm-overlap.rst:83-95:
+  compute static DMA packets 4 KiB -> 64 KiB raise their priority against collective DMA): with the hardware barrier,
+  G64 159.2 -> 158.7 and F0 137.7 -> 137.3 out tok/s (kiln-hv-32, logs hv-{G64,F0}-hwpk.log): nothing.
+- nkilib experimental/gdn (Gated DeltaNet prefill and decode, new since 2.32): kernels/delta_rule.py already does the
+  same algebra (nilpotent diagonal blocks inverted by squaring, then merge levels) at 1.7x its tensor-engine floor; gdn
+  also uses `tensor_copy(engine=scalar)`, which trn1 rejects.
+- `DISABLE_NUMERIC_CC_TOKEN=1` (NxDI compile_env.py:20-24): libtorch_neuronx_lite already sets it
+  (libtorch_neuronx_lite/__init__.py:44-45).
+- vllm-neuron 0.24's other two runtime knobs: `NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS` and
+  `NEURON_RT_IO_RING_CACHE_SIZE=32` (neuron_worker.py:700-713) are already engine defaults; `NEURON_RT_MAP_HBM=1` is for
+  RDMA (disaggregation).
+- The explicit async API (`nrta_*`, nkipy SpikeAsync: gpt-oss-20b decode 41 -> 68 tok/s): Kiln's host is ~0 of the
+  wall and the device 99.6% busy ("Accelerator utilization" above); implicit async is gone in 2.32 anyway.
+- `-O1` for prefill (NxDI CTE): fails Kiln's prefill groups (NCC_EBVF030) and decode group 0 (NCC_INAS001), above.
+- `NEURON_RT_ONE_THREAD_PER_CORE` (runtime 2.29: 2x collective latency for EFA proxy threads): fails to schedule here
+  (above).
+- nki-samples: contributed/decode_attention.py (no split-K) and attn_fwd_v10 (manual SBUF / PSUM allocation, a skewed
+  software pipeline, which Kiln's attention kernels already do); every MX kernel (`nc_matmul_mx`: NeuronCore-v4 only).
+- torchtitan-neuron and neuron-agentic-development: no inference kernel, flag or runtime setting not listed here.
+- Bug classes worth knowing from nkilib's fixes, both met by Kiln before: `oob_mode.skip` with a sub-tensor-view source
+  still writes (core/moe/moe_tkg/all_expert_mx_impl.py:2127), and duplicate indirect-scatter destinations are
+  nondeterministic (branch viekash/ncc-9479-qkv-oob-skip; Kiln's padded-row fix c99a373 is the same class).
+
+## Decode at scale: the step's fixed cost, trn2 at large batch, and the 1M-context indexer (2026-10-05, SDK 2.32, feat/decode-scale)
+
+GLM-5.3-Flash real weights (zai-org/GLM-5.3-Flash@eb9eb208), tp=32, DP attention 4, page bucket 264 (8448 keys), engine-v0
+70ddc1b defaults plus this branch (no default changed), every device graph from the compile farm with
+`NEURON_LIBTORCH_ASSERT_CACHE_HIT=1`. `tools/time_decode.py` times synchronous decode steps on random token ids with
+every KV row on the null page (the work of a step at that bucket), wall p50. **Every step time and $ figure in this
+section is step-only, null-page** (every row reads one page, which flatters the bandwidth, and none of them checks that
+the batch's real KV fits HBM) unless it says "real KV": see "Real KV on the trn1 decode box" at its end, which also
+shows that 48 rows per group at 8K do not fit a trn1 rank. Exact commands in each log's `.cmd`
+(tools/dc_td1.sh, dc_td3.sh, dc_td2.sh, dc_cap.sh); logs s3://<your-bucket>/logs/kiln-dc-32/ (trn1.32xlarge spot,
+us-east-2c) and .../kiln-t2-cb/ (trn2.48xlarge, the trn2 agent's capacity block in ap-south-2b, cores 32-63).
+
+**The trn1 decode step is ~70 ms of fixed latency plus ~3.3 ms per row per DP group** (td-<cfg>-*.log):
+
+| rows per group (per step) | 1 (4) | 4 (16) | 8 (32) | 16 (64) |
+|---|---|---|---|---|
+| 12-layer groups (the default: prep + 4 + post = 6 graphs) | 70.3 ms | 97.4 / 95.9 | 114.5 | 136.8 |
+| 24-layer groups (KILN_PIECEWISE_MOE_GROUP=24, 4 graphs) | 71.3 | 96.5 | | 131.2 |
+| one 45-layer layer graph (=48, 3 graphs) | 72.6 | 97.6 | | 137.5 |
+| one graph per call (KILN_DECODE_WHOLE=1, this branch) | 71.8 | **93.3** | | **127.9** |
+| NEURON_RT_DISABLE_EXECUTION_BARRIER=1 (provisional: deadlocks under skew, harvest agent) | | 91.8 | 105.8 | 128.8 |
+
+(G16 / F0 / G64 serving shapes: 4 rows per group with EP, 0.65 GB bf16 KV; 8 rows, 1.5 GB bf16; 16 rows, 1.5 GB fp8. The 1-row
+bucket is G16's.) **The graph count is not the fixed cost**: at 1 row per group the step is 70-73 ms whether the call is 1 or
+6 graphs. Merging the call into one graph buys 4-9 ms at 4-16 rows (-4% / -6.5%); 24-layer groups 1-6 ms; one 45-layer layer
+graph nothing. The ~70 ms is in-graph latency: ~1.56 ms per layer at 1 row per group.
+
+**Where a call goes** (`KILN_CAPTURE_INPUTS` of one warm call on every rank, then `tools/util_report.py replay / bins / report`,
+rank 0; prof-G16, prof-G64; `tools/prof_step.py` on the layers 12-23 graph, logs/kiln-dc-32/g16-002-step.txt):
+
+| | G16 (16 rows) | G64 (64 rows) |
+|---|---|---|
+| call (replay) | 104.0 ms: prep 2.9, groups 22.7 / 24.7 / 24.9 / 24.3, post 4.5 | 144.2 ms: prep 3.2, groups 34.4 / 35.3 / 37.8 / 27.4, post 6.1 |
+| engine busy (tensor / vector / scalar / gpsimd) | 21 / 30 / 15 / 7% | 27 / 30 / 15 / 6% |
+| HBM | 52 GB/s (12% of 440) | 61 GB/s (14%) |
+| collectives | 92 all-reduces of 128 KB: 0.19 ms waiting for the slowest rank + 0.25 ms transfer each = 39 ms (38%) | 227 = 52 ms (36%): 45 AR 128 KB at 0.38 ms skew wait + 0.07 (20 ms), 45 RS 512 KB 18.7 ms, 47 AR 512 KB 10.9 ms |
+
+Per layer at 4 rows per group (layers 12-23, KKKD x 3): KDA mixer 0.386 ms (36 MB of projection weights read: 95 GB/s; tensor
+engine `dot` 348 us busy, the KDA decode kernel), FFN 0.47-0.94 ms, mean 0.65 (EP v2 MoE kernel with its in-kernel CC-core
+activity, shared expert, router, mHC; 35-114 MB), **DSA mixer 1.54 ms of which a `reduce-window` on the tensor engine is 415 us**
+(the `cumsum` of glm5_next.decode_slots' prefix counts over 2112 pools) and fp32 dequantization multiplies ~0.39 ms (vector
+388 us, tensor 196 us: the FP8 q_a / kv_a / q_b / o_proj weights converted every step), collective transfer 0.25 ms mean (the
+FFN all-reduces 0.2-0.85 ms: the busiest EP rank). So the fixed cost is 45 layers x (~1.45 ms of chained small ops with every
+engine under 50% busy + 2 collectives at ~0.43 ms), plus ~7 ms of prep / post.
+
+Two changes this attribution names, opt-in on this branch: `KILN_DSA_PREFIX=mm` (glm5_next.prefix_counts: the counts as two
+small triangular matmuls, exact; tests/test_glm5_next.py::test_prefix_counts_matmul_form_is_exact) and the existing
+`KILN_DENSE_FP8=0`; their A/Bs follow below.
+
+**trn2 at large batch** (kiln-t2-cb, one tp=32 engine = half the box, LNC=2, the same command with --core-base, q/dc1-t2,
+td2-X.log; K by the trn2 agent on cores 0-31 with this command, 20261005T172648Z-t2-td-K.log):
+
+| rows per group (per step) | 16 (64) | 32 (128) | 64 (256) |
+|---|---|---|---|
+| engine-v0's trn2 defaults (XLA KDA / DSA decode paths, TP MoE) | 143.6 ms, 446 out tok/s | 219.7, 583 | 1438.7, 178 (the XLA DSA mask form spills) |
+| + KDA / DSA decode kernels + SP decode streams (the trn1 defaults; off on trn2) | 110.7, 578 | 154.9, 827 | **264.2, 969** |
+
+Per box (two engines) that is ~1,165 out tok/s on the trn2 defaults ($3.6 / 1M out at $15/h spot, decode only, MBU ~9-10%)
+and **~1,940 out tok/s with the decode kernels** ($2.2 / 1M, MBU ~10-14% by the utilization section's per-rank bytes at
+725 GB/s per logical core), at 8K context. A trn2 step at 64 rows (110.7 ms) costs what a trn1 step does (136.8 ms with EP):
+the fixed latency does not shrink with the faster chip.
+
+**The W1M arithmetic (the lead's, checked against the config)**: 11 DSA layers x 262,144 pools x 128 B = 0.369 GB of fp8
+pool keys per row per step; 34 KDA layers x 64 heads x 128 x 128 fp32 = 142.6 MB of state read and the same written; ~455 GB
+per step at 187 rows (328 GB of weights, every expert touched, + 187 x 0.67 GB), 9.8 ms at 46.4 TB/s; 1,000 out tok/s = 5%
+MBU, $0.5 / 1M at $15/h = 8.3k out tok/s = 44%; a 1M prefill ~45.5 GFLOP per token, 47.5 PFLOP per request. Two corrections
+for engine-v0: (a) its DSA cache under FP8 KV is 832 B per token per layer (latent 512, indexer key and gate logits 256, bf16
+pool-key pieces 64: models/mla.py cache_widths / pool_key_width), 9.6 GB per 1M sequence, and the pool keys read per step
+are bf16 (0.74 GB per row); the 6.27 GB / 0.37 GB need the long-context agent's `KILN_DSA_KV=minimal` (512 + 32 B per token).
+(b) Under DP attention the latent is replicated on every rank of an attention group (attention TP 8): 77 GB of HBM per 1M
+sequence, about one sequence per attention group, ~8 per trn2 box with two tp=32 engines. ~187 sequences needs context
+parallelism of the DSA cache (`KILN_DSA_CP=1`, feat/long-context), the minimal layout and ONE weight copy per box (tp=64; two
+tp=32 engines hold 2 x 328 GB): ~7.2 GB of weights + ~3 GB of graphs per 24 GiB rank leaves ~15.5 GB, ~154 sequences.
+
+**The decode-side indexer at 1M context** (`kernels/dsa_index.py`, `tools/probe_dsa_index.py`, one NeuronCore; scores of
+every complete pool for B decode rows, each row its own context, read from the paged pool-key cache):
+
+| | trn1.2xlarge, B=1 / 4 | trn2 logical core (LNC=2), B=1 / 4 |
+|---|---|---|
+| XLA (page gather, einsums: engine-v0's decode scores), 262,144 pools | 3.08 / 4.18 ms (16 rows: fails to compile) | 0.93 / 3.11 |
+| the kernel, one 256-byte pool row per gather descriptor (first form) | 3.32 / 13.16 (20 GB/s) | |
+| the kernel, one 2 KB page row (8 pools) per descriptor | **0.705 / 2.70 (95-99 GB/s)** | **0.497 / 1.048 (256 GB/s at B=4)** |
+| the same with no gathers after the first (engines alone) | 0.412 / 1.58 | |
+
+Exact against emulate() (3e-7 relative) on both chips and in nki.simulate (trn1 grid 1, trn2 grid 2). The profile
+(`tools/prof_attn_kernels.py dsa_index`, trn1, B=1): GpSimd busy 486 us generating the indirect DMAs' descriptors (~15 ns per
+2 KB page descriptor: trn1's DGE is software), tensor / vector / scalar ~240 us each. So per row per layer: trn1 ~0.68 ms on
+one core (0.49 ms of it the page descriptors at 32-token pages), trn2 ~0.26 ms per logical core (the two physical cores take
+alternate rows). Consequences: a gather granule under 2 KB is descriptor-bound (20 GB/s at 256 B), so under `KILN_DSA_CP=1`
+with A = 8 ranks a rank's share of a 32-token page is one pool (256 B): CP=8 wants pages of at least 256 tokens; and
+`dge_mode=hwdge` on these indirect gathers fails at trace on trn2 (not a lever as written). engine-v0 itself cannot trace a
+1M decode step (kernels/dsa_topk.py MAX_W: 8192 scores per partition at 4 rows per group); the long-context device forms
+are on feat/long-context.
+
+**Verdict (fail-fast, sent 17:35 UTC): ~44% MBU on trn2 at W1M is not reachable on this decode architecture.** A 44% step
+is ~22 ms at ~187 rows; the measured fixed latency is ~70 ms on trn1 (1 row per group) and a trn2 engine's step is 110.7 ms
+at 64 rows with every kernel on. At zero per-row cost 187 rows / 0.07-0.09 s is ~2-2.7k out tok/s (10-13% MBU), and the
+1M per-row work adds ~11 ms per step even spread over 128 trn2 cores. Reaching 44% needs the per-layer latency ~5x lower:
+fused per-layer decode kernels (the MoE FFN first, then the KDA mixer), collectives issued from inside kernels or far fewer
+of them, per-row work at bandwidth. 5% (1,000 out tok/s per box) looks reachable once ~150 1M sequences fit (tp=64 +
+CP + minimal) and the step stays near the trn2 curve's ~150-260 ms at 128-256 rows.
+
+### The fixed cost, stage by stage, and what it was (2026-10-05 evening, trn1.32xlarge, feat/decode-scale)
+
+**At 1 row per group the collectives are rank imbalance, not latency.** `tools/prof_skew.py` over a replay of the 1-row
+G16 decode call's layers 12-23 graph with every rank profiled (`util_report.py replay --profile-all --seq 2`, captured
+inputs; logs/kiln-dc-32b/skew-G1-002.txt): per FFN segment the median rank computes 240-410 us and the slowest 565-877 us
+(a different rank each layer), and rank 0's FFN all-reduce "transfer" (300-550 us) is that difference. The slowest rank's
+FFN moves 107 MB (its EP experts: ~4 whole experts of 25 MB), the median's 9.5 MB (shared expert and router only): under
+expert parallelism at 4 rows x 8 experts the routed experts land on a few ranks. By contrast a chain of 16 all-reduces of
+32-128 KB inside one graph costs ~0.01 ms each over the 32 ranks (`tools/probe_decode_cc.py`, XLA world and 8-rank group,
+and the same in-kernel through nki.collectives); with uniform compute between them they hide entirely.
+
+**Four opt-ins, each measured** (time_decode wall p50, ms per step at 1 / 4 / 16 rows per DP group; logs td-<cfg>-<v>.log):
+
+| | 1 | 4 | 16 |
+|---|---|---|---|
+| engine-v0 70ddc1b (EP experts) | 70.3 | 97.4 | 136.8 |
+| KILN_DECODE_WHOLE=1 | 71.8 | 93.3 | 127.9 |
+| KILN_DENSE_FP8=0 | 66.3 | 93.5 | 131.6 |
+| KILN_DSA_PREFIX=mm | 69.7 | 94.0 | 136.8 |
+| KILN_MOE_EP=0 (tensor-parallel experts) | 55.1 | 78.3 | 126.5 |
+| **ST: all four** | **47.5** | **68.4** | **110.6** |
+
+The step's fixed part (1 row per group) is down 32%; the per-row slope stays ~3.5 ms per row per group. EP stays the
+better prefill layout (its gates), so ST is a decode-box configuration: with prefill / decode disaggregation the decode
+engine loads TP experts and never runs a prefill piece. Its serving gate (with prefill graphs, check_mixed's decode-path
+NLL against engine-v0 b8814ab) is in flight (q/dc2-st).
+
+**Async MTP on the current tree** (`tools/dc_mtp.sh`: tools/amtp_g1b.sh's G1b workload, KV 1.5 fp8, 256 requests per
+level, cold / warm, kiln-dc-32, logs amtp-MB / -MS / -MA): no MTP 275.0 / 338.8 out tok/s, synchronous MTP k=1 243.0 /
+276.7, async 248.7 / 298.3, 96.4-96.9% of drafts accepted. MTP now loses (on f54fc18 async was +7.1% / +5.5%): the
+engine turns SP decode streams off with an MTP head, and the verify graph (Q = 2) takes the XLA KDA verify scan and the
+DSA mask form rather than the decode kernels, so the speculative step lost what the plain decode step gained. MTP pays
+again only with verify-capable decode kernels; at 1M context the verify needs the decode-side indexer too.
+
+**The KV handoff through the host** (`tools/probe_kv_handoff.py`, one trn1.2xlarge NeuronCore, bf16, 16 KB pages):
+device -> host 2.9-3.5 GB/s from 64 MB up (11.8 GB/s at 16 MB), host -> device 9.2-12.4 GB/s; gathering a sequence's
+scattered pages on the device before the read, or scattering after the write, costs ~5%. A 1M sequence under CP = 8 +
+minimal is ~0.78 GB per rank of its attention group: ~0.35 s through the host per handoff against ~30 s of 1M prefill; at
+8K a request is ~28 MB per rank. EFA (trn2 16 x 200 Gbit) moves 6.3 GB in ~16 ms. The transfer is not a constraint.
+
+**W1M on trn2, a projection (not a measurement):** two tp=32 engines, DP attention 4, `KILN_DSA_CP=1` with A = 8 and
+256-token pages (8 local pools = 2 KB per descriptor), `KILN_DSA_KV=minimal`: ~10.5 GB free per 24 GiB rank after
+11.8 GB of weights and ~3 GB of graphs = ~13 1M sequences per attention group, ~104 per box. Step at 13 rows per group:
+~111 ms (the trn2 decode-kernel curve at 8K) + ~5 ms of indexer (0.26 ms per row-layer / 8 ranks) + selection and merge
+= ~120-130 ms for 52 rows per engine, **~830 out tok/s per box** before the fixed-cost changes above are applied on trn2.
+
+**Where the ST step's fixed cost is now, and the price of a kernel call** (2026-10-05, trn1.32xlarge kiln-dc-32b; the ST
+1-row call replayed as its one graph with captured inputs, logs/kiln-dc-32b/st-g1-step.txt, rep-G1.report.txt): 38.6 ms
+on rank 0 (time_decode wall 48 ms): KDA mixers 34 x 0.301 = 10.2 ms, FFN blocks 45 x 0.272 = 12.2 ms, DSA mixers 11 x
+0.594 = 6.5 ms, 91 all-reduces at 0.024 ms wait + 0.067 ms transfer = 8.4 ms (0.41 ms each under EP: the imbalance is
+gone), post 1.0 ms. Every block moves its weights at ~130 GB/s (KDA 32 MB in ~0.25 ms, FFN 37 MB in ~0.29, DSA 76 MB in
+~0.57; HBM read 3.56 GB per call against 2.89 GB the model needs).
+
+Weight streaming is not the limit by itself (`tools/probe_gemv.py`, one trn1.2xlarge core, bf16, [T, 4096] x [4096,
+4096], 8 chained products per graph): XLA's chain of F.linear streams 227 GB/s at T = 1 / 4 / 16; the same chain as ONE
+NKI kernel (kernels/gemv.py kiln_gemv_chain_kernel: each weight k-tile one [128, 4096] DMA, the next product's tiles
+loaded while the current one finishes) **262.6 GB/s**; as 8 kernel calls in one graph (kiln_gemv_kernel each) 99 GB/s.
+So an NKI kernel call inside a graph costs ~0.21 ms over its work ((2.70 - 1.02) / 8): the compiler overlaps nothing
+across the call, and the call's prologue (its inputs loaded and transposed, its first weight tiles) starts cold. A decode
+layer holds 1-3 kernel calls and a collective between its blocks, so the blocks cannot prefetch each other's weights: the
+fused per-layer kernels must each be one call holding all of a block's projections, so their weight tiles stream back to
+back.
+
+**The FFN block fused into one call does not pay by itself** (`kernels/moe_ffn.py` kiln_moe_ffn_pairs_v1: the router's
+logits from bf16 x bf16 products in one PSUM bank, sigmoid, + bias, max8 / nc_find_index8 for the top-8, the weights
+normalised and scaled, then kiln_moe_tiles_pairs_v1's per-pair loop with the shared expert as a ninth pair per token at
+weight 1; exact against its emulation on the device (0 at T = 1 / 4, 1.9e-4 at 15) and in nki.simulate,
+tests/test_moe_ffn.py). `tools/probe_moe_ffn.py`, one trn1.2xlarge core, GLM-5.3-Flash's rank shapes (288 FP8 experts, 128
+x 128 block scales, 64 intermediate rows, clamped SwiGLU): the served form (XLA router and top-k, the per-pair kernel, the
+XLA shared expert) 0.140 / 0.200 / 0.508 ms per call at T = 1 / 4 / 15, the one kernel 0.137 / 0.183 / 0.535 ms. The
+expert loads (one 0.79 MB tile per pair) dominate and the XLA parts around the kernel were not the cost, so this block is
+not integrated; what the step's fixed cost needs is fewer kernel boundaries per LAYER (the mixer, the FFN and their
+collectives in one call), not a sub-block fused on its own.
+
+**trn2 with the stack** (the trn2 agent ran this branch's `tools/dc_td2.sh 0 KST` on kiln-t2-cb cores 0-31, q/dc1-t2,
+log logs/kiln-t2-cb/td2-KST.log; KST = the decode kernels and SP decode streams + the moe_dedupe LNC split +
+KILN_DENSE_FP8=0 + KILN_DSA_PREFIX=mm + KILN_DECODE_WHOLE=1, TP experts being trn2's default): 1 / 4 / 16 / 32 / 64 rows
+per group = 58.9 / 49.2 / 86.9 / 114.3 / 204.2 ms per step, 1,254 out tok/s per tp=32 engine at 256 rows, ~2,500 per
+box, $1.67 / 1M out at trn2 spot (step-only, null-page) (decode only, 8K context; the decode kernels' greedy agreement on trn2 is still under the
+trn2 agent's gate, so throughput only). Not a clean A/B against the decode kernels alone (110.7 / 154.9 / 264.2 at 16 / 32 /
+64 rows per group): that run loaded 3 decode buckets and KST 5, and the trn2 agent measured its own decode-kernel stack
+(D2K2) 12-20% slower with the 5 buckets loaded (105.8 / 126.8 / 202.7 against 87.7 / 110.7 / 180.7), so on trn2 the
+stack's own gain is closer to its same-tree numbers: D2K2 + ST 84.5 / 105.2 / 182.9 ms against D2K2's 87.7 / 110.7 /
+180.7 (-4% / -5% / +1%; 1,400 out tok/s per engine at 256 rows, $1.52 / 1M at half-box spot; step-only, null-page). A same-bucket A/B is the
+trn2 agent's next run.
+
+### The decode-only box at large batch: the MoE read every expert twice (2026-10-05 night, trn1.32xlarge, feat/decode-scale)
+
+**Single changes under ST, 1 / 4 rows per group** (time_decode wall p50, `tools/dc_td7.sh`, q/dc1-t1, kiln-dc-32, logs
+td7-*.log): ST 48.1 / 69.7 ms; the KDA decode kernel off (`KILN_KDA_DECODE_KERNEL=xla`) 47.6 / 70.5; the DSA decode kernel
+off (`KILN_DSA_DECODE_KERNEL=xla`) 53.8 / 73.8; DP attention 1 (attention TP 32: a quarter of DP 4's mixer weights per
+rank, every rank holding every sequence's KV) 44.1 ms at 4 rows per step and 72.9 at 16, against ST's 48.1 / 69.7 at the
+same rows per step (-8% / +5%). The KDA kernel is neutral at small batch, the DSA kernel pays, and DP attention 1 only pays
+for the smallest batches.
+
+**ST as a decode-only box** (`tools/dc_queue12.sh` / `dc_td7.sh STL`: decode buckets 32 and 48 rows per group = 128 / 192
+rows per step, fp8 KV, no prefix cache, 8K context; ~48 rows per group is what a rank's HBM holds at 8K with no prefill
+graphs loaded): 152.1 ms (841.5 out tok/s) and 226.8 ms (846.5 out tok/s, $0.71 / 1M out at $2.15/h trn1 spot;
+step-only, null-page: 48 rows per group do not fit with real 8K KV, below). The
+plateau was the MoE: with TP experts every rank runs every row of the step, and moe_dedupe called kiln_moe_dedupe_v8 on
+chunks of at most 128 tokens (it holds a call's tokens on the partitions), so 192 rows were a 128-token call and a
+64-token call that each read nearly every one of the 288 experts (283 and ~240 distinct).
+
+**kiln_moe_dedupe_v9: 129-256 tokens in one call** (`kernels/moe_dedupe.py`, opt-in `KILN_MOE_DEDUPE_MAX_TOKENS=256`; v8's
+source and REV are unchanged, so no existing graph moves). The tokens sit in two tiles of 128 partitions wherever v8 holds
+them there (x, the lanes' 0/1 gather matrix, the route's output, the fp32 accumulator, the LNC exchange); the plan takes up
+to 2048 pairs and 512 static slots (its slot table is one PSUM row: `fits()`, 448 slots at 192 rows, 512 at 256). Exact
+against `emulate()` under nki.simulate at 130 / 136 / 150 / 200 / 256 tokens, 128 / 160 / 288 experts, lanes 8 / 16, and at
+grid 2 (`tests/test_moe_dedupe.py`, `tests/test_lnc_split.py`); on the device 0.0021 of the output's max at 192 rows. One
+trn1.2xlarge core, GLM-5.3-Flash's rank shapes (`tools/probe_moe_kernel.py --experts 288 --scales block128 --act
+silu_clamp --kernels dedupe`, ms per graph call including ~0.13 ms of launch and read-back):
+
+| form | 128 rows | 192 rows | 256 rows |
+|---|---|---|---|
+| v8, 128-token calls (engine-v0) | 1.871 | 3.118 | 3.542 |
+| v9, one call (as first written, lanes 8) | | 2.361 | 2.695 |
+| v9, lanes 16 (groups of one slot) | | 3.034 | 3.264 |
+| v9 tuned: routes of two blocks summed in PSUM, PSUM copies on the scalar engine | | 2.302 | 2.726 |
+| + expert ring 4 (ring 5: 2.130 at 192) | | 2.152 | 2.595 |
+| + the gather's tensor-engine half and the route matmuls deferred (`KILN_MOE_DEDUPE_RING9=4`, the default) | | **2.136** | **2.524** |
+| v9 for 128-token calls too (`KILN_MOE_DEDUPE_V9=1`; 16 / 32 / 64 rows 0.640 / 1.063 / 1.440 against v8's 0.634 / 1.073 / 1.430) | **1.711** | | |
+
+What bounds it (`tools/probe_dedupe_prof.py` + `tools/prof_engines.py` + `tools/prof_ops.py`, the 192-row graph profiled):
+not the expert bytes (288 x 0.82 MB = 236 MB, 0.9 ms at 262 GB/s; DMA active 1.07-1.27 ms of the call) and not the tensor
+engine (48 matmul pairs per slot at ~33 ns), but the vector engine: 1.65 ms busy of the first form's 1.9 ms, then 1.25 of
+the tuned form's 1.67. Per slot it scales the down products (`pd * s_down`, 0.58 us, from PSUM), per group of two slots it
+multiplies and sums the gate_up tile partials by their scales (0.96 + 0.66 us) and masks g and a by half (2 x 0.27 us),
+per block it builds the lanes' 0/1 and weight matrices (~7.6 us) and adds the route into the accumulator. Every one of the
+448 static slots costs that, and at uniform routing only ~314 are real (`n_slots` covers the worst routing), so a device
+loop that skips the slot tail past the routing's real count (as moe_prefill's `KILN_MOE_PREFILL_SKIP` segments do) is the
+next ~25% of this kernel. GpSimd does not take the SBUF-only products: `nisa.tensor_tensor(engine=gpsimd)` fails
+neuronx-cc 2.27 on trn1 with `[NCC_IXCG965] Instruction engine check failed (Pool)` although nki.simulate runs it.
+
+**End to end, one tree** (`tools/dc_td8.sh`, engine-v0 8229c3d + this branch at the first v9 form, q/dc1-t1 configs t1-STL
+/ t1-STL9, kiln-dc-32, logs td8-*.log): STL 151.4 / 225.4 ms at 128 / 192 rows per step; STL9 (`KILN_MOE_DEDUPE_MAX_TOKENS=256`)
+151.3 / 195.2 ms: 983 out tok/s, $0.61 / 1M out at 192 rows (step-only, null-page; decode only; a first run on the same graphs
+195.7), -30 ms = 42 MoE layers x the kernel's -0.76 ms. Two keys to know: the slice of a chunk is in the graph (moe_dedupe slicing `x[s:s + n]` instead of
+`x[s:s + max_tokens]` gave the 192-row v8 graphs new keys and the farm's STL graphs missed), so v8's chunks keep the old
+slice; and a 1M-context row is a different capacity question, so none of these per-box numbers apply to W1M.
+
+**ST in a mixed serving box does not pay** (`tools/dc_gate.sh`: bench/serve_sweep.py at the G64 shape, conc 64, 128
+requests, q/dc2-st, logs gate-serve-*.log). engine-v0 8229c3d 167.7 out tok/s (decode call 117 ms, prefill call 475 ms);
+STb (ST + `KILN_SP_GATHER=xla`, below) 120.3 out tok/s (decode call 99.7 ms, -15%; prefill call 821 ms, +73%: TP experts
+are the worse prefill layout, as EP's gates said). So ST belongs to the decode engine of a disaggregated pair, with EP on
+the prefill engine. The first STb attempt died in the NCCL bootstrap (`Failed to bind(127.0.0.1<40788>) ... Address already
+in use`, while the CPU suite ran on the same box) and passed on a rerun.
+
+**ST's numerics** (`tools/check_mixed.py`, 32 prompts of 700-8192 tokens, 64 greedy tokens, conc 32, logs
+gate-cmp-*.log): LONG_TEXT engine-v0 against itself 32 / 32 identical; against STb 29 / 32 equal, token agreement 0.937,
+decode calls |dlogprob| mean 0.0027 / p99 0.090 / max 0.30, signed **-0.00054**; wikitext-2 4 / 32 equal, agreement 0.558,
+0.033 / 0.22 / 0.69, signed **-0.0021**. That is the floor of the numerically neutral changes already accepted (EPLB 30 / 32
+and 3 / 32, -0.0008 / -0.0022; EP row form against EPT 9 / 64, -0.0028): the summation order moved, the decode-path NLL did
+not.
+
+**TP experts + the NKI SP gather do not compile** (engine-v0 b8814ab / 8229c3d, neuronx-cc 2.27): with `KILN_MOE_EP=0`
+and the default `KILN_SP_GATHER=nki`, 4 of the 12 prefill pieces of q/dc2-st G64-ST failed `[NCC_ISCH719] topological
+order violations` (keys 28585433..., 84c93cef..., 73a1331f...), as did 4 of 16 with 6-layer pieces (G64-ST6) and the same
+without `KILN_DENSE_FP8=0` (G64-STa); `KILN_SP_GATHER=xla` (G64-STb) compiled all 23 graphs. The prefill agent reproduced
+it (4 of 4 keys on 8229c3d) and its fallback (e40befb: the NKI world gather only for EP or expert-free models) compiles 12
+of 12; until it merges, EP=0 configurations set `KILN_SP_GATHER=xla`.
+
+**trn2, same buckets** (the trn2 agent, cores 32-63, buckets 16 / 32 / 64, logs 20261005T221314Z-t2-td-X2b): D2K2 on this
+branch 87.77 / 110.52 / 212.29 ms (64 rows min 198.8; cores 0-31 were busy beside it), the same as D2K2 on its own tree
+(87.7 / 110.7), so the branch is clean and the earlier 12-20% was the extra decode graphs loaded: on trn2 every loaded
+decode graph costs step time, which matters for serving bucket ladders. ST at three buckets could not run (cache miss
+4c031150..., the 5-bucket NEFFs do not serve it); with five buckets each, ST against D2K2 is -20 / -17 / -10% at 16 / 32 /
+64 rows per group.
+
+### Real KV on the trn1 decode box (2026-10-06, trn1.32xlarge, feat/decode-scale)
+
+**What fits a rank** (`tools/tensor_bytes.py` on the meta device + `tools/hbm_estimate.py` over the compiled graphs,
+`tools/dc_hbm.sh`, q/dc1-t1 t1-STL9's keys; one rank's own keys only, the summary line sums all four captured ranks):
+the ST decode box (TP experts, decode buckets 32 / 48) with 0.5 GB of KV is tensors 12.76 GiB (experts 10.01 GB, other
+weights 2.23 GB, KV 0.50 GB, layer state 0.97 GB) + code 0.22 + spill rings 0.62 + scratch 0.31 + fixed 0.13 = 14.04 GiB;
+with 3.5 GB of KV (12,833 pages) 17.04 GiB. The runtime refused a configuration at 15.91 GiB of the 16 before. A 32-token
+page of every DSA layer's fp8 latent, indexer rows and pool keys is ~270 KB per rank plus ~22.5 KB of token-slot state,
+REPLICATED over an attention group's 8 ranks; a request's KDA state ~19.4 MB per rank. An 8448-token sequence is then
+~96 MB per rank and **28 rows per group (112 per step) is what fits at 8K** (t1-STL9r2: `--max-num-seqs 112
+--kv-cache-gb 2.1 --decode-buckets 28`, ~7,770 pages per group for 28 x 264 + 1); 48 per group (the STL / STL9 batches
+above) do not. KV 1.95 GB (t1-STL9r) holds only ~7,222 pages: too few for 28 full sequences.
+
+**Timing with real pages** (`tools/time_decode.py --real-kv`): every row of every group gets pages of its own (distinct ids
+from each group's pool, all filled once with random values, fp8 clamped, by ModelRunner.fill_slots on every rank), a
+context of --input-len + 1 + a spread over --output-len (positions, the new token's slot in its last page) and its own
+state row, as ModelRunner.decode builds a running batch; it refuses a bucket whose rows do not fit the pool, and the
+curve lines say `kv=real` or `kv=null-page`. Under context-parallel DSA it counts pages in cache rows per page (ps / cp).
+
+**The tuned v9 end to end, step-only, null-page** (`tools/dc_td8.sh`, DC_TDN=10, one tree 83036ba, q/dc1-t1 t1-STL /
+t1-STL9d / t1-STL9e, logs td10-*.log), ms per step at 32 / 48 rows per group: STL (v8) 152.7 / 226.9; STL9d (v9 at its
+defaults for the 192-row calls) 152.5 / **183.3**; STL9e (and v9 for the 128-row calls, `KILN_MOE_DEDUPE_V9=1`) **145.2** /
+184.5. v9 with its slot-tail segment costs farm compile time: a whole-decode graph took 491-510 s at 48 rows, 583-618 s at
+32 (v9 everywhere) and 651-703 s at 28, against 328-345 s for the same graphs with v8's 128-token calls (c7i.48xlarge,
+one compile per graph).
+
+**The slot tail under real routing** (`tools/dedupe_slot_stats.py` on logs/kiln-mimo-trn1/ep_routing.pt, every MoE layer,
+rows drawn one token each from random positions of the saved wikitext / random-token sequences): at 128 / 192 / 256 rows
+the routing fills 257 / 320 / 384 slots on average (p90 279 / 332 / 393, max 292 / 343 / 403) of the 384 / 448 / 512
+static ones (67-79%); random tokens 232 / 300 / 367. Uniform routing (the probes') sits between them (~314 at 192). So
+v9's default head is 75% of the static slots and the rest is one device-loop segment of 6 blocks, which real routing
+rarely reaches; one trn1 core, uniform routing, 192 / 256 rows: no segments 2.074 / 2.424 ms, segments of 2 blocks after
+the always-real head 1.864 / 2.256 (ring 4) and 1.846 / 2.215 (ring 3), the defaults (head 75%, segment 6, ring 3) 1.835 /
+2.229 (head 75% at ring 4: 1.966 / 2.188). With segments the kernel spilled SBUF (67 spill reloads in the profile against 3
+without; ring 3 and bf16 lane matrices, exact as 0 / 1 and weight x 0 / 1, are what bring it back), and each run segment
+pays a pipeline restart of ~25 us plus the loop barrier.
+
+**The PD decode role's admission** (engine/scheduler.py on 8229c3d): admission always leaves at least one token to compute
+(`limit = (num_tokens - 1) // page_size`) and a recurrent match stops at a page-aligned KDA checkpoint, so a request whose
+KV arrives through the radix / host-tier restore path would still run a prefill chunk (the 1024-token prefill graph per
+admission) on the decode box. feat/disagg admits a handed-off request straight to RUNNING instead (num_computed = prompt
+length, the first token from the prefill box, its pages, pool keys and KDA state row written by eager runner copies as
+HostTier.kv_load / state_load), so the decode role needs the decode graphs only (capture --skip-prefill).
+
+
+**The first real-KV decode box** (t1-STL9r2 on the trn1 tree 83036ba, `tools/dc_td8.sh STL9r2` DC_TDN=11, log td11-STL9r2-1.log):
+28 rows per group, real 8K KV through 7,700 pages per group (29,172 pages over 4 groups, filled in 20 s; the fill loads no
+graph: ASSERT_CACHE_HIT held), contexts 8193-8448: **166.9 ms per step, 671 out tok/s, $0.89 / 1M out** (decode-only, 8K,
+real KV, trn1 spot).
+
+**Context-parallel DSA on the 8K decode box** (`KILN_DSA_CP=1`, feat/long-context's attention_cp: each rank of an attention
+group of 8 holds 1 / 8 of every sequence's latent, indexer rows and pool keys; 256-token pages so a rank's pools of a page
+are one 2 KB run; a scratch merge of this branch and feat/long-context 2c99613, `tools/dc_queue17.sh` / `dc_tdcp.sh`, one
+tree, kiln-dc-32, q/dc1-t1 configs cp-R*, logs tdcp-*.log). Tensors per rank (`tools/dc_cp_size.sh`): 12.72 / 13.14 / 13.57
+/ 13.99 GiB at 48 / 64 / 80 / 96 rows per group with KV for rows x 33 pages + 1, so ~13.6-14.9 GiB with graphs. Decode-only,
+8K, real KV, trn1 spot:
+
+| config | rows / group | rows / step | step ms | out tok/s | $ / 1M out |
+|---|---|---|---|---|---|
+| no CP, KV replicated over the group (28 is what fits) | 28 | 112 | 167.3 | 669 | 0.89 |
+| CP | 48 | 192 | 195.5 | 982 | 0.61 |
+| CP | 64 | 256 | **237.3** | **1,079** | **0.55** |
+| CP | 80 | 320 | 317.2 | 1,009 | 0.59 |
+| CP | 96 | 384 | the graphs fail neuronx-cc 2.27: `[NCC_INIC902] NeuronInstComb error ... APIndex.py:205` | | |
+
+80 rows per group lose to 64 because a 320-row MoE call is v9's 256 plus a 64-row call, each reading every expert again;
+v9 holds at most 256 tokens. On the null page the same graphs time 194.7 ms (CP, 48) and 165.4 ms (no CP, 28): distinct
+pages cost ~1%. CP's own cost, both on the null page: 194.7 ms against 183.3 ms for the non-CP graph at 48 rows (which does
+not fit with real KV), **+11.4 ms (+6%) per step**: the long path's selection, the group merge of the ranks' lists, the
+log-sum-exp combine and the head reduce-scatter, net of each rank reading 1 / 8 of the attention bytes. Not split by op: a
+replay of a real-KV decode call loads all 32 ranks' inputs (446 GB here, 88% of the host's memory) and hung in its
+collective bootstrap (`Timeout waiting for RX`). Two traps on the way: the long path needs at least `keep` (512) local
+pools per rank, so an 8K context (33 pages x 8 = 264) failed to trace (`Attempting to broadcast a dimension of length
+264 ... [48, 512]`) until the page bucket was 64 (feat/long-context 77d716f takes the short case since); and the CP graphs
+differ per DP group but not per rank within one (ranks 1 and 9 have ranks 0 and 8's keys), so captures of ranks 0, 8, 16,
+24 cover them. Farm compile per graph: 476-504 s at 48 rows, 346-367 at 64.
+
+**fp8 pool keys in the decode indexer** (`kernels/dsa_index.py` kiln_dsa_index_fp8_kernel, REV8; for the minimal KV layout,
+whose pool keys sit in V in the KV dtype): each page row is gathered as stored (1 KB at 8 pools of 128 fp8) and goes through
+the transposes as the fp8 stationary operand against the bf16 identity, exact; scores() picks it for an fp8 cache and the
+bf16 kernel's source and REV are unchanged. One trn1.2xlarge core, 262,144 pools (`tools/probe_dsa_index.py --fp8`): B=1
+0.623 ms (bf16 0.705), B=4 2.375 ms (bf16 2.703), relative error 2e-7. trn1's software DGE is per descriptor, so halving
+the bytes buys 12% there; tests/test_dsa_index.py checks both kernels in nki.simulate.
+
+**Step time does not follow the KV pool's size.** The 28-row decode box on the null page took 165.4 ms with a 2.1 GB pool
+and 165.0 ms with 0.5 GB (cp-R28s, the same graph shape otherwise; the compiler aliases the 2.6 GiB of caches in place,
+`alias size (KiB): 2724780` in its log). What makes 28 rows per group slower than 32 (145.2 ms, STL9e) is still open:
+the configurations differ in bucket set (28 alone against 32 + 48) and max-num-seqs (state rows), not in pool size.
+
+**kiln_moe_dedupe_v10: up to 512 tokens in one call** (`KILN_MOE_DEDUPE_MAX_TOKENS=512`; v8's and v9's sources and REVs
+unchanged). At 4 token tiles v9's layout does not fit SBUF, so v10 keeps x in HBM and gathers each block's lanes' rows by
+one indirect DMA (row tok(l) onto partition l, then 32 transposes into xg), keeps every pair's lane pair-major ([p, j],
+pair 128 j + p) instead of on every partition, and builds a block's route matrix R [lanes, T] and its lanes' tokens by
+matmuls of the pairs' one-hot onto the block's lanes against each pair tile's 16-token window (pair n = 8 t + k); the slot
+table is PSUM rows of 512 (up to 1024 slots). Exact in nki.simulate and on the device (relative error against fp32
+0.004-0.009, v9's class). One trn1.2xlarge core, 288 experts, uniform routing, ms per MoE call:
+
+| T | v9, 256-token calls | v10, one call |
+|---|---|---|
+| 192 | 1.840 | 1.924 |
+| 256 | 2.210 | 2.161 |
+| 320 | 3.388 (256 + 64) | **2.909** |
+| 384 | 3.514 (256 + 128) | **3.098** |
+| 512 | 4.148 (256 + 256) | 4.043 |
+
+Less than the expert bytes alone predict: the route's token tiles (one route matmul and one accumulator add per tile per
+512 columns) and the plan over T K pairs grow with T.
+
+**A trn1 hazard nki.simulate does not show: several accumulation chains into regions of ONE PSUM tensor lose all but the
+last chain's first partial.** Minimal case (`tools/probe_psum_interleave.py`, trn1.2xlarge, neuronx-cc 2.27): column j of
+a [128, 4] fp32 PSUM tensor accumulates 3 bf16 matmuls (`accumulate=False`, then `True`, `True`); with the four chains one
+after another (or interleaved, or chains of 1 to 16 columns each) columns 0-2 come out as the sum of their LAST TWO
+partials (partition 0: 373 = 185 + 188 where 545 = 172 + 185 + 188 is right) and only the last chain is right; with each
+chain in a PSUM tensor of its own every column is exact; under nki.simulate every form is exact. A tensor written region by
+region with `accumulate=False` only (v9's gate_up tiles, v10's R windows) is fine, as is one chain per tensor
+(kernels/dsa_slots.py's PO across a row's blocks, the long-context agent's check). v10's first form hit it twice (each pair
+tile's lane accumulated over the expert tiles into column j of one [128, NJ] tensor), which gave lanes of 0, tokens
+past T and an `Out of bounds access` (nrta status 1006) on the x gather; summing the expert tiles on the vector engine
+before ONE transpose per pair tile made the device match plan() exactly (`tools/probe_v10_plan.py`: lanes, R and tokens
+|d| 0). Two other device-only refusals on the way: the vector engine reads at most one PSUM operand per instruction
+(`'src0' and 'src1' cannot both read from PSUM`), and an fp32 operand on a matmul's stationary side is not kept at fp32
+(v10 sends the lanes as two bf16-exact parts, 64 hi + lo).
+
+**CP's merge at 96 rows per group** failed neuronx-cc 2.27 with `[NCC_INIC902] NeuronInstComb error ... APIndex.py:205` on
+an `and` of its tie search ([96, 4096]; 289 `and`s in the graph), while 80 rows compiled; `dsa_long.cp_merge` now merges a
+batch above `KILN_DSA_CP_MERGE_ROWS` (64) in pieces of it (each row is independent; at 64 rows and below the graph is the
+same).
+
+**Rebased onto engine-v0 f997d35** (feat/long-context merged; branch feat/decode-scale-f997): the CP decode graphs' keys
+moved (cp-R64 851bf972 / b9673eb6 / 8a8019e7 / 95fde958 on the scratch merge, 40302a99 / 7ed3b76c / 99f25ec2 / db81995d
+rebased, the same env and argv): engine-v0's long-context commits after 2c99613 change the CP decode graph.
+
+**trn2, real KV** (the trn2 agent, feat/trn2-fast-ds2 ef289f8, one tp=32 engine, DP attention 4, 8K + spread, KV per set,
+time_decode --real-kv; logs s3 logs/kiln-t2-cb/20261006T*-t2-tdr-*): ms per step at 16 / 32 / 64 / 96 rows per group, D2K2
+96.82 / 111.55 / 179.47 / 245.74; + ST 81.85 / 107.52 / 172.64 / 245.96; + ST + v9 with the moe_dedupe LNC split on
+**78.52 / 104.95 / 147.23 / 217.50** (815 / 1,220 / 1,739 / 1,766 out tok/s per engine, $2.61 / 1.75 / 1.23 / 1.21 per 1M at
+half-box spot); v9 with the split off and its segments on 96.90 / 140.45 / 182.01 / 280.08 (on trn2 keep the split). 96 rows
+per group is the 8K ceiling there (tensors 22.4 GB at 384 sequences; 512 do not fit 24 GiB).
+
+**The CP decode box with v10, on feat/decode-scale-f997** (engine-v0 f997d35 + this branch, one tree, kiln-dc-32,
+q/dc1-t1 configs cp-R64-rb / cp-R80-v10 / cp-R96-v10 from `tools/dc_queue18.sh`, `tools/dc_tdcp.sh`, logs tdcp-*.log;
+decode-only, 8K, real KV, trn1 spot): CP-64 (v9) 238.2 ms, 1,075 out tok/s, $0.556 / 1M (237.3 on the scratch merge);
+CP-80 with v10 295.4 ms, 1,083 out tok/s, $0.551 (317.2 with v9's 256 + 64 calls: -21.8 ms, the kernel's -0.48 ms x 42
+layers); **CP-96 with v10 and the merge in 64-row pieces 335.7 ms, 1,144 out tok/s, $0.522 / 1M**, at ~14.9 GiB per rank.
+Farm compile per decode graph: 312-331 s (CP-64), 382-396 s (CP-80), 437-465 s (CP-96).
+
+**Where the CP-64 decode step goes** (cp-R64p: CP-64 as 6 piecewise graphs, 239.5 ms live against 238.2 for the whole-decode
+graph; `tools/dc_cap3.sh`: one warm real-KV decode call captured, each piece replayed on 32 cores, rank 0 profiled; log
+s3 logs/kiln-dc-32/rep2-R64p.report.txt). Replayed 250.1 ms; HBM read 20.6 GB per call against an 18.5 GB floor (MBU 16.8%),
+and 0.98 / 1.58 GB of spill save / reload. By the collective that ends each segment: the MoE FFN blocks (ending in the 2 MiB
+world reduce-scatter) 83.2 ms, 1.85 ms per layer; DSA under CP 68.5 ms, **6.2 ms per DSA layer** (the selection and the
+two 1 MiB list gathers 29.4, the merge, slots and partial attention up to the 0.12 MiB lse gather 38.3, the 8 MiB head
+reduce-scatter 0.8); the token mixers (ending in the 0.5 MiB group reduce-scatter) 35.5 ms, 0.79 per layer; collectives'
+transfers and waits ~52 ms, of which ~20 ms is a per-layer 0.5 MiB all-reduce whose trigger waits 0.37 ms for the slowest
+rank (with TP experts every rank routes alike, so not the MoE's slot plan). KDA state read and write is at least 0.25 ms
+of a 0.79 ms mixer segment, ~8.5 ms per step, so bf16 state would buy under 2% and is not built. Page bucket 33 instead
+of 64 (each rank's 264 local pools all candidates rather than a top-512 over 512 padded ones, cp-R64b33) is 239.0 ms
+against 238.2: the padding is not the DSA cost.
+
+**One DSA layer under CP, op by op** (the same cp-R64p replay, rank 0, piece 004, which holds two DSA layers that agree
+within 5%; neuron-explorer's JSON view of the NTFF, instructions bucketed by time window and the HLO ops named by their
+graph.hlo shapes, `tools/prof_layer_ops.py` cc / window / timeline / named / hlo; `active` = any compute engine busy). A DSA layer under CP is ~7.05 ms, a KDA layer ~3.4 ms (mixer
+1.02, MoE 1.90, the rest reduce-scatters and norms):
+
+| window | span ms | active ms | what |
+|---|---|---|---|
+| projections, cache stores | 0.63 | 0.33 | q / indexer projections, cp_local_slots scatters |
+| local selection | 2.15 | 0.57 | scores (pool-key rows [64, 512, 128] at 256 B each 0.40, dot 0.44), then select_device + compact over Pl = keep = 512: compact()'s [64, 512, 32] gather (slice [1, 1, 1], one descriptor per element) 0.73 and its cumsum, sc.gather 0.41, pool_row's table gather 0.42 |
+| 3 group all-reduces | 0.31 | 0.00 | the list values, the context pools, q_all |
+| cp_merge | 0.92 | 0.80 | vector-bound: the 21-step tie search over [64, 4096] |
+| partial attention | 2.58 | 1.91 | kernels/dsa_slots.py, 16 calls of 4 rows x 640 slots |
+| combine | 0.46 | 0.12 | lse all-reduce, 8 MiB head reduce-scatter, W_UV, o_proj |
+
+So ~1.6 ms of the selection window is every compute engine idle on XLA element gathers, and at 8K (any context up to keep A
+kpool = 16,384 tokens at A = 8) a rank's local pools all fit keep, so that selection is the identity: the visible local
+pools are the prefix m < nloc. Each rank also attends 640 slots per row of which only its share of the global top-512
+(~64 on average) plus the tail are live: the long-context agent's decode slot classes. **Rank skew is not a lever**: the
+every-rank replay (cp-R64pa, all 32 ranks profiled, each viewed with its own group's NEFF: `tools/prof_skew.py
+--group-keys`, logs s3 logs/kiln-dc-32/skew2-R64pa-*.txt) gives the slowest rank's compute within 1.1-1.2% of the median
+in every piece (median / max ms: 001 51.32 / 51.91, 002 54.14 / 54.73, 003 54.57 / 55.16, 004 39.86 / 40.32; 199.9 / 202.1
+over the four layer pieces) and the per-layer 0.5 MiB
+all-reduce a trigger wait of ~0.5 us; rank 0's waits are the piece's first collective (the replay's start, 4.4-4.6 ms) and
+the 16 KiB all-reduce behind each 2 MiB one (56-301 us). The "~20 ms waiting for the slowest rank" above came from a
+rank-0-only replay and does not hold.
+
+**KILN_DSA_CP_ALL_LOCAL / KILN_DSA_CP_PAGE_KEYS** (models/mla.py attention_cp's decode branch, opt-in, 0079633): when Pl <=
+keep, `_cp_local_all` writes select_device + compact's list directly (entry k = k below min(nloc, Pl), 0 after; the values,
+NEG_INF past it; the slot rows prow[:, k], which is pool_row(k)); PAGE_KEYS reads the local pool keys as page rows (the
+cache viewed as [pages, ppl Di] indexed by the block table: 2 KiB rows instead of 256 B). Both exact (tests/test_dsa_long.py:
+element for element against the selection path at keep A, one and A context pools below and fewer, Pl = keep, keep - ppl,
+keep / 2, ties and zeros; the tp-2 CP engine's tokens and logprobs equal without them, the direct list taken at bucket
+Pl 6 / 9 / 14 and declined at 20). Neither changes a cache, a state row or a prefill graph. **CP-64, one tree** (engine-v0
+2143e0b merged, `tools/dc_cpA.sh`, kiln-dc-32, the variants in turn and twice, logs tdA-*.log; decode-only, 8K, real KV,
+trn1 spot):
+
+| CP-64 | step ms (pass 1 / 2) | out tok/s | $ / 1M out |
+|---|---|---|---|
+| base | 236.9 / 237.8 | 1,078 | 0.554 |
+| + ALL_LOCAL | 220.0 / 220.2 | 1,163 | 0.513 |
+| + ALL_LOCAL + PAGE_KEYS | 215.9 / 215.3 | 1,187 | 0.503 |
+
+-17.3 ms for the direct list (11 DSA layers, ~1.6 ms each, the profile's idle gather time), -4.4 ms more for the page rows.
+The 12 graphs compiled on the box in 527 s. With engine-v0 3df0b63 (feat/disagg) merged as well (e34272d) the base CP-64
+capture's 4 keys are the same, already compiled: the disaggregation work leaves these decode graphs alone.
+
+**cp_merge's row pieces are for decode batches only** (2e6e2b2): 78469a9 split any merge above 64 rows, which would also
+have cut a prefill chunk's merge (thousands of rows, one piece on engine-v0) into 64-row pieces; attention_cp now passes
+`CP_MERGE_ROWS` for a decode batch's [B, P] table only. Checked by capture against engine-v0 3df0b63
+(`tools/dc_g64keys.sh`, ranks 0 / 8 / 16 / 24, prefill graphs included, nothing compiled): `KILN_DSA_CP=1` alone at the
+CP-64 shapes 10 / 10 keys per rank equal (28 / 28 distinct), and the CP-64 / CP-96 decode configs with ALL_LOCAL +
+PAGE_KEYS re-captured on 2e6e2b2 already compiled (4 / 4 each). **The colocated G64 defaults** (no flag set, hv_ab.sh's
+G64 env and argv, prefill and decode graphs): 15 / 15 keys per rank equal to engine-v0 3df0b63's (33 / 33 distinct), on
+e4af8a2 and on 2e6e2b2. After engine-v0 401b3a3 (the long-context agent's #2, which carries this branch's three CP
+commits plus its bounded tie search, `KILN_DSA_CP_MERGE_BOUND`, opt-in) was merged in (ad37e35): the G64 defaults 15 / 15
+per rank and `KILN_DSA_CP=1` alone 10 / 10 per rank equal 401b3a3's, and the CP-96 / CP-64 decode configs with
+ALL_LOCAL + PAGE_KEYS still already compiled (4 / 4 each): the measured graphs are the merged tree's.
+
+**CP-96 (v10), one tree** (e34272d: engine-v0 3df0b63 merged; `tools/dc_cpA.sh R96 R96A R96Ak R64`, the same box and
+method; decode-only, 8K, real KV, trn1 spot; 12 graphs compiled on the box in 714 s; the CP-64 base on this tree
+237.6 ms, as on the 2143e0b one):
+
+| CP-96 | step ms (pass 1 / 2) | out tok/s | $ / 1M out |
+|---|---|---|---|
+| base | 336.6 / 336.6 | 1,141 | 0.523 |
+| + ALL_LOCAL | 306.9 / 306.1 | 1,253 | 0.477 |
+| **+ ALL_LOCAL + PAGE_KEYS** | **302.4 / 302.8** | **1,269** | **0.470** |
+
+**$0.470 per 1M output tokens, decode-only, 8K context, real KV, trn1.32xlarge spot at $2.15/h**: the decode box under the
+$0.5 target (1,269 out tok/s against the 1,194 it needs). Keys (q/dc1-t1 configs cpA-R96Ak): 13e612ef (rank 0) / 4e19b71c
+(8) / 6c7f0d61 (16) / b216626e (24), decode graphs only, the disaggregation agent's decode-role set.
+
+**CPU suite on the final tree** (72f890b; the later commits are docs only; kiln-dc-32, one pytest process,
+`KILN_TEST_MODEL=Qwen/Qwen3-0.6B`, logs s3 logs/kiln-dc-32/ci-final.log, ci-final-tf518.log): the venv's transformers 770
+passed, 67 skipped, 0 failed in 25:04; the whole suite with transformers 5.18 first on PYTHONPATH 902 passed, 15 skipped,
+7 failed in 1:06:13, the 7 all tests/test_inkling.py (`KeyError: 'model.llm.embed_...'`, its checkpoint names under 5.18),
+which fail the same 7 on engine-v0 401b3a3 under 5.18 (inkling-tf518-ev401.log) and pass under the venv's transformers.
+
+## Prefill / decode disaggregation on the device (2026-10-05/06, SDK 2.32, trn1.32xlarge spot)
+
+Written up at release time from the disaggregation agent's logs, which were taken while the work was in
+progress and were never written into these notes. GLM-5.3-Flash@eb9eb208 real weights, 8192 in / 256 out,
+trn1.32xlarge spot $2.15/h per box, every graph from the compile farm under
+`NEURON_LIBTORCH_ASSERT_CACHE_HIT=1`. The price-performance table is docs/price-performance.md
+"Prefill / decode disaggregation (G1, trn1)". Sources, each archive holding each engine's log and the `.cmd`
+that started it: s3://<your-bucket>/logs/kiln-pd-d1/pd-logs{,2,4}-d1.tgz,
+logs/kiln-pd-p{1,2,3,4}/pd-logs{,2,3}-p<n>.tgz, logs/kiln-pd-l{1,2}/pd-logs4-l<n>.tgz,
+logs/kiln-pd-ci/ci-logs-2026-10-06.tgz.
+
+**NONE of it ran on engine-v0 e3ff411**, so every number is labelled with the tree it ran on (release gate 4):
+the prefill boxes on feat/disagg over engine-v0 f997d35 and then feat/disagg-stream, the decode box on
+scratch/pd-dec-f997 686d791 (cp-R96-v10), the latency prefill boxes on feat/disagg-stream 8ab4763 plus the
+`dsa_fused` MIN_HEADS patch that became engine-v0 4e5f226.
+
+**What the parts are.** `kiln/engine/disagg.py` gives an engine a ROLE: a prefill engine runs the prompt and
+hands the request's pages, pool keys and KDA state row to a decode engine over its own frames (a TCP
+connection per rank), and the decode engine admits the handed-off request straight to RUNNING
+(num_computed = prompt length, the first token from the prefill box) so it needs no prefill graph at all
+(`capture --skip-prefill`). `kiln/server/pd_router.py` is the front door: threshold routing (`--threshold`,
+4096 input tokens by default, the same knob SageMaker HyperPod calls routingThreshold), decode-credit
+backpressure, an opt-in per-engine prefill queue-depth cap (`--prefill-depth`) and latency prefill engines
+(`--latency-prefill-urls --latency-depth 1`, preferred while one has a free slot). Its SLO metrics are
+Prometheus series named `kiln:pd_router_waiting`, `_prefill_waiting`, `_inflight`, `_prefill_depth`,
+`_decode_credits`, `_queue_seconds`, `_prefill_queue_seconds`, `_e2e_ttft_seconds`, `_prefill_seconds`,
+`_prefill_call_seconds`, plus `kiln:pd_transfer_seconds`.
+
+**The engines, verbatim from the `.cmd` files.** Prefill (kiln-pd-p1..p4): `pd_serve.py --pd-role prefill
+--port 8100 -- --model zai-org/GLM-5.3-Flash --tp 32 --dp-attention 4 --piecewise --overlap --prefill-tokens
+8192 --prefill-buckets 2048 --max-num-seqs 64 --decode-buckets 16 --kv-cache-gb 1.2 --kv-cache-dtype fp8
+--state-checkpoints 4 --eplb-rebalance --page-buckets 264` with `KILN_PIECEWISE_PREFILL_MOE_GROUP=45
+KILN_EP_REDUNDANT=1 KILN_EPLB_INIT=<placement> KILN_EPLB_INTERVAL=200 KILN_EPLB_MAX_REBALANCES=1` and farm
+queue q/pf-p8-7ce6a12: the one-piece 8192 prefill with EPLB, i.e. the same configuration as the colocated
+191.3 out tok/s / $3.12 row. Decode (kiln-pd-d1): `--pd-role decode --pd-listen 0.0.0.0:7400 --pd-buffer-gb
+48 -- ... --tp 32 --dp-attention 4 --prefill-tokens 4096 --prefill-buckets 1024 --kv-cache-dtype fp8
+--no-prefix-caching --page-size 256 --page-buckets 64 --max-num-seqs 384 --kv-cache-gb 0.92
+--decode-buckets 96` with `KILN_DSA_CP=1 KILN_MOE_EP=0 KILN_DENSE_FP8=0 KILN_DECODE_WHOLE=1
+KILN_MOE_DEDUPE_V9=1 KILN_MOE_DEDUPE_MAX_TOKENS=512` and farm queue q/dc1-t1; from pd-logs2 on also
+`KILN_DSA_CP_ALL_LOCAL=1 KILN_DSA_CP_PAGE_KEYS=1`. Latency prefill (kiln-pd-l1, l2): the prefill env at
+`--dp-attention 1 --prefill-tokens 4096 --prefill-buckets 4096 --max-num-seqs 16`, farm queue
+q/pf-tp1-pdpre.
+
+**The closed-loop levels** (`bench/pd_sweep.py`, which prints each level twice: the whole level, and the
+steady rate over its middle half, because a closed-loop level's start and tail understate it). Per-engine
+`busy_frac` from the router's step metrics in the same log:
+
+| log | prefill : decode | $/h | conc | steady out tok/s | steady all-in | whole level out tok/s | TTFT p50 / p90 | ITL p50 / p90 | decode busy | prefill busy | errors |
+|---|---|---|---|---:|---:|---:|---|---|---|---|---|
+| g1-pd-f | 3 : 1 | 8.60 | 320 | **930.9** (207.4 s) | **$2.566** | 789.9 | 17553 / 58158 ms | **277.0 / 284.3 ms** | 0.898 | 0.853-0.854 | 0 |
+| g1-pd-l pass 1 | 4 : 1, ALL_LOCAL + PAGE_KEYS | 10.75 | 440 | **1,139.5** (192.1 s) | **$2.621** | 879.4 | 8621 / 70059 ms | 353.5 / 370.7 ms | 0.962 | 0.741-0.751 | 0 |
+| g1-pd-l pass 2 | the same | 10.75 | 440 | 1,094.5 (198.8 s) | $2.728 | 849.3 | 10943 / 69831 ms | 363.4 / 386.9 ms | 0.964 | 0.712-0.727 | 1 |
+| g1-pd-k | 4 : 1, neither flag | 10.75 | 440 | 1,002.2 (157.2 s) | $2.980 | 716.5 | 11229 / 79096 ms | 406.7 / 426.7 ms | 0.890 | 0.614-0.639 | 0 |
+| g1-pd-j | 4 : 1, neither flag | 10.75 | 440 | 967.5 (270.9 s) | $3.086 | 829.1 | 8432 / 60910 ms | 414.2 / 464.8 ms | | | 5 |
+| g1-pd-i | 4 : 1, neither flag | 10.75 | 440 | 967.4 / 938.3 | $3.087 / $3.182 | 780.9 / 768.1 | 9071 / 69884 ms | 417.3 / 455.1 ms | | | 0 |
+| g1-pd-e | earlier arm | 8.60 | 256 | | | 665.7 / 707.9 | 11158 / 54187 ms | 248.7 / 322.4 ms | | | 0 |
+| g1-pd-c | earlier arm | 8.60 | 112-168 | | | 466.9-510.7 | 8089 / 26107 ms up | 178.2-183.4 ms | | | 0 |
+
+The two CP flags on the decode box are worth 1,002.2 -> 1,139.5 out tok/s steady (+13.7%) and
+$0.5959 -> $0.5241 per 1M output tokens on the decode side, which is the same direction and about the same
+size as the decode-only measurement in "The CP decode box with v10" above (1,141 -> 1,269 out tok/s).
+
+**What could NOT be reproduced from the logs, and is therefore not cited anywhere.**
+- **g1-pd-g** reports `$2.536` all-in at `$6.45/h`, but its own step metrics list FOUR busy engines (three
+  prefill at busy_frac 0.765-0.784 and the decode box), so the run was 4 boxes priced as 3. At 4 x $2.15/h its
+  706.6 out tok/s steady is $3.381 all-in, worse than the 3:1 row. The row is excluded.
+- There is no colocated STEADY middle-half figure at concurrency 64, so the $2.57 steady figure has no
+  like-for-like colocated partner; the honest comparison is whole level against whole level, $3.024 against
+  $3.12 (3.1% below). Said plainly in docs/price-performance.md.
+- No ITL of 311 ms exists in any disaggregation log (`ITL p50 31x` matches nothing; the values measured are
+  243.0, 248.7, 277.0, 287.7, 299.2, 327.1, 353.5, 363.4, 406.7, 414.2, 417.3 and 267-271 ms on the latency
+  arm). An earlier draft of the release notes quoted 311 ms as "the colocated best"; it is not measured.
+- The design estimate in "Where a GLM-5.3-Flash decode step goes" predicted 5.4 prefill boxes per decode box
+  and $4.13 per 1M output tokens all-in. Measured: 3 or 4 prefill boxes per decode box and $2.57-$3.02
+  (steady / whole level) at 3:1. The estimate was pessimistic on both counts, and its own caveat (that the
+  gain needs ~190 sequences in flight per decode box) is what the conc 320 and 440 levels supply.
+
+**The TTFT-SLO arm (latency prefill boxes).** Driver slo4.log on kiln-pd-d1, 2 latency prefill + 1 decode
+= 3 boxes at $6.45/h, the router started with `--latency-prefill-urls` and `--latency-depth 1` (its /debug
+reports `"kind":"latency","depth":1` for both). Post-fix tree only: before engine-v0 4e5f226 the fused DSA
+kernel read an overwritten latent ring block at fewer than 3 MLA heads, which is exactly what DP attention 1
+at tp 32 gives (2 heads per rank), so the earlier latency-box runs (slo2) are timing only.
+
+| arm | TTFT p50 / p90 | ITL p50 | req/s served (steady) | log |
+|---|---|---|---|---|
+| idle, conc 1 | **1595 / 1607 ms** | 267.3 ms | 0.014 | slo4-idle-lat |
+| open loop, rate 0.4 | 1554 / 2126 ms | 269.2 ms | 0.234 (0.292) | slo4-open-lat |
+| open loop, rate 0.6 | 1530 / 1775 ms | 269.6 ms | 0.357 (0.476) | slo4-open-lat |
+| open loop, rate 0.8 | 1559 / 2078 ms | 270.1 ms | 0.449 (0.589) | slo4-open-lat |
+| open loop, rate 1.0 | 1596 / 2268 ms | 270.5 ms | 0.579 (0.743) | slo4-open-lat |
+| threshold routing only, idle | 4334 / 4338 ms | 267.3 ms | 0.014 | slo2-idle-thr |
+| colocated one box, idle | 4013 / 4175 ms | 87.6 ms | 0.038 | colo-idle, kiln-pd-p1 |
+
+So the latency arm takes the idle 8K TTFT from 4.01 s to 1.60 s and holds it to 1.60 s at an arrival rate of
+1 req/s, while its ITL stays at the decode box's 267-270 ms (96 rows per DP group) against the colocated
+87.6 ms. **No arm reaches a p90 TTFT of 1 s.** The router's own histograms on the idle arm: 5 requests,
+`_e2e_ttft_seconds` 7.589 s total against `_prefill_seconds` 7.057 and `_prefill_call_seconds` 6.121, so the
+prefill call is 81% of the TTFT and the router's own queue is 11 microseconds of it.
+
+Device gate for the arm (`tools/check_mixed.py` through the latency prefill engine against the colocated
+reference on the fixed tree; chk-colo-fix on kiln-pd-l1, result lines in slo4.log): **equal 15 / 16**, token
+agreement 0.9639 (987 / 1024), teacher-forced |dlogprob| over decode calls n = 972 mean 0.00228, p99 0.0582,
+max 0.2980, signed mean -0.00020; over prefill chunks n = 16 mean 0.01168, max 0.1278, signed -0.00430. On
+the pre-fix tree the same check was 10 / 16 with a first-token mean |dlogprob| of 0.58 (the MIN_HEADS commit
+message), which is what the padding fixed.
+
+**An idle decode engine must release what it holds** (engine-v0 9e693cf). A disaggregated decode engine under
+overlap holds freed pages and state rows for one step (`pd_hold`) so a handoff copy need not wait for the
+device. Pages the radix prefix cache evicted to make room for an incoming handoff went into that hold, and an
+engine that had gone idle has no step in flight to read back, so the hold was never drained: on trn2
+(T2-BEST1, prefix caching on) a closed-loop level was followed by 30 queued handoffs with KV 99% used and
+nothing running, the engine thread spinning in `_admit_prefilled`. An idle decode engine now drains its own
+hold before it gates admission; `tests/test_disagg.py::test_idle_decode_engine_releases_what_it_holds` is a
+CPU repro (36 pages, the first batch leaves 7 free and 28 cached, the next handoff needs 8).

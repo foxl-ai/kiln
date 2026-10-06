@@ -80,6 +80,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--text-file", default=None,
                     help="score this file's text instead (its first --max-tokens tokens, 256-token prefill chunks)")
     ap.add_argument("--max-tokens", type=int, default=3072)
+    ap.add_argument("--chunk", type=int, default=None,
+                    help="--text-file: tokens per prefill call (default 256), so --chunk 1024 at --dp-attention 4 runs the "
+                         "sequence-parallel row gathers at 32 rows per rank (the served graphs' path at 128)")
     # The target with an MTP head loaded (its weights, KV, and the MTP graph after each prefill chunk): the
     # prompt logprobs are the target's, so they must not move. --state-checkpoints holds the recurrent-state
     # pool at the baseline's rows (bench/serve_sweep.py --state-checkpoints): 1 + 4 x (1 + k) + checkpoints.
@@ -94,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _long_shape(args) -> tuple[int, int]:
     """(prefill chunk, max_model_len) of a --long / --text-file run, (32, 512) otherwise."""
     if getattr(args, "text_file", None):
-        return 256, -(-(args.max_tokens + 64) // 256) * 256
+        return getattr(args, "chunk", None) or 256, -(-(args.max_tokens + 64) // 256) * 256
     return (256, 2048) if getattr(args, "long", False) else (32, 512)
 
 

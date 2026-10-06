@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import queue
 import threading
 import time
@@ -49,6 +50,15 @@ class _Submit:
     loop: asyncio.AbstractEventLoop
     session_id: str | None = None
     out: asyncio.Queue = field(default_factory=asyncio.Queue)
+    # Prefill / decode disaggregation (engine/disagg.py): on a prefill engine, (transfer id, decode receiver)
+    # to hand the request to; on a decode engine, the transfer id whose handoff this request waits for.
+    handoff: tuple[str, str] | None = None
+    await_xfer: str | None = None
+    created: float = field(default_factory=time.monotonic)
+
+
+# How long a decode engine keeps a handoff nobody waits for, and a request waits for its handoff.
+PD_AWAIT_TIMEOUT_S = float(os.environ.get("KILN_PD_AWAIT_TIMEOUT_S", "600"))
 
 
 class EngineLoop:
@@ -57,16 +67,91 @@ class EngineLoop:
         self.metrics = Metrics()
         self.inbox: queue.Queue = queue.Queue()
         self.streams: dict[str, _Stream] = {}
+        # Decode engine of a disaggregated deployment: requests waiting for their handoff, and handoffs that
+        # arrived before their request (transfer id -> (_Submit or meta, time)).
+        self.awaits: dict[str, _Submit] = {}
+        self.arrived: dict[str, tuple[dict, float]] = {}
+        self.pd_expired = 0
+        # A decode server streams every running request each step (hundreds): batch the hand-over to the event loop and
+        # detokenize incrementally (_Detok). Other servers keep the per-stream path.
+        self.fast_stream = engine.pd_role == "decode" and os.environ.get("KILN_FAST_STREAM", "1") == "1"
+        # Per step() call: (monotonic time, seconds, decode rows, prefill tokens, handoffs copied in): GET /debug/steps.
+        import collections
+
+        self.steps: collections.deque = collections.deque(maxlen=int(os.environ.get("KILN_STEP_LOG", "20000")))
+        engine.pd_wake = lambda: self.inbox.put(("wake", None))
         self.thread = threading.Thread(target=self._run, name="kiln-engine", daemon=True)
         self.thread.start()
 
+    def submit_await(self, xfer: str, prompt_ids: list[int], params: SamplingParams) -> _Submit:
+        """A decode engine's half of a disaggregated request: stream the request handoff `xfer` brings."""
+        sub = _Submit(xfer, prompt_ids, params, 0, asyncio.get_running_loop(), await_xfer=xfer)
+        self.inbox.put(("await", sub))
+        return sub
+
+    def _handoff(self, sub: _Submit, meta: dict) -> None:
+        """A complete handoff (or the prefill side's end of the request) for a waiting request."""
+        post = lambda *m: sub.loop.call_soon_threadsafe(sub.out.put_nowait, m)  # noqa: E731
+        if meta.get("error"):
+            self.engine.pd_release(meta["xfer"])
+            post("error", meta["error"])
+            return
+        if meta.get("prompt_ids") is not None and list(meta["prompt_ids"]) != list(sub.prompt_ids):
+            self.engine.pd_release(meta["xfer"])
+            post("error", "the prefill engine tokenized the prompt differently from this decode engine")
+            return
+        lps = [tuple(x) for x in meta["logprobs"]] if meta.get("logprobs") is not None else None
+        if meta.get("done") is not None:  # it ended on the prefill engine: nothing to decode
+            self.engine.pd_release(meta["xfer"])
+            first = [meta["token"]] if meta.get("token") is not None else []
+            post("tokens", first, meta["done"] if meta["done"] != "abort" else "abort", lps if first else None)
+            return
+        try:
+            req = self.engine.add_prefilled(meta)
+        except ValueError as e:
+            self.engine.pd_release(meta["xfer"])
+            post("error", str(e))
+            return
+        req.arrival_time = sub.created
+        self.streams[req.rid] = _Stream(req, sub.loop, sub.out, sent=1)
+        post("tokens", req.output_ids[:1], None, req.logprobs[:1] if req.params.logprobs is not None else None)
+
+    def _pd_poll(self) -> None:
+        eng = self.engine
+        while True:
+            try:
+                meta = eng.pd_ready.get_nowait()
+            except queue.Empty:
+                break
+            sub = self.awaits.pop(meta["xfer"], None)
+            if sub is None:
+                self.arrived[meta["xfer"]] = (meta, time.monotonic())
+            else:
+                self._handoff(sub, meta)
+        if self.awaits or self.arrived:
+            now = time.monotonic()
+            for x, sub in list(self.awaits.items()):
+                if now - sub.created > PD_AWAIT_TIMEOUT_S:
+                    del self.awaits[x]
+                    self.pd_expired += 1
+                    sub.loop.call_soon_threadsafe(sub.out.put_nowait, (
+                        "error", f"no handoff for {x} within {PD_AWAIT_TIMEOUT_S:g} s (KILN_PD_AWAIT_TIMEOUT_S)"))
+            for x, (meta, t) in list(self.arrived.items()):
+                if now - t > PD_AWAIT_TIMEOUT_S:
+                    del self.arrived[x]
+                    self.pd_expired += 1
+                    eng.pd_release(x)
+                    print(f"kiln pd: dropped handoff {x}: no request waited for it within {PD_AWAIT_TIMEOUT_S:g} s",
+                          flush=True)
+
     def submit(self, prompt_ids: list[int], params: SamplingParams, priority: int = 0,
-               session_id: str | None = None) -> _Submit:
+               session_id: str | None = None, handoff: tuple[str, str] | None = None) -> _Submit:
         if not prompt_ids or not all(isinstance(t, int) for t in prompt_ids):
             raise HTTPException(status_code=400, detail="prompt must be a non-empty list of token ids")
         if session_id is not None and not isinstance(session_id, str):
             raise HTTPException(status_code=400, detail="session_id must be a string")
-        sub = _Submit(uuid.uuid4().hex, prompt_ids, params, priority, asyncio.get_running_loop(), session_id)
+        sub = _Submit(uuid.uuid4().hex if handoff is None else handoff[0], prompt_ids, params, priority,
+                      asyncio.get_running_loop(), session_id, handoff=handoff)
         self.inbox.put(("add", sub))
         return sub
 
@@ -89,10 +174,20 @@ class EngineLoop:
             return
         while True:
             kind, payload = item
-            if kind == "add":
+            if kind == "await":
+                payload.loop.call_soon_threadsafe(payload.out.put_nowait, ("accepted", None))
+                got = self.arrived.pop(payload.await_xfer, None)
+                if got is not None:
+                    self._handoff(payload, got[0])
+                else:
+                    self.awaits[payload.await_xfer] = payload
+            elif kind == "wake":
+                pass
+            elif kind == "add":
                 try:
                     req = self.engine.add_request(payload.prompt_ids, payload.params, rid=payload.rid,
-                                                  priority=payload.priority, session_id=payload.session_id)
+                                                  priority=payload.priority, session_id=payload.session_id,
+                                                  handoff=payload.handoff)
                 except QueueFull as e:
                     payload.loop.call_soon_threadsafe(payload.out.put_nowait, ("busy", str(e)))
                 except ValueError as e:
@@ -114,6 +209,8 @@ class EngineLoop:
                 st = self.streams.pop(payload, None)
                 if st is not None and st.req.status is not Status.FINISHED:
                     self.engine.abort(st.req)
+                if self.awaits.pop(payload, None) is not None:  # waiting for a handoff: drop it when it comes
+                    self.arrived[payload] = ({"xfer": payload, "done": "abort"}, 0.0)
             try:
                 item = self.inbox.get_nowait()
             except queue.Empty:
@@ -122,10 +219,16 @@ class EngineLoop:
     def _run(self) -> None:
         while True:
             self._drain(block=not self.engine.has_work())
+            if self.engine.pd_role == "decode":
+                self._pd_poll()
             if not self.engine.has_work():
                 continue
             try:
+                inj = self.engine.pd_counts["injected"]
                 self.engine.step()
+                st = self.engine.last_step
+                self.steps.append((time.monotonic(), st.seconds, st.num_decode, st.num_prefill_tokens,
+                                   self.engine.pd_counts["injected"] - inj))
             except Exception as e:  # never let the engine thread die silently
                 traceback.print_exc()
                 for rid, st in list(self.streams.items()):
@@ -134,6 +237,7 @@ class EngineLoop:
                         self.engine.abort(st.req)
                 self.streams.clear()
                 continue
+            batch: dict = {}  # fast_stream: one cross-thread call per event loop and step, not one per stream
             for rid, st in list(self.streams.items()):
                 out = st.req.output_ids
                 finished = st.req.status is Status.FINISHED
@@ -146,11 +250,21 @@ class EngineLoop:
                     new = out[st.sent:ready]
                     lps = st.req.logprobs[st.sent:ready] if with_lp else None
                     st.sent = ready
-                    st.loop.call_soon_threadsafe(
-                        st.out.put_nowait, ("tokens", new, st.req.finish_reason if finished else None, lps))
+                    item = ("tokens", new, st.req.finish_reason if finished else None, lps)
+                    if self.fast_stream:
+                        batch.setdefault(st.loop, []).append((st.out, item))
+                    else:
+                        st.loop.call_soon_threadsafe(st.out.put_nowait, item)
                 if finished:
                     del self.streams[rid]
                     self.metrics.on_finish(st.req)
+            for loop, items in batch.items():
+                loop.call_soon_threadsafe(_deliver, items)
+
+
+def _deliver(items) -> None:
+    for q, item in items:
+        q.put_nowait(item)
 
 
 class _Detok:
@@ -162,19 +276,38 @@ class _Detok:
     the OpenAI API specifies.
     """
 
-    def __init__(self, tokenizer, stops: tuple[str, ...] = ()):
+    def __init__(self, tokenizer, stops: tuple[str, ...] = (), incremental: bool = False):
         self.tok = tokenizer
         self.stops = stops
         self.hold = max((len(x) for x in stops), default=1) - 1
         self.ids: list[int] = []
         self.emitted = 0
         self.stopped = False
+        # incremental (a decode server of a disaggregated deployment, EngineLoop.fast_stream): the text so far is kept
+        # and extended by decoding a window of the newest ids (from the last point where the text was complete, TGI's
+        # prefix / read offsets), instead of decoding every id on every push, which is O(n^2) per stream and with
+        # 384 streams per step held the GIL for tens of ms per step on the G1 decode box. The final push decodes the
+        # whole output once, so the complete text is the full decode.
+        self.incremental = incremental
+        self._text = ""
+        self._po = self._ro = 0
+
+    def _decoded(self, final: bool) -> str:
+        if final or not self.incremental:
+            return self.tok.decode(self.ids, skip_special_tokens=True)
+        prefix = self.tok.decode(self.ids[self._po : self._ro], skip_special_tokens=True)
+        new = self.tok.decode(self.ids[self._po :], skip_special_tokens=True)
+        if len(new) > len(prefix) and not new.endswith("\ufffd"):
+            self._text += new[len(prefix):]
+            self._po, self._ro = self._ro, len(self.ids)
+            return self._text
+        return self._text + "\ufffd"  # an incomplete character: held back below, as the full decode's would be
 
     def push(self, ids: list[int], final: bool) -> str:
         if self.stopped:
             return ""
         self.ids.extend(ids)
-        text = self.tok.decode(self.ids, skip_special_tokens=True)
+        text = self._decoded(final)
         cut = min((i for i in (text.find(x) for x in self.stops) if i >= 0), default=-1)
         if cut >= 0:
             self.stopped = True
@@ -257,11 +390,24 @@ def build_app(engine: LLMEngine, model_name: str, reasoning_parser: str | None =
 
     @app.get("/health")
     async def health():
-        return {"status": "ok"}
+        out = {"status": "ok", "role": engine.pd_role or "both", "max_num_seqs": engine.cfg.max_num_seqs}
+        if engine.pd_role is not None:
+            out["layout"] = engine.runner.pd_signature()
+        if engine.pd_role == "decode":
+            out["pd_address"] = getattr(engine, "pd_address", None)
+            out["pd_buffer_bytes"] = int(engine.cfg.pd_buffer_gb * 2**30)
+            out["bypass_prefill"] = engine.cfg.pd_bypass_prefill
+        return out
+
+    @app.get("/debug/steps")
+    async def steps(since: float = 0.0):
+        """The engine loop's step log (EngineLoop.steps): [monotonic time, seconds, decode rows, prefill tokens,
+        handoffs copied in] per step() call after `since` (this host's monotonic clock), and the clock now."""
+        return {"now": time.monotonic(), "steps": [list(x) for x in list(loop_.steps) if x[0] > since]}
 
     @app.get("/metrics")
     async def metrics():
-        return PlainTextResponse(loop_.metrics.render(engine), media_type="text/plain; version=0.0.4")
+        return PlainTextResponse(loop_.metrics.render(engine, loop_), media_type="text/plain; version=0.0.4")
 
     @app.post("/generate")
     async def generate(http: HTTPRequest):
@@ -478,10 +624,45 @@ def build_app(engine: LLMEngine, model_name: str, reasoning_parser: str | None =
     async def models():
         return {"object": "list", "data": [{"id": model_name, "object": "model", "owned_by": "kiln"}]}
 
+    async def _prefill_only(prompt_ids: list[int], params: SamplingParams, pd: dict, priority: int):
+        """A prefill engine's whole answer: run the request to its first token, hand it to pd["dest"], and say
+        how it went (the client's stream comes from the decode engine)."""
+        if not isinstance(pd.get("xfer"), str) or not isinstance(pd.get("dest"), str):
+            raise HTTPException(status_code=400, detail="kiln_pd needs xfer and dest on a prefill engine")
+        sub = loop_.submit(prompt_ids, params, priority, handoff=(pd["xfer"], pd["dest"]))
+        first = await sub.out.get()
+        if first[0] in ("busy", "error"):
+            raise HTTPException(status_code=429 if first[0] == "busy" else 400, detail=first[1])
+        finish = None
+        try:
+            while finish is None:
+                kind, *rest = await sub.out.get()
+                if kind == "error":
+                    raise HTTPException(status_code=500, detail=rest[0])
+                finish = rest[1]
+        except asyncio.CancelledError:
+            loop_.abort(sub.rid)
+            raise
+        req = first[1]
+        return JSONResponse({"kiln_pd": {"xfer": pd["xfer"], "handed_off": finish == "handoff",
+                                         "finish_reason": finish, "prompt_tokens": len(prompt_ids),
+                                         "cached_tokens": max(req.num_cached_tokens, 0),
+                                         "prefill_seconds": (req.finish_time or time.monotonic()) - req.arrival_time}})
+
     async def _generate(http: HTTPRequest, prompt_ids: list[int], params: SamplingParams, chat: bool,
                         stream: bool, priority: int = 0, parse: dict | None = None, session_id: str | None = None,
-                        tool_choice=None):
-        sub = loop_.submit(prompt_ids, params, priority, session_id)
+                        tool_choice=None, pd: dict | None = None, return_ids: bool = False):
+        if engine.pd_role == "prefill":
+            if pd is None:
+                raise HTTPException(status_code=400, detail="this is a prefill engine: requests come from the "
+                                                            "router with kiln_pd {xfer, dest}")
+            return await _prefill_only(prompt_ids, params, pd, priority)
+        if pd is not None:
+            if engine.pd_role != "decode" or not isinstance(pd.get("xfer"), str):
+                raise HTTPException(status_code=400, detail="kiln_pd {xfer} goes to a decode engine")
+            sub = loop_.submit_await(pd["xfer"], prompt_ids, params)
+        else:
+            sub = loop_.submit(prompt_ids, params, priority, session_id)
         # Admission errors (bad prompt, full queue) arrive before any token: surface them as
         # HTTP status codes rather than inside a 200 stream.
         first = await sub.out.get()
@@ -492,7 +673,7 @@ def build_app(engine: LLMEngine, model_name: str, reasoning_parser: str | None =
         created = int(time.time())
         oid = ("chatcmpl-" if chat else "cmpl-") + sub.rid
         obj = "chat.completion" if chat else "text_completion"
-        detok = _Detok(tok, params.stop)
+        detok = _Detok(tok, params.stop, incremental=loop_.fast_stream)
 
         def lp_block(lps):
             if lps is None:
@@ -561,7 +742,7 @@ def build_app(engine: LLMEngine, model_name: str, reasoning_parser: str | None =
         if stream:
             return StreamingResponse(events(), media_type="text/event-stream")
 
-        text, finish, n_out, all_lps = "", None, 0, []
+        text, finish, n_out, all_lps, out_ids = "", None, 0, [], []
         try:
             while finish is None:
                 kind, *rest = await sub.out.get()
@@ -569,6 +750,7 @@ def build_app(engine: LLMEngine, model_name: str, reasoning_parser: str | None =
                     raise HTTPException(status_code=400, detail=rest[0])
                 ids, finish, lps = rest
                 n_out += len(ids)
+                out_ids += ids
                 if lps is not None:
                     all_lps.extend(zip(ids, lps))
                 text += detok.push(ids, finish is not None)
@@ -588,6 +770,10 @@ def build_app(engine: LLMEngine, model_name: str, reasoning_parser: str | None =
             choice = {"index": 0, "text": text, "finish_reason": finish}
         if params.logprobs is not None:
             choice["logprobs"] = lp_block(all_lps)
+        if return_ids:  # vLLM's return_token_ids; kiln_logprobs: (chosen logprob, top ids, top logprobs) per token
+            choice["token_ids"] = [int(t) for t in out_ids]
+            if params.logprobs is not None:
+                choice["kiln_logprobs"] = [[lp, [int(i) for i in ti], list(tl)] for _, (lp, ti, tl) in all_lps]
         resp = {"id": oid, "object": obj, "created": created, "model": model_name,
                 "choices": [choice], "usage": usage}
         if params.prompt_logprobs is not None:
@@ -620,7 +806,8 @@ def build_app(engine: LLMEngine, model_name: str, reasoning_parser: str | None =
             raise HTTPException(status_code=400, detail="prompt must be a string or a list of token ids")
         return await _generate(http, ids, _params(body, 16, chat=False), chat=False,
                                stream=bool(body.get("stream")), priority=int(body.get("priority", 0)),
-                               session_id=body.get("session_id"))
+                               session_id=body.get("session_id"), pd=body.get("kiln_pd"),
+                               return_ids=bool(body.get("return_token_ids")))
 
     @app.post("/v1/chat/completions")
     async def chat(http: HTTPRequest):
@@ -653,6 +840,7 @@ def build_app(engine: LLMEngine, model_name: str, reasoning_parser: str | None =
                          parallel_tool_calls=body.get("parallel_tool_calls") is not False)
         return await _generate(http, ids, _params(body, 512, chat=True), chat=True,
                                stream=bool(body.get("stream")), priority=int(body.get("priority", 0)),
-                               parse=parse, session_id=body.get("session_id"), tool_choice=tool_choice)
+                               parse=parse, session_id=body.get("session_id"), tool_choice=tool_choice,
+                               pd=body.get("kiln_pd"))
 
     return app

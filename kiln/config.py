@@ -651,6 +651,12 @@ class EngineConfig:
     piecewise_prefill_moe_group: int | None = field(
         default_factory=lambda: int(os.environ["KILN_PIECEWISE_PREFILL_MOE_GROUP"])
         if os.environ.get("KILN_PIECEWISE_PREFILL_MOE_GROUP") else None)
+    # KILN_DECODE_WHOLE=1 (off by default): under piecewise, a decode call is ONE graph (the prep, every layer
+    # and the post: forward_decode compiled whole) while prefill, verify and mixed calls keep their pieces.
+    # Each graph execution holding a cross-chip collective has a fixed cost at 32 ranks (docs/neuron-notes.md
+    # "Collectives across chips"), and a decode call is otherwise prep + ceil(layers / piecewise_moe_group)
+    # groups + post graphs.
+    decode_whole: bool = field(default_factory=lambda: os.environ.get("KILN_DECODE_WHOLE", "0") == "1")
     # Mixed batches (KILN_MIXED_BATCH=1, off by default): the decode tokens of running requests ride in the
     # prefill calls of the same step, as vLLM's chunked prefill does (vllm 0.24.0 vllm/v1/core/sched/
     # scheduler.py Scheduler.schedule: "There's no 'decoding phase' nor 'prefill phase' in the scheduler",
@@ -692,6 +698,10 @@ class EngineConfig:
     # sequence drafts every step; GLM-5.3-Flash tp=32 at conc 64 also does not fit trn1's HBM with the decode
     # graphs beside the verify graphs (docs/neuron-notes.md "MTP at serving scale").
     spec_verify_plain: bool | None = None
+    # Speculative steps under overlap scheduling (engine/spec_async.py): the accepted count, the newest token, the
+    # next positions and the MTP drafts stay on the device and the next step is scheduled before this one is read.
+    # MTP with spec_k 1 only. None: KILN_SPEC_ASYNC (default 0).
+    spec_async: bool | None = None
     spec_ngram_min: int = 2
     spec_ngram_max: int = 4
     # "suffix" (vLLM suffix decoding): see engine/spec_suffix.py.
@@ -700,7 +710,36 @@ class EngineConfig:
     suffix_max_spec_factor: float = 1.0
     suffix_min_token_prob: float = 0.1
     num_layers: int | None = None  # debugging: run only the first n layers of the checkpoint
+    # Prefill / decode disaggregation (engine/disagg.py): None (one engine does both), "prefill" (prefill
+    # graphs only; every request is handed off at its first token) or "decode" (decode graphs only; takes
+    # handed-off requests). A decode engine listens for handoffs on pd_listen ("host:port", port 0: any),
+    # announces pd_advertise (this box's address as prefill boxes reach it; default the listen host, or the
+    # host's own address for 0.0.0.0), and holds at most pd_buffer_gb of received parts on the host
+    # (/dev/shm) before a part waits. pd_bypass_prefill: the decode engine also loads its prefill buckets
+    # and serves whole requests (short prompts the router does not disaggregate, server/router.py).
+    pd_role: str | None = None
+    pd_listen: str | None = None
+    pd_advertise: str | None = None
+    pd_buffer_gb: float = 16.0
+    pd_bypass_prefill: bool = False
+    # One long prefill over several engines (engine/pp.py, opt-in): stage pp_stage of pp_stages runs the layers of its
+    # range only (pp_split: the first layer of every stage after the first; None: by measured time,
+    # pp.default_split); a stage after the first listens on pp_listen ("host:port", rank r on port + r) for the
+    # previous stage's hidden stream, a stage before the last sends to pp_next. Prefill only, piecewise only.
+    pp_stage: int = 0
+    pp_stages: int = 1
+    pp_split: tuple | None = None
+    pp_listen: str | None = None
+    pp_next: str | None = None
     extra: dict = field(default_factory=dict)
+
+    @property
+    def spec_overlap(self) -> bool:
+        """Whether speculative steps run under overlap scheduling (spec_async, engine/spec_async.py)."""
+        import os
+
+        v = self.spec_async if self.spec_async is not None else os.environ.get("KILN_SPEC_ASYNC", "0") == "1"
+        return bool(v) and self.spec_method == "mtp"
 
     @property
     def spec_merged(self) -> bool:

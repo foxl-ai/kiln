@@ -19,8 +19,19 @@
 # "This checkout" is the one this script lives in, wherever it is called from.
 # KILN_BOX_SRC=/opt/kiln/src-<x> syncs to (and runs from) another directory on the box, so a
 # second checkout can run CPU-only work beside a job that is running from /opt/kiln/src.
-#   infra/fleet.sh down <name>|--all          # terminate
+#   infra/fleet.sh down <name>|--all          # terminate (and release what `up` made for it: EIP, placement group)
 #   infra/fleet.sh ls --all                   # Project=kiln instances in every Kiln region
+#   infra/fleet.sh cleanup                    # release Project=kiln EIPs / placement groups nothing uses
+#   infra/fleet.sh pd-sg                      # one-time per region: the kiln-pd security group, which lets
+#                                             # its members reach each other on every port (and EFA)
+#
+# Box-to-box traffic (prefill / decode disaggregation, engine/disagg.py): KILN_SG_EXTRA=kiln-pd adds the
+# kiln-pd group to the instance; members of it accept TCP (and EFA) from each other, nothing from outside.
+# KILN_EFA=1 launches with an EFA interface on every network card the type has (trn1.32xlarge 8, trn2.48xlarge
+# 16), in the cluster placement group KILN_PG (made on first use, Project=kiln, deleted by `down` once empty),
+# with kiln-pd on every interface. An instance with several interfaces gets no automatic public address, and SSM
+# needs one in the default VPC, so `up` allocates an Elastic IP (Project=kiln, Name=<name>) for the primary
+# interface and `down` releases it.
 #
 # Region: us-east-2 by default (measured 2026-10-02: the only region offering trn1, trn1n,
 # trn2 and inf2 together, and the cheapest spot for each - trn1.32xlarge $2.15/h,
@@ -106,6 +117,46 @@ cmd_bootstrap() {
   fi
 }
 
+cmd_cleanup() {
+  # Project=kiln leftovers no instance uses: Elastic IPs not associated with anything, and cluster placement
+  # groups `up` made (Project=kiln) that hold no instance. Safe to run any time; touches nothing untagged.
+  local a; for a in $(aws_ ec2 describe-addresses --filters "Name=tag:Project,Values=kiln" \
+      --query 'Addresses[?AssociationId==null].AllocationId' --output text); do
+    aws_ ec2 release-address --allocation-id "$a" && echo "released unassociated elastic ip $a"
+  done
+  local g; for g in $(aws_ ec2 describe-placement-groups --filters "Name=tag:Project,Values=kiln" \
+      --query 'PlacementGroups[].GroupName' --output text); do
+    local left; left=$(aws_ ec2 describe-instances --filters "Name=placement-group-name,Values=$g" \
+      "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down" \
+      --query 'Reservations[].Instances[].InstanceId' --output text)
+    [ -z "$left" ] && aws_ ec2 delete-placement-group --group-name "$g" && echo "deleted empty placement group $g"
+  done
+  return 0
+}
+
+pd_sg_id() {
+  aws_ ec2 describe-security-groups --filters "Name=group-name,Values=kiln-pd" "Name=tag:Project,Values=kiln" \
+    --query 'SecurityGroups[0].GroupId' --output text
+}
+
+cmd_pd_sg() {
+  local sg; sg=$(pd_sg_id)
+  if [ "$sg" = "None" ]; then
+    local vpc; vpc=$(aws_ ec2 describe-vpcs --filters Name=is-default,Values=true --query 'Vpcs[0].VpcId' --output text)
+    sg=$(aws_ ec2 create-security-group --group-name kiln-pd --vpc-id "$vpc" \
+      --description "Kiln PD boxes: every port between members of this group only (TCP handoff, EFA)" \
+      --tag-specifications "ResourceType=security-group,Tags=[{$TAGS}]" --query GroupId --output text)
+    # EFA needs all traffic in and out between members (AWS EFA docs, "Prepare an EFA-enabled security group").
+    aws_ ec2 authorize-security-group-ingress --group-id "$sg" \
+      --ip-permissions "IpProtocol=-1,UserIdGroupPairs=[{GroupId=$sg}]" >/dev/null
+    aws_ ec2 authorize-security-group-egress --group-id "$sg" \
+      --ip-permissions "IpProtocol=-1,UserIdGroupPairs=[{GroupId=$sg}]" >/dev/null 2>&1 || true
+    echo "created kiln-pd security group $sg in $REGION (members reach each other, nothing else)"
+  else
+    echo "kiln-pd security group $sg exists in $REGION"
+  fi
+}
+
 cmd_up() {
   local name="$1" type="$2" az="${3:-}"
   local existing; existing=$(instance_id "$name")
@@ -129,16 +180,62 @@ cmd_up() {
       --capacity-reservation-specification "CapacityReservationTarget={CapacityReservationId=${KILN_CAPACITY_RESERVATION:?KILN_CAPACITY_RESERVATION=cr-...}}") ;;
     *) echo "KILN_MARKET must be spot, ondemand or capacity-block" >&2; exit 2 ;;
   esac
-  aws_ ec2 run-instances --image-id "$ami" --instance-type "$type" \
-    --iam-instance-profile "Name=$ROLE" --security-group-ids "$sg" \
+  local groups=("$sg")
+  if [ -n "${KILN_SG_EXTRA:-}" ] || [ "${KILN_EFA:-0}" = 1 ]; then
+    local extra; extra=$(pd_sg_id)
+    [ "$extra" = "None" ] && { echo "no kiln-pd security group in $REGION: run 'infra/fleet.sh pd-sg'" >&2; exit 1; }
+    groups+=("$extra")
+  fi
+  local nics=() sgs=()
+  if [ "${KILN_EFA:-0}" = 1 ]; then
+    [ -n "${KILN_PG:-}" ] || { echo "KILN_EFA=1 needs KILN_PG=<cluster placement group name>" >&2; exit 2; }
+    [ -n "$az" ] || { echo "KILN_EFA=1 needs an AZ (the placement group lives in one)" >&2; exit 2; }
+    if [ "$(aws_ ec2 describe-placement-groups --filters "Name=group-name,Values=$KILN_PG" \
+            --query 'PlacementGroups[0].GroupName' --output text)" = "None" ]; then
+      aws_ ec2 create-placement-group --group-name "$KILN_PG" --strategy cluster \
+        --tag-specifications "ResourceType=placement-group,Tags=[{$TAGS}]" >/dev/null
+      echo "created cluster placement group $KILN_PG"
+    fi
+    # Whatever happens from here on (a refused launch, an EIP that cannot be had), leave nothing behind.
+    trap 'rc=$?; [ $rc -ne 0 ] && { echo "up failed (rc $rc): cleaning up" >&2; cmd_cleanup >&2; }' EXIT
+    local cards; cards=$(aws_ ec2 describe-instance-types --instance-types "$type" \
+      --query 'InstanceTypes[0].NetworkInfo.EfaInfo.MaximumEfaInterfaces' --output text)
+    local subnet; subnet=$(aws_ ec2 describe-subnets --filters "Name=availability-zone,Values=$az" "Name=default-for-az,Values=true" --query 'Subnets[0].SubnetId' --output text)
+    local gl; gl=$(IFS=,; echo "${groups[*]}")
+    nics=(--network-interfaces)  # one flag, one structure per interface (a repeated flag keeps only the last)
+    local i; for i in $(seq 0 $((cards - 1))); do
+      # Card 0 carries the primary interface (ENA + EFA); the others EFA only (no IP traffic, RDMA only).
+      local kind=efa; [ "$i" -gt 0 ] && kind=efa-only
+      nics+=("NetworkCardIndex=$i,DeviceIndex=$([ "$i" = 0 ] && echo 0 || echo 1),InterfaceType=$kind,SubnetId=$subnet,Groups=$gl,DeleteOnTermination=true")
+    done
+    placement=(--placement "GroupName=$KILN_PG,AvailabilityZone=$az")
+  else
+    sgs=(--security-group-ids "${groups[@]}")
+  fi
+  local pgtag=""
+  [ "${KILN_EFA:-0}" = 1 ] && pgtag=",{Key=KilnPlacementGroup,Value=$KILN_PG}"
+  local out; out=$(aws_ ec2 run-instances --image-id "$ami" --instance-type "$type" \
+    --iam-instance-profile "Name=$ROLE" ${sgs[@]+"${sgs[@]}"} ${nics[@]+"${nics[@]}"} \
     ${placement[@]+"${placement[@]}"} ${KILN_DRY_RUN:+--dry-run} \
     ${market[@]+"${market[@]}"} \
     --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$ROOT_GB,VolumeType=gp3,Iops=6000,Throughput=500,DeleteOnTermination=true}" \
     --metadata-options HttpTokens=required \
-    --tag-specifications "ResourceType=instance,Tags=[{$TAGS},{Key=Name,Value=$name}]" \
+    --instance-initiated-shutdown-behavior terminate \
+    --tag-specifications "ResourceType=instance,Tags=[{$TAGS},{Key=Name,Value=$name}$pgtag]" \
                          "ResourceType=volume,Tags=[{$TAGS},{Key=Name,Value=$name}]" \
-    --query 'Instances[0].[InstanceId,InstanceType,Placement.AvailabilityZone]' --output text
+    --query 'Instances[0].[InstanceId,InstanceType,Placement.AvailabilityZone]' --output text)
+  echo "$out"
   echo "ami $ami (${KILN_AMI:+KILN_AMI}${KILN_AMI:-$AMI_PARAM}) region $REGION"
+  if [ "${KILN_EFA:-0}" = 1 ] && [ -z "${KILN_DRY_RUN:-}" ]; then
+    local id; id=$(echo "$out" | awk '{print $1}')
+    aws_ ec2 wait instance-running --instance-ids "$id"
+    local eni; eni=$(aws_ ec2 describe-instances --instance-ids "$id" \
+      --query 'Reservations[0].Instances[0].NetworkInterfaces[?Attachment.DeviceIndex==`0` && Attachment.NetworkCardIndex==`0`].NetworkInterfaceId|[0]' --output text)
+    local alloc; alloc=$(aws_ ec2 allocate-address --domain vpc \
+      --tag-specifications "ResourceType=elastic-ip,Tags=[{$TAGS},{Key=Name,Value=$name}]" --query AllocationId --output text)
+    aws_ ec2 associate-address --allocation-id "$alloc" --network-interface-id "$eni" >/dev/null
+    echo "efa: $(echo "${nics[@]}" | grep -o InterfaceType | wc -l) interfaces, placement group $KILN_PG, elastic ip $alloc on $eni"
+  fi
 }
 
 cmd_ready() {
@@ -286,7 +383,31 @@ cmd_down() {
     ids=$(instance_id "$1"); [ "$ids" = "None" ] && ids=""
   fi
   [ -z "$ids" ] && { echo "nothing to terminate"; return; }
+  local pgs; pgs=$(aws_ ec2 describe-instances --instance-ids $ids \
+    --query 'Reservations[].Instances[].Tags[?Key==`KilnPlacementGroup`].Value[]' --output text)
+  local names; names=$(aws_ ec2 describe-instances --instance-ids $ids \
+    --query 'Reservations[].Instances[].Tags[?Key==`Name`].Value[]' --output text)
   aws_ ec2 terminate-instances --instance-ids $ids --query 'TerminatingInstances[].[InstanceId,CurrentState.Name]' --output text
+  # What `up` made for these instances (KILN_EFA=1): their Elastic IPs, then their placement groups once empty.
+  local n; for n in $names; do
+    local a; for a in $(aws_ ec2 describe-addresses --filters "Name=tag:Project,Values=kiln" "Name=tag:Name,Values=$n" \
+        --query 'Addresses[].AllocationId' --output text); do
+      local assoc; assoc=$(aws_ ec2 describe-addresses --allocation-ids "$a" --query 'Addresses[0].AssociationId' --output text)
+      [ "$assoc" != "None" ] && aws_ ec2 disassociate-address --association-id "$assoc" >/dev/null 2>&1 || true
+      aws_ ec2 release-address --allocation-id "$a" && echo "released elastic ip $a ($n)"
+    done
+  done
+  if [ -n "$pgs" ]; then
+    aws_ ec2 wait instance-terminated --instance-ids $ids
+    local g; for g in $(echo $pgs | tr ' ' '\n' | sort -u); do
+      local left; left=$(aws_ ec2 describe-instances --filters "Name=placement-group-name,Values=$g" \
+        "Name=instance-state-name,Values=pending,running,stopping,stopped" --query 'Reservations[].Instances[].InstanceId' --output text)
+      if [ -z "$left" ] && [ "$(aws_ ec2 describe-placement-groups --group-names "$g" \
+            --query 'PlacementGroups[0].Tags[?Key==`Project`].Value|[0]' --output text)" = kiln ]; then
+        aws_ ec2 delete-placement-group --group-name "$g" && echo "deleted placement group $g"
+      fi
+    done
+  fi
 }
 
 case "${1:-}" in
@@ -301,5 +422,7 @@ case "${1:-}" in
   nvme) shift; cmd_nvme "$@" ;;
   log) shift; cmd_log "$@" ;;
   down) shift; cmd_down "$@" ;;
+  pd-sg) cmd_pd_sg ;;
+  cleanup) cmd_cleanup ;;
   *) sed -n "2,/^set -euo/p" "$0" | grep "^#"; exit 2 ;;
 esac

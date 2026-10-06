@@ -11,14 +11,16 @@ from dataclasses import dataclass
 
 import torch
 
+from .. import profiling
 from ..config import EngineConfig, ModelConfig
 from ..models.loader import load_model, resolve_model_path
+from . import watchdog
 from .kv_pool import PagePool
 from .model_runner import ModelRunner
 from .radix_cache import RadixCache
 from .request import Request, SamplingParams, Status
 from .sampler import NUM_TOP_LOGPROBS, unpack
-from .scheduler import NeedSync, Scheduler, SchedulerConfig
+from .scheduler import BLIND, NeedSync, Scheduler, SchedulerConfig
 
 # Tensor-parallel engines not closed yet, held weakly: close() at exit (stopping the workers) without
 # keeping every engine a process ever made alive. atexit.register(self.close) did, so a test session
@@ -84,6 +86,17 @@ def resolve_attention_tp(mcfg: ModelConfig, cfg: EngineConfig) -> int:
     return attention_tp(mcfg, cfg.tp, cfg.attention_tp, mtp)
 
 
+def _cp_degree(mcfg: ModelConfig, attn_tp: int) -> int:
+    """The context-parallel degree of the DSA caches (DecoderForCausalLM.cp): the attention TP when KILN_DSA_CP=1 and
+    every attention layer can run the long path, else 1."""
+    from ..config import LinearSpec
+    from ..models import dsa_long, mla
+
+    specs = [s for s in (mcfg.attn_layers or ()) if not isinstance(s, LinearSpec)]
+    ok = dsa_long.cp_enabled() and attn_tp > 1 and specs and all(mla.long_capable(s) for s in specs)
+    return attn_tp if ok else 1
+
+
 def pool_pages(cfg: EngineConfig, mcfg: ModelConfig) -> int:
     """Pages in each KV pool. The pool is a graph input shape (every layer graph's KV cache), so a
     capture (kiln/capture.py) must size it exactly as the engine does."""
@@ -98,6 +111,8 @@ def pool_pages(cfg: EngineConfig, mcfg: ModelConfig) -> int:
                   * kv_heads_per_rank(mcfg.num_kv_heads, attn_tp) // mcfg.num_kv_heads)
     page_bytes += state_bytes_per_token_rank(mcfg, attn_tp, cfg.dtype,
                                              kv_cache_torch_dtype(cfg) == torch.float8_e4m3fn) * cfg.page_size
+    # Context-parallel DSA (models/dsa_long.py, KILN_DSA_CP=1): a rank holds 1 / attn_tp of every page.
+    page_bytes //= _cp_degree(mcfg, attn_tp)
     # A model of linear-attention layers only has no KV: pages then only count positions.
     return cfg.num_pages or (int(cfg.kv_cache_gb * 2**30 // page_bytes) + 1 if page_bytes
                              else cfg.max_num_seqs * cfg.max_pages_per_seq + 1)
@@ -118,6 +133,11 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
         # (libnrt clamps larger values to 63, with a warning).
         os.environ.setdefault("NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS", "63" if cfg.piecewise else "32")
         os.environ.setdefault("NEURON_RT_IO_RING_CACHE_SIZE", "32")
+        # NOT NEURON_RT_DISABLE_EXECUTION_BARRIER=1, the third knob vllm-neuron sets there (neuron_worker.py:715-718):
+        # without the runtime's per-execution barrier a collective mismatch returns silently wrong numbers, and ranks
+        # alternating world and attention-group collectives under host jitter deadlock (docs/neuron-notes.md
+        # "Upstream harvest (2026-10)"). Its serving gain (+2-3% on trn1) comes from the hardware barrier instead,
+        # which keeps the ordering (platform.configure_runtime_env, HW_BARRIER_FAMILIES).
         from .. import platform
 
         platform.configure_runtime_env()  # NEURON_LOGICAL_NC_CONFIG on trn2 / trn3, before the runtime
@@ -150,15 +170,44 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
     model = load_model(path, mcfg, cfg.dtype, device, cfg.max_model_len, rank, cfg.tp, group,
                        keep_fp8=keep_fp8, fp8_max=fp8_e4m3_max(device), vocab_parallel=cfg.vocab_parallel,
                        packed_mxfp4=cfg.mxfp4_packed, mtp=mtp, moe_kernel=cfg.moe_kernel, attn_tp=atp,
-                       attn_group=attn_group, dp_attention=dp, max_num_seqs=cfg.max_num_seqs)
+                       attn_group=attn_group, dp_attention=dp, max_num_seqs=cfg.max_num_seqs, pd_role=cfg.pd_role)
     runner = ModelRunner(model, mcfg, cfg, num_pages, device, kv_heads=model.nkv)
+    # For an EPLB rebalance (models/eplb.py): this rank's redundant slots reloaded from the same checkpoint.
+    from ..models.loader import _Checkpoint, prepare_ep_slots
+
+    runner.ep_prepare = lambda layer, index, slots, ck=None: prepare_ep_slots(path, model, layer, index, slots,
+                                                                              fp8_e4m3_max(device), ck)
+    runner.ep_checkpoint = lambda: _Checkpoint(path)
     # For update_weights_from_disk: the same shard of another checkpoint, on the host.
     runner.load_host = lambda p: load_model(p, mcfg, cfg.dtype, torch.device("cpu"), cfg.max_model_len, rank, cfg.tp,
                                             None, keep_fp8=keep_fp8, fp8_max=fp8_e4m3_max(device),
                                             vocab_parallel=cfg.vocab_parallel, packed_mxfp4=cfg.mxfp4_packed,
                                             mtp=mtp, moe_kernel=cfg.moe_kernel, attn_tp=atp, dp_attention=dp,
-                                            max_num_seqs=cfg.max_num_seqs)
+                                            max_num_seqs=cfg.max_num_seqs, pd_role=cfg.pd_role)
+    _trim_after_load(rank, device)
     return model, runner
+
+
+def _rss_gib() -> float:
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 2**20
+    return 0.0
+
+
+def _trim_after_load(rank: int, device) -> None:
+    """KILN_MALLOC_TRIM=1: hand the heap the loader freed back to the system (glibc keeps freed chunks below its mmap
+    threshold in the process heap), and print this rank's host RSS before and after. A GLM-5.3-Flash rank of the 1M
+    configuration held ~34.6 GB of host RSS on trn2, ~30 GB of it in two heap regions, and two such engines ran a
+    trn2.48xlarge (2 TB) out of memory (docs/neuron-notes.md "Long context (1M)"). Off by default."""
+    if os.environ.get("KILN_MALLOC_TRIM", "0") != "1" or device.type == "cpu":
+        return
+    import ctypes
+
+    before = _rss_gib()
+    ctypes.CDLL("libc.so.6").malloc_trim(0)
+    print(f"kiln rank {rank}: host RSS {before:.1f} GiB after load, {_rss_gib():.1f} GiB after malloc_trim", flush=True)
 
 
 class LLMEngine:
@@ -330,11 +379,257 @@ class LLMEngine:
         self._ids = itertools.count()
         self.last_step = StepStats()
         self._inflight = None  # (plan, launches) of a step whose results are not read yet
+        # EPLB rebalances (models/eplb.py, _eplb_tick): only with redundant slots and the recorder on.
+        from ..models import eplb as _eplb
+
+        rec = any(getattr(l, "ep_stats", None) is not None for l in getattr(self.runner.model, "layers", []))
+        self._eplb_every = _eplb.rebalance_interval() if rec else 0
+        self._eplb_max = int(os.environ.get("KILN_EPLB_MAX_REBALANCES", "0"))
+        self._eplb_calls = self._eplb_total = 0
+        self._eplb_pending = None  # (start time, prefill calls) of a prepared rebalance not committed yet
+        self.eplb_log: list[tuple[int, int, float, float, int]] = []
+        self._pd_setup()
+
+    # -- prefill / decode disaggregation (engine/disagg.py) ---------------------------------------------
+
+    def _pd_setup(self) -> None:
+        import queue
+
+        cfg = self.cfg
+        self.pd_role = cfg.pd_role
+        self.pd_receiver = None
+        self.pd_ready: queue.Queue = queue.Queue()  # complete handoffs (meta dicts), from the receiver thread
+        self.pd_wake = None  # called after a handoff completes (server/api.py wakes its engine loop)
+        self.pd_counts = collections.Counter()  # handed_off, done_at_prefill, admitted, injected, refused
+        self.pd_done = collections.deque(maxlen=4096)  # metas of handoffs that ended on the prefill side (pd_poll)
+        self.pd_inject_seconds = 0.0
+        self._pd_prefetch_on = os.environ.get("KILN_PD_PREFETCH", "1") == "1"
+        self._pd_pf: list = []  # handoffs placed since the last launch, to prefetch on every rank of their group
+        if self.pd_role is None:
+            return
+        if self.pd_role not in ("prefill", "decode"):
+            raise ValueError(f"pd_role must be prefill or decode, not {self.pd_role!r}")
+        if cfg.spec_method:
+            raise NotImplementedError("speculative decoding with disaggregation (the MTP KV and drafts of the prompt "
+                                      "would have to be handed off too)")
+        if self.mixed_unsupported_by_role():
+            raise ValueError(f"mixed batches on a {self.pd_role} engine: it runs one kind of call only")
+        print(f"kiln role: {self.pd_role} (layout {self.runner.pd_signature()}, tp {cfg.tp}, attention tp "
+              f"{self.attn_tp}, dp_attention {self.dp})", flush=True)
+        for p in self.pools:
+            p.ascending = True
+        if self.pd_role == "prefill":
+            self.scheduler.prefill_only = True
+            return
+        # The handoff's eager copies then never land on a page or state row an overlapped step may still write, so
+        # they need not wait for the device (_pd_cool, ModelRunner._pd_inject settle=False).
+        self.pd_hold = bool(cfg.overlap) and os.environ.get("KILN_PD_SETTLE", "0") != "1"
+        if self.pd_hold:
+            for p in self.pools:
+                p.hold = True
+            if self.runner.state is not None:
+                self.runner.state.hold = True
+        if cfg.pd_listen:
+            from . import disagg
+
+            def done(meta, ready=self.pd_ready):
+                ready.put(meta)
+                if self.pd_wake is not None:
+                    self.pd_wake()
+
+            self.pd_receiver = disagg.Receiver(cfg.pd_listen, done, int(cfg.pd_buffer_gb * 2**30),
+                                               signature=self.runner.pd_signature())
+            self.pd_address = self.pd_receiver.address(cfg.pd_advertise)
+            print(f"kiln pd: decode engine receives handoffs at {self.pd_address} (buffer {cfg.pd_buffer_gb} GB in "
+                  f"{self.pd_receiver.dir})", flush=True)
+
+    def mixed_unsupported_by_role(self) -> bool:
+        return self.pd_role is not None and bool(self.runner.mixed_rows)
+
+    def add_prefilled(self, meta: dict) -> Request:
+        """Decode engine: a complete handoff (disagg.Receiver) as a running request's next step. Its first
+        token was sampled by the prefill engine and is the last of token_ids; the step that admits it copies its
+        parts onto the device before decoding it (_pd_inject_plan)."""
+        from . import disagg
+
+        if self.pd_role != "decode":
+            raise ValueError("handoffs go to a decode engine (pd_role='decode')")
+        if meta.get("error"):
+            raise ValueError(meta["error"])
+        if meta.get("done") is not None:
+            raise ValueError("a handoff that finished on the prefill engine has nothing to decode")
+        if int(meta.get("cp", 1)) > 1 and (int(meta["cp"]) != self.runner._pd_cp()[0]
+                                            or int(meta.get("page_size", 0)) != self.cfg.page_size):
+            raise ValueError(f"a handoff from a context-parallel engine (CP {meta['cp']}, page size {meta.get('page_size')}) "
+                             f"needs a decode engine with the same CP degree and page size, not CP "
+                             f"{self.runner._pd_cp()[0]} / page size {self.cfg.page_size}")
+        sa = self._pd_sender_a(meta)
+        if sa and not disagg.regroup_ok(sa, self.attn_tp):
+            raise ValueError(f"a handoff from attention TP {sa} cannot be split for this decode engine's attention TP "
+                             f"{self.attn_tp}: one must divide the other")
+        params = disagg.params_from_json(meta["params"])
+        req = Request(meta["rid"], list(meta["prompt_ids"]), params, priority=int(meta.get("priority", 0)))
+        req.token_ids.append(int(meta["token"]))
+        if meta.get("logprobs") is not None:
+            req.logprobs = [(lp, list(ti), list(tl)) for lp, ti, tl in meta["logprobs"]]
+        if meta.get("prompt_logprobs"):
+            req.prompt_logprobs = {int(k): (v[0], int(v[1]), list(v[2]), list(v[3]))
+                                   for k, v in meta["prompt_logprobs"].items()}
+        req.num_cached_tokens = int(meta.get("num_cached_tokens", 0))
+        req.first_token_time = time.monotonic()
+        req.pd_meta = meta
+        self.runner.pd_set_rng(req.rid, meta.get("rng"))
+        self.scheduler.add_prefilled(req)
+        if self._pd_prefetch_on:  # broadcast with the next step's launch (_pd_inject_plan), one message for all
+            self._pd_pf.append((meta["xfer"], meta["parts"], req.dp_group, req.num_prompt, int(meta.get("cp", 1)),
+                                self._pd_sender_a(meta)))
+        self.pd_counts["admitted"] += 1
+        return req
+
+    def _pd_sender_a(self, meta: dict) -> int:
+        """The sender's attention TP when it differs from this engine's (ModelRunner.pd_regroupable), else 0."""
+        sa = int(meta.get("attention_tp") or 0)
+        return sa if sa and sa != self.attn_tp else 0
+
+    def pd_poll(self) -> list[Request]:
+        """Admit every complete handoff the receiver holds (an engine driven without server/api.py)."""
+        import queue
+
+        out = []
+        while True:
+            try:
+                meta = self.pd_ready.get_nowait()
+            except queue.Empty:
+                return out
+            if meta.get("done") is not None or meta.get("error"):
+                self.pd_release(meta["xfer"])
+                self.pd_done.append(meta)
+                self.pd_counts["refused" if meta.get("error") else "done_at_prefill"] += 1
+                continue
+            out.append(self.add_prefilled(meta))
+
+    def pd_release(self, xfer: str) -> None:
+        if self.pd_receiver is not None:
+            self.pd_receiver.release(xfer)
+
+    def _pd_inject_plan(self, plan) -> None:
+        """Copy the parts of every handed-off request this step decodes for the first time onto the device,
+        before any of the step's calls (they are ordered with the calls on every rank: ModelRunner.serve)."""
+        t = time.perf_counter()
+        if self._pd_pf:
+            self.runner.pd_prefetch_many(self._pd_pf)
+            self._pd_pf = []
+        items = []
+        for s in plan.decodes:
+            r = s.req
+            if r.pd_meta is None or r.pd_injected:
+                continue
+            srow = self.runner.state.row(r) if self.runner.state is not None else None
+            items.append((None if self._pd_prefetch_on else r.pd_meta["parts"], list(r.pages), r.num_prompt, srow,
+                          r.dp_group, not self.pd_hold, int(r.pd_meta.get("cp", 1)), r.pd_meta["xfer"],
+                          self._pd_sender_a(r.pd_meta)))
+            r.pd_injected = True
+            plan.pd_injected.append(r.pd_meta["xfer"])
+            self.pd_counts["injected"] += 1
+        if items:
+            self.runner.pd_inject_many(items)
+        self.pd_inject_seconds += time.perf_counter() - t
+
+    def _pd_handoff(self, r: Request) -> None:
+        """Prefill engine, a request that just sampled its first token (or finished): decide with the request's
+        own params whether it continues, and either hand its state off or tell the decode side it is done. Runs
+        inside _finish, before the request's state row is released and before the next schedule."""
+        from . import disagg
+
+        orig, (xfer, dest) = r.handoff_params, r.handoff
+        out = r.output_ids
+        reason = r.finish_reason
+        if reason == "length":  # the prefill engine's own limit of one token; the request's limits decide
+            reason = None
+            if len(out) >= orig.max_new_tokens or r.num_tokens >= self.cfg.max_model_len:
+                reason = "length"
+            elif orig.stop and self.tokenizer is not None:
+                tail = self.tokenizer.decode(out[-(max(len(x) for x in orig.stop) + 8):])
+                reason = "stop" if any(x in tail for x in orig.stop) else None
+        n = orig.logprobs
+        lps = [[lp, list(ti)[:n] if n is not None else [], list(tl)[:n] if n is not None else []]
+               for lp, ti, tl in r.logprobs] if n is not None else None
+        meta = {"xfer": xfer, "rid": r.rid, "prompt_ids": list(r.prompt_ids), "token": int(out[0]) if out else None,
+                "logprobs": lps, "params": disagg.params_to_json(orig), "priority": r.priority,
+                "num_cached_tokens": max(r.num_cached_tokens, 0), "signature": self.runner.pd_signature(),
+                "prefill_seconds": time.monotonic() - r.arrival_time,
+                "prompt_logprobs": {str(k): [v[0], v[1], list(v[2]), list(v[3])] for k, v in r.prompt_logprobs.items()}
+                if r.prompt_logprobs else None}
+        r.handoff_meta = meta
+        if reason is not None or not out:
+            meta.update(done=reason or "abort", parts=[])
+            r.finish_reason = meta["done"]
+            self.runner.pd_send_meta(dest, meta)
+            self.pd_counts["done_at_prefill"] += 1
+            return
+        A, _ = self.runner.pd_attention()
+        cp, _ = self.runner._pd_cp()
+        meta.update(parts=disagg.part_names(A), rng=self.runner.pd_rng_state(r.rid), cp=cp, page_size=self.cfg.page_size,
+                    attention_tp=A)
+        srow = self.runner.state.row(r) if self.runner.state is not None else None
+        self.runner.pd_extract(xfer, dest, r.handoff_pages, r.num_prompt, srow, r.dp_group, meta)
+        r.finish_reason = "handoff"
+        self.pd_counts["handed_off"] += 1
+
+    def _pd_gate(self) -> None:
+        """Admit handed-off requests in batches (KILN_PD_ADMIT_MIN handoffs waiting, or KILN_PD_ADMIT_WAIT steps since
+        the last admission): every step that copies a handoff in is slower, whatever it copies, so fewer such steps
+        with more in each trade a little TTFT for decode throughput. Defaults 1 / 0: admit at once."""
+        groups = getattr(self.scheduler, "groups", [self.scheduler])
+        waiting = sum(len(g.prefilled) for g in groups)
+        if not hasattr(self, "_pd_since"):
+            self._pd_since = 0
+            self._pd_min = int(os.environ.get("KILN_PD_ADMIT_MIN", "1"))
+            self._pd_wait = int(os.environ.get("KILN_PD_ADMIT_WAIT", "0"))
+        ok = waiting > 0 and (waiting >= self._pd_min or self._pd_since >= self._pd_wait)
+        for g in groups:
+            g.admit_ok = ok
+        self._pd_since = 0 if ok else self._pd_since + 1
+
+    def _pd_cool(self) -> None:
+        """The step in flight when the held pages and rows were freed has been read back: nothing writes them now."""
+        for p in self.pools:
+            p.release_held()
+        for sch in getattr(self.scheduler, "groups", [self.scheduler]):
+            sch.cooling = 0
+        if self.runner.state is not None:
+            self.runner.state.release_cooling()
+
+    def pd_flush(self, timeout: float = 600.0) -> None:
+        """Wait until every queued handoff frame of this process is written (rank 0's; the other ranks flush
+        when the engine closes)."""
+        snd = getattr(self.runner, "_pd_snd", None)
+        if snd is not None:
+            snd.flush(timeout)
 
     def add_request(self, prompt_ids: list[int], params: SamplingParams, rid: str | None = None,
-                    priority: int = 0, session_id: str | None = None) -> Request:
+                    priority: int = 0, session_id: str | None = None, handoff: tuple[str, str] | None = None) -> Request:
+        """handoff: (transfer id, decode receiver "host:port"), on a prefill engine (engine/disagg.py): the
+        request runs to its first token here and continues on that decode engine."""
+        own = params
+        if handoff is not None or self.pd_role == "prefill":
+            from . import disagg
+
+            if self.pd_role != "prefill" or handoff is None:
+                raise ValueError("a prefill engine serves handoffs only, and only a prefill engine hands off")
+            why = disagg.unsupported(params)
+            if why:
+                raise ValueError(f"{why} cannot be disaggregated: send the request to a decode engine directly")
+            import dataclasses
+
+            params = dataclasses.replace(params, max_new_tokens=1)
+        elif self.pd_role == "decode" and not self.cfg.pd_bypass_prefill:
+            raise ValueError("this decode engine takes handed-off requests only (start it with pd_bypass_prefill "
+                             "to also serve whole requests)")
         req = Request(rid or f"req-{next(self._ids)}", list(prompt_ids), params, priority=priority,
                       session_id=session_id)
+        if handoff is not None:
+            req.handoff, req.handoff_params = handoff, own
         req.watermarked = self.watermark is not None and params.watermarking and params.temperature > 0
         if params.thinking_token_budget is not None:
             if not self.think_start_ids:
@@ -390,6 +685,11 @@ class LLMEngine:
     def abort(self, req: Request) -> None:
         self.scheduler.abort(req)
         self.runner.forget(req)
+        if req.pd_meta is not None and not req.pd_injected:
+            self.pd_release(req.pd_meta["xfer"])
+        if req.handoff is not None and req.handoff_meta is None:  # tell the decode side it will not come
+            req.handoff_meta = {"xfer": req.handoff[0], "rid": req.rid, "done": "abort", "parts": [], "token": None}
+            self.runner.pd_send_meta(req.handoff[1], req.handoff_meta)
         if hasattr(self.proposer, "finish"):
             self.proposer.finish(req.rid, [])
 
@@ -398,6 +698,17 @@ class LLMEngine:
         give this process back the state init_rank changed. Idempotent."""
         _OPEN.discard(self)
         runner = getattr(self, "runner", None)
+        if runner is not None and getattr(runner, "watchdog", None) is not None:
+            runner.watchdog.close()
+        if runner is not None and getattr(runner, "_pd_snd", None) is not None:
+            try:
+                runner._pd_snd.flush(60)
+            finally:
+                runner._pd_snd.close()
+                runner._pd_snd = None
+        if getattr(self, "pd_receiver", None) is not None:
+            self.pd_receiver.close()
+            self.pd_receiver = None
         if self._workers and runner is not None and runner.tp_send is not None:
             runner.tp_send(None)
             runner.tp_send = None
@@ -428,7 +739,10 @@ class LLMEngine:
             self._tp_saved = None
 
     def warmup(self, reverse: bool = False) -> dict:
-        out = self.runner.warmup(1 + self.cfg.spec_k if self.cfg.spec_method else None, reverse=reverse)
+        role = self.cfg.pd_role  # a prefill engine never decodes; a decode engine prefills only on bypass
+        out = self.runner.warmup(1 + self.cfg.spec_k if self.cfg.spec_method else None, reverse=reverse,
+                                 decode=role != "prefill", prefill=role != "decode" or self.cfg.pd_bypass_prefill)
+        self.runner.eplb_reset()  # warmup's dummy prefill calls were recorded too (models/eplb.py)
         out["cache_pulled"] = self.cache_pulled
         if self.cfg.compile_cache_uri and self.cfg.device == "neuron":
             from .. import compile_cache
@@ -446,6 +760,10 @@ class LLMEngine:
         if self.cfg.spec_k_per_batch_size:  # the draft length for this many running requests
             n = len(self.scheduler.running)
             k = min(k, next((kk for lo, hi, kk in self.cfg.spec_k_per_batch_size if lo <= n <= hi), self.cfg.spec_k))
+        if self.cfg.spec_method == "mtp" and self.runner.spec_async:
+            # engine/spec_async.py: the drafts (and the newest token, positions, state row) are on the device; the
+            # verify always carries k of them, and tokens past the request's limits are dropped at commit.
+            return [BLIND] * self.cfg.spec_k
         if self.cfg.spec_method == "mtp":
             draft, req.mtp_draft = req.mtp_draft, []
             return draft[: max(k, 0)]
@@ -466,15 +784,57 @@ class LLMEngine:
         """
         t = time.perf_counter()
         self.last_step = StepStats()
+        if self.pd_role == "decode":
+            if self.pd_hold and self._inflight is None:
+                # Nothing is in flight, so nothing can still write what the hold keeps. An engine that went idle never
+                # reads a step back again, and without this its held pages and slots (every slot, when its last
+                # requests ended together) were never released: handoffs then waited forever (seen on trn2).
+                self._pd_cool()
+            self._pd_gate()
         if self.cfg.overlap and self._overlap_ok():
             finished = self._step_overlap()
         else:
             finished = self._drain() + self._step_sync()
         self.last_step.seconds = time.perf_counter() - t
+        if profiling.TIMELINE is not None:  # KILN_TIMELINE: what this step() call launched
+            st = self.last_step
+            profiling.record("step", t, t + st.seconds, st.num_decode, st.num_prefill_tokens, st.decode_calls,
+                             st.prefill_calls)
+        self._eplb_tick()  # after the step's own time (outside last_step.seconds)
         return finished
 
+    def _eplb_tick(self) -> None:
+        """KILN_EPLB_INTERVAL (models/eplb.py): every that many prefill graph calls, rebalance the redundant expert
+        slots from the counts recorded since the last rebalance, at most KILN_EPLB_MAX_REBALANCES times (0: no
+        limit). Non-blocking: ModelRunner.eplb_prepare starts the slots' loading on every rank's host thread and
+        each later step polls eplb_commit, which installs them once every rank is done (the only pause is that
+        commit: the calls in flight finish and the staged slots are copied in). Each one is logged in eplb_log:
+        (prefill calls when it started, slots moved over all ranks, seconds from start to commit, the commit's
+        pause in seconds, slots this rank reloaded)."""
+        every = self._eplb_every
+        if not every:
+            return
+        self._eplb_calls += self.last_step.prefill_calls
+        self._eplb_total += self.last_step.prefill_calls
+        if self._eplb_pending is not None:
+            moved = self.runner.eplb_commit()
+            if moved is not None:
+                t0, at = self._eplb_pending
+                self._eplb_pending = None
+                r = self.runner
+                self.eplb_log.append((at, moved, time.perf_counter() - t0, getattr(r, "eplb_commit_seconds", 0.0),
+                                      getattr(r, "eplb_loaded", 0)))
+                print(f"eplb: rebalance started after {at} prefill calls committed, {moved} slots moved, "
+                      f"{self.eplb_log[-1][2]:.2f} s to commit, paused {self.eplb_log[-1][3]:.3f} s", flush=True)
+            return
+        if self._eplb_calls < every or (self._eplb_max and len(self.eplb_log) >= self._eplb_max):
+            return
+        self._eplb_calls = 0
+        self._eplb_pending = (time.perf_counter(), self._eplb_total)
+        self.runner.eplb_prepare()
+
     def _overlap_ok(self) -> bool:
-        if self.cfg.spec_method:
+        if self.cfg.spec_method and not self.runner.spec_async:
             return False
         if getattr(self.mcfg.hybrid, "ple", None) is not None:  # n-gram ids are hashed from host tokens
             return False
@@ -494,7 +854,7 @@ class LLMEngine:
         self._verified_states(launches)
         finished = self._finish(plan, self.scheduler.update(plan, tokens), tokens)
         t4 = time.perf_counter()
-        if self.cfg.spec_method == "mtp":
+        if self.cfg.spec_method == "mtp" and not self.runner.spec_async:
             self._mtp_draft(launches)
             self.mtp_seconds += time.perf_counter() - t4
         if STEP_TIMES is not None:  # KILN_PROFILE_STEP=1: wall per phase, by the kinds the step launched
@@ -590,10 +950,13 @@ class LLMEngine:
 
     def _step_overlap(self) -> list[Request]:
         self.scheduler.in_flight = self._inflight is not None
+        t_sched = time.perf_counter()
         try:
             plan = self.scheduler.schedule()
         except NeedSync:
             return self._drain()
+        if profiling.TIMELINE is not None:
+            profiling.record("sched", t_sched, time.perf_counter())
         if not plan:
             return self._drain()
         launches = self._launch(plan)
@@ -613,6 +976,8 @@ class LLMEngine:
         return self._finish(plan, self.scheduler.commit(plan, tokens), tokens)
 
     def _launch(self, plan):
+        if self.pd_role == "decode":
+            self._pd_inject_plan(plan)
         if self.runner.mixed_rows and plan.prefills:
             return self._launch_mixed(plan)
         if self.dp > 1:
@@ -631,10 +996,18 @@ class LLMEngine:
         Q = 1 + self.cfg.spec_k
         for i in range(0, len(spec), max_b):
             chunk = spec[i : i + max_b]
+            if self.runner.spec_async:
+                launches.append((chunk, self.runner.verify_async(chunk, Q), "verify_async", self.runner.last_hidden,
+                                 self.runner.last_layout))
+                self.runner.mtp_async()
+                continue
             launches.append((chunk, self.runner.verify(chunk, Q), "verify", self.runner.last_hidden, None))
         for s in plan.prefills:
             launches.append(([s], self.runner.prefill(s), "prefill", self.runner.last_hidden, None))
-            self._mtp_fill_early(launches[-1][0], None)
+            if self.runner.spec_async:
+                self.runner.spec_after_prefill([s], self.runner.last_hidden, None)
+            else:
+                self._mtp_fill_early(launches[-1][0], None)
             self._save_states([s])
         self._step_stats(plan, launches)
         return launches
@@ -682,14 +1055,21 @@ class LLMEngine:
                 groups[s.req.dp_group].append(s)
             for i in range(0, max(len(g) for g in groups), per):
                 chunk = [s for g in groups for s in g[i : i + per]]
+                k_ = kind
                 if kind == "one":
                     out = self.runner.decode(chunk)
+                elif kind == "verify" and self.runner.spec_async:
+                    out, k_ = self.runner.verify_async(chunk, Q), "verify_async"
                 elif kind == "verify":
                     out = self.runner.verify(chunk, Q)
                 else:
                     out = self.runner.prefill(chunk)
-                launches.append((chunk, out, kind, self.runner.last_hidden, self.runner.last_layout))
-                if kind == "prefill":
+                launches.append((chunk, out, k_, self.runner.last_hidden, self.runner.last_layout))
+                if k_ == "verify_async":
+                    self.runner.mtp_async()
+                if kind == "prefill" and self.runner.spec_async:
+                    self.runner.spec_after_prefill(chunk, self.runner.last_hidden, self.runner.last_layout)
+                elif kind == "prefill":
                     self._mtp_fill_early(chunk, self.runner.last_layout)
                 if kind != "verify":
                     self._save_states(chunk)
@@ -759,7 +1139,14 @@ class LLMEngine:
         results: dict[int, object] = {}
         self._new_count = {}
         for chunk_, out_, kind_, _, lay in launches:
-            out_ = out_.cpu()
+            if kind_ == "verify_async":
+                self._collect_blind(chunk_, out_, lay, results)
+                continue
+            t_read = time.perf_counter()
+            with watchdog.watched(self.runner.watchdog, f"reading back a {kind_} call"):
+                out_ = out_.cpu()
+            if profiling.TIMELINE is not None:  # KILN_TIMELINE: the host waiting for this call's output
+                profiling.record("read", t_read, time.perf_counter(), kind_)
             for chunk, out, kind in (self._dp_parts(chunk_, out_, kind_, lay) if lay is not None
                                      else [(chunk_, out_, kind_)]):
                 if kind != "verify":  # a decode batch, or one prefill chunk
@@ -778,7 +1165,49 @@ class LLMEngine:
                     for b, s in enumerate(chunk):
                         results[id(s)] = self._accept(s, out[b * Q : (b + 1) * Q])
                         self._new_count[id(s)] = len(results[id(s)])
+        for xfer in plan.pd_injected:  # every rank has executed the copies: they precede the calls just read
+            self.pd_release(xfer)
+        plan.pd_injected = []
+        if self.pd_role == "decode" and self.pd_hold:
+            self._pd_cool()
         return [results[id(s)] for s in plan.seqs()]
+
+    def _collect_blind(self, chunk, outs, lay, results) -> None:
+        """A blind verify's read-back (engine/spec_async.py): spec_post's (tokens, acc) row per sequence gives the
+        emitted tokens; the verify's own rows give their logprobs, chosen as _accept chooses them (the draft's for
+        an accepted position, then the replacement's or the bonus token's)."""
+        out, res = outs
+        with watchdog.watched(self.runner.watchdog, "reading back a blind verify"):
+            out, res = out.cpu(), res.cpu()
+        Q = 1 + self.cfg.spec_k
+        N = NUM_TOP_LOGPROBS
+        for b, s in enumerate(chunk):
+            i = lay[b][0] // Q if lay is not None else b
+            row = res[i].tolist()
+            acc, drafted = int(row[Q]), row[Q + 1] > 0.5
+            new = [int(t) for t in row[: acc + 1]]
+            results[id(s)] = new
+            req = s.req
+            if drafted:  # a draftless row (its newest token from the host, spec_host_init) is a decode, as in _accept
+                self.spec_proposed += self.cfg.spec_k
+                self.spec_accepted += acc
+                self.spec_verifies += 1
+                req.spec_proposed += self.cfg.spec_k
+                req.spec_accepted += acc
+                for j in range(min(acc + 1, self.cfg.spec_k)):
+                    if j == len(self.spec_pos_reached):
+                        self.spec_pos_reached.append(0)
+                        self.spec_pos_accepted.append(0)
+                    self.spec_pos_reached[j] += 1
+                    self.spec_pos_accepted[j] += j < acc
+            n = req.params.logprobs
+            if n is not None and req.status is Status.RUNNING:
+                rows = out[i * Q : (i + 1) * Q].tolist()
+                for j in range(acc + 1):
+                    r_ = rows[j]
+                    # the draft's (accepted), the replacement's, the bonus token's; a draftless row's is y_0's
+                    lp = r_[5] if j < acc else (r_[4] if drafted and acc < self.cfg.spec_k else r_[3])
+                    req.logprobs.append((lp, [int(x) for x in r_[6 : 6 + n]], r_[6 + N : 6 + N + n]))
 
     def _watermark(self, req, tok, lp, top_ids, top_lps):
         """Replace the device's sample with a watermarked one (engine/watermark.py)."""
@@ -829,6 +1258,10 @@ class LLMEngine:
         finished += self._advance_grammars(seqs, tokens)
         if self.cfg.jump_forward and self.runner.grammar is not None:
             finished += self._jump_forward(seqs)
+        if self.pd_role == "prefill":
+            for r in finished:
+                if r.handoff is not None and r.handoff_meta is None:
+                    self._pd_handoff(r)
         for r in finished:
             self.runner.forget(r)
             if hasattr(self.proposer, "finish"):

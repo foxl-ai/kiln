@@ -58,11 +58,15 @@ def test_trn3_never_unsafe_fp8(monkeypatch):
 
 def test_configure_runtime_env(monkeypatch):
     monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)
+    hw = "NEURON_RT_ENABLE_HW_EXECUTION_BARRIER"
+    monkeypatch.setenv(hw, "x")  # records the state from before the test, so whatever is set below is undone
+    monkeypatch.delenv(hw)
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     platform.configure_runtime_env()
     import os
 
     assert os.environ["NEURON_LOGICAL_NC_CONFIG"] == "2"
+    assert hw not in os.environ  # trn2: the runtime's default barrier until measured there
     p = platform.detect()
     assert (p.family, p.lnc, p.nki_gen, p.hbm_gib_per_core, p.logical_cores_per_chip) == ("trn2", 2, 3, 24, 4)
     # Not monkeypatch.delenv: it would record the "2" just set and put it back at teardown (the line
@@ -70,4 +74,8 @@ def test_configure_runtime_env(monkeypatch):
     os.environ.pop("NEURON_LOGICAL_NC_CONFIG")
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn1")
     platform.configure_runtime_env()
-    assert "NEURON_LOGICAL_NC_CONFIG" not in os.environ  # trn1: nothing set
+    assert "NEURON_LOGICAL_NC_CONFIG" not in os.environ  # trn1: no LNC
+    assert os.environ[hw] == "1"  # trn1: the hardware execution barrier
+    monkeypatch.setenv(hw, "0")  # an explicit choice wins
+    platform.configure_runtime_env()
+    assert os.environ[hw] == "0"

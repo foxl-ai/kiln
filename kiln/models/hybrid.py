@@ -204,15 +204,30 @@ def _ple_layers(model) -> list:
     return [l for l in model.layers if getattr(l, "ple_slot", None) is not None]
 
 
+def _open_pool_layers(model) -> list:
+    """The pooled DSA layers in the minimal cache layout (models/mla.py KV_LAYOUT), in kv_layers() order."""
+    from . import mla as _mla
+
+    return [l for l in model.kv_layers() if l.spec.mla is not None and _mla.minimal_layout(l.spec.mla)]
+
+
 def aux_state_shapes(model) -> list[tuple[tuple[int, ...], torch.dtype]]:
-    """Per-request state rows beside the linear-attention ones: the PLE conv history."""
+    """Per-request state rows beside the linear-attention ones: the PLE conv history, then each minimal-layout DSA
+    layer's open pool (kpool rows of indexer key and gate logits, models/mla.py write_pool_keys_minimal)."""
     hy = model.cfg.hybrid
-    return [((hy.ple.conv_state_len, hy.hc * model.cfg.hidden_size), model.dtype) for _ in _ple_layers(model)]
+    out = [((hy.ple.conv_state_len, hy.hc * model.cfg.hidden_size), model.dtype) for _ in _ple_layers(model)]
+    for l in _open_pool_layers(model):
+        d = l.spec.mla.dsa
+        out.append(((d.kpool, 2 * d.head_dim), model.dtype))
+    return out
 
 
 def bind_aux_state(model, states: list[torch.Tensor]) -> None:
-    for l, s in zip(_ple_layers(model), states, strict=True):
+    ple = _ple_layers(model)
+    for l, s in zip(ple, states[: len(ple)], strict=True):
         l.ple_state = s
+    for l, s in zip(_open_pool_layers(model), states[len(ple):], strict=True):
+        l.open_pool = s
 
 
 # -- forward -----------------------------------------------------------------------------------
@@ -369,11 +384,22 @@ def sp_rs_enabled() -> bool:
 def _sp_route(model, layer, x: torch.Tensor):
     """(topv, topi) of every rank's rows, in rank order, from this rank's rows x [r, H]: routed here and
     gathered as one fp32 [R, 2k] tensor (DecoderForCausalLM._sp_gather: one rank's value plus zeros per
-    element, so the weights and the expert indices, integers below 2^24, come back exactly)."""
+    element, so the weights and the expert indices, integers below 2^24, come back exactly). A layer with
+    redundant expert slots (models/eplb.py) counts this rank's pairs per expert into ep_stats when recording, and
+    maps its ids to physical ones before the gather (only r rows here): then (topv, topi, True)."""
     topv, topi = model._route(layer, x)
     k = topi.shape[-1]
+    phys = bool(getattr(layer, "ep_s", 0))
+    if phys:
+        from . import eplb
+
+        st = getattr(layer, "ep_stats", None)
+        if st is not None and eplb.record_enabled():
+            st.add_(eplb.counts(topi, st.shape[0]))
+        topi = model._ep_phys(layer, topi, decode=False)
     both = model._sp_gather(torch.cat([topv.float(), topi.float()], dim=-1))
-    return both[:, :k].to(topv.dtype), both[:, k:].to(topi.dtype)
+    out = both[:, :k].to(topv.dtype), both[:, k:].to(topi.dtype)
+    return (*out, True) if phys else out
 
 
 def _sp_out(model, fn, rs: bool):
@@ -435,6 +461,9 @@ def _mix(model, layer, x, positions, slot_mapping, table, bias, state_slot, seq,
     if sp.mla is not None:
         if seq is not None:
             return model._attn_all_reduce(_mla.reference(model, layer, x, positions, seq))
+        if _mla.minimal_layout(sp.mla):  # its open pool lives in the request's state row
+            return model._attn_all_reduce(_mla.attention(model, layer, x, positions, slot_mapping, table, bias,
+                                                         mixed=mixed, state_slot=state_slot))
         return model._attn_all_reduce(_mla.attention(model, layer, x, positions, slot_mapping, table, bias,
                                                      mixed=mixed))
     if mixed is not None:
@@ -455,9 +484,10 @@ def _moe_clamped(model, layer, x: torch.Tensor, limit: float, route=None) -> tor
     """DecoderForCausalLM._moe_routed with Glm5NextTextExperts' clamped SwiGLU, both of its forms.
     route: (topv, topi) of x's rows made elsewhere (_sp_route), instead of routing x here."""
     cfg = model.cfg
-    topv, topi = model._route(layer, x) if route is None else route
+    topv, topi = model._route(layer, x) if route is None else route[:2]
+    phys = route is not None and len(route) > 2 and route[2]  # _sp_route mapped the ids already (models/eplb.py)
     if getattr(layer, "moe_ep", False):  # expert parallel (models/decoder.py moe_ep_enabled)
-        return model._moe_ep(layer, x, topv, topi, 1, limit)
+        return model._moe_ep(layer, x, topv, topi, 1, limit, phys=phys)
     T, H = x.shape
     k, Im = cfg.num_experts_per_tok, model.moe_inter
 

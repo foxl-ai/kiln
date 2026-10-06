@@ -56,7 +56,8 @@ def free_port() -> int:
 
 # Process state init_rank / neuron_env change in the calling process, which rank 0 (the engine's
 # own process: a server, a test session) restores on LLMEngine.close.
-_ENV_KEYS = ("MASTER_ADDR", "MASTER_PORT", "NEURON_RT_VISIBLE_CORES", "NEURON_RT_ROOT_COMM_ID")
+_ENV_KEYS = ("MASTER_ADDR", "MASTER_PORT", "NEURON_RT_VISIBLE_CORES", "NEURON_RT_ROOT_COMM_ID", "NEURON_RT_INSPECT_ENABLE",
+             "NEURON_RT_INSPECT_OUTPUT_DIR")
 
 
 def process_state() -> dict:
@@ -80,6 +81,13 @@ def neuron_env(rank: int, port: int, core_base: int) -> None:
     """Must run before libtorch_neuronx_lite is imported in this process."""
     os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_base + rank)
     os.environ["NEURON_RT_ROOT_COMM_ID"] = f"127.0.0.1:{port + 1}"
+    # KILN_RT_INSPECT=<dir>: the Neuron runtime's system trace (NEURON_RT_INSPECT_ENABLE, every execution's
+    # start and end on the device, ntrace.pb) for the ranks in KILN_RT_INSPECT_RANKS (default "0"), each
+    # under <dir>/r<rank>; tools/util_report.py systrace reads it. Off by default.
+    insp = os.environ.get("KILN_RT_INSPECT")
+    if insp and str(rank) in os.environ.get("KILN_RT_INSPECT_RANKS", "0").split(","):
+        os.environ["NEURON_RT_INSPECT_ENABLE"] = "1"
+        os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"] = os.path.join(insp, f"r{rank}")
 
 
 def init_rank(rank: int, world: int, port: int) -> None:

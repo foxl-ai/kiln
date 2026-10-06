@@ -213,7 +213,8 @@ def cmd_decisions(a) -> None:
 
 # The tools whose EngineConfig a capture can rebuild: module, directory, and whether engine_config
 # takes the model path (the check tools resolve it in main()).
-TOOLS = {"serve_sweep": ("bench", False), "check_device": ("tools", True), "check_ppl": ("tools", True)}
+TOOLS = {"serve_sweep": ("bench", False), "check_device": ("tools", True), "check_ppl": ("tools", True),
+         "check_long": ("tools", True)}
 
 
 def _tool(name: str):
@@ -337,7 +338,7 @@ def cmd_capture(a) -> None:
 
     dec = capture.read_decisions(a.shape_dir)
     tool_path = {"serve_sweep": "bench/serve_sweep.py", "check_device": "tools/check_device.py",
-                 "check_ppl": "tools/check_ppl.py"}[a.tool]
+                 "check_ppl": "tools/check_ppl.py", "check_long": "tools/check_long.py"}[a.tool]
     with open(os.path.join(a.out_dir, "config.json"), "w") as f:
         json.dump({"target": a.target, "tool": a.tool, "argv": a.sweep, "env": env,
                    "command": " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()

@@ -6,8 +6,9 @@
 Builds the engine exactly as the sweep does (serve_sweep.engine_config, real weights), then
 launches the first decode bucket's step --steps times on rows of random token ids (so the MoE
 routing spreads over experts as real tokens do, unlike warmup's all-zero rows). The KV rows are
-the null page, as in warmup; every graph has static shapes, so the work per step is the work of a
-step at that bucket. Prints the p50 of each piece (KILN_PROFILE_PIECES: prep, every layer group,
+the null page, as in warmup (a step-only, null-page number: every row reads one page), or with --real-kv every
+row's own pages (random contents) at the sweep's context; every graph has static shapes, so the work per step is the
+work of a step at that bucket. Prints the p50 of each piece (KILN_PROFILE_PIECES: prep, every layer group,
 post, each timed synchronously on rank 0) and of the whole step (KILN_PROFILE_EXEC), the first
 `--skip` steps dropped. Only decode graphs are built: with the farm (tools/compile_farm.py capture
 --skip-prefill) they come from the compile cache.
@@ -53,6 +54,10 @@ def main() -> None:
                          "(KILN_PROFILE_PIECES; the wall line is the plain pass's)")
     ap.add_argument("--price", type=lambda v: (v.split("=")[0], float(v.split("=")[1])), action="append",
                     default=[], help="name=dollars_per_hour for the decode-only $ per 1M output tokens")
+    ap.add_argument("--real-kv", action="store_true",
+                    help="every row its own pages (distinct ids through each group's pool, filled once with random "
+                         "values, fp8 clamped) at a context of the sweep's --input-len plus a spread of its "
+                         "--output-len, and its own state row; refuses a bucket whose rows do not fit the pool")
     ap.add_argument("sweep", nargs=argparse.REMAINDER)
     a = ap.parse_args()
     sweep = a.sweep[1:] if a.sweep[:1] == ["--"] else a.sweep
@@ -64,7 +69,7 @@ def main() -> None:
     from kiln.engine.model_runner import BOARD
 
     args = serve_sweep.build_parser().parse_args(sweep)
-    cfg = serve_sweep.engine_config(args)
+    cfg = serve_sweep.engine_config(args, args.core_base)  # --core-base: a disjoint core range of a shared box
     t0 = time.perf_counter()
     eng = LLMEngine(cfg)
     print(f"engine up {time.perf_counter() - t0:.1f}s cc_args={os.environ.get('KILN_CC_ARGS', '')!r}", flush=True)
@@ -75,10 +80,20 @@ def main() -> None:
         buckets = [int(b) for b in a.buckets.split(",")]
     else:
         buckets = list(r.decode_buckets) if a.all_buckets else list(r.decode_buckets[:1])
+    if a.real_kv:
+        lps = getattr(r, "lps", r.ps)  # cache rows per page on a rank (context-parallel DSA: ps / cp)
+        npg = r._paged_caches()[0].shape[0] // lps
+        t0 = time.perf_counter()
+        for s0 in range(lps, npg * lps, 4096):  # every page but the null page, on every rank of every group
+            r.fill_slots(s0, min(npg * lps, s0 + 4096), a.seed + s0)
+        print(f"real KV: {npg} pages per group pool filled in {time.perf_counter() - t0:.1f}s", flush=True)
     rows = []
     for B in buckets:
         P, N = r.page_buckets[0], r.dp
-        host, p50 = _decode_bucket(a, r, B, P, N, rng, vocab, mr, NULL_PAGE, BOARD)
+        if a.real_kv:
+            host, p50 = _decode_bucket_real(a, r, B, P, N, rng, vocab, mr, NULL_PAGE, BOARD, args)
+        else:
+            host, p50 = _decode_bucket(a, r, B, P, N, rng, vocab, mr, NULL_PAGE, BOARD)
         if p50 is not None:
             rows.append((B, N, p50))
         if cfg.spec_method == "mtp":
@@ -86,7 +101,8 @@ def main() -> None:
             time_spec(r, a, rng, vocab, B, P, N, None if a.skip_decode or cfg.spec_merged else host)
             report(mr)
     for B, N, p50 in rows:
-        line = f"curve B={B} rows/step={N * B} step_ms={p50 * 1e3:.2f} tok_s={N * B / p50:.1f}"
+        line = (f"curve B={B} rows/step={N * B} step_ms={p50 * 1e3:.2f} tok_s={N * B / p50:.1f} "
+                f"kv={'real' if a.real_kv else 'null-page'}")
         for name, usd in a.price:
             line += f" usd_per_m_out[{name}]={usd / 3600 / (N * B / p50) * 1e6:.3f}"
         print(line, flush=True)
@@ -130,6 +146,67 @@ def _decode_bucket(a, r, B, P, N, rng, vocab, mr, NULL_PAGE, BOARD):
     wall.sort()
     print(f"B={B} rows/group, {N * B} rows/step: wall p50 {wall[len(wall) // 2] * 1e3:.3f} ms min {wall[0] * 1e3:.3f}"
           f" -> {N * B / wall[len(wall) // 2]:.1f} out tok/s", flush=True)
+    return host, wall[len(wall) // 2]
+
+
+def _decode_bucket_real(a, r, B, P, N, rng, vocab, mr, NULL_PAGE, BOARD, sweep_args):
+    """_decode_bucket with real KV: in every group row b holds pages 1 + b S .. of its own (S the pages its context
+    can reach; the pool's first B S pages after the null page, filled by --real-kv's fill_slots), its context L = --input-len + 1 + a spread over
+    --output-len (positions L - 1, the new token's slot in its last page) and state row 1 + b, as
+    ModelRunner.decode builds a running batch's arguments."""
+    ps = r.ps
+    npg = r._paged_caches()[0].shape[0] // getattr(r, "lps", ps)
+    base, span = sweep_args.input_len, max(1, sweep_args.output_len)
+    stride = min(P, -(-(base + span) // ps))  # pages a row can reach (the page bucket may be wider than the context)
+    if 1 + B * stride > npg:
+        raise SystemExit(f"--real-kv: {B} rows x {stride} pages need {1 + B * stride} pages per group, the pool has {npg}")
+    if r.state is not None and r.state.rows < 1 + B:
+        raise SystemExit(f"--real-kv: {B} rows need {1 + B} state rows, the pool has {r.state.rows}")
+    pos = np.zeros((N, B), np.int64)
+    table = np.full((N, B, P), NULL_PAGE, np.int64)
+    ctx = np.ones((N, B), np.int64)
+    slot = np.zeros((N, B), np.int64)
+    srow = np.zeros((N, B), np.int64)
+    for g in range(N):
+        for b in range(B):
+            L = min(P * ps, base + 1 + (37 * b + 11 * g) % span)
+            n = -(-L // ps)
+            pages = 1 + b * stride + np.arange(n)
+            table[g, b, :n] = pages
+            pos[g, b], ctx[g, b] = L - 1, L
+            slot[g, b] = pages[(L - 1) // ps] * ps + (L - 1) % ps
+            srow[g, b] = 1 + b
+    G = r._grp
+    host = [rng.integers(min(1000, vocab // 2), vocab, N * B).astype(np.int64), G(pos), G(table), G(ctx), G(slot),
+            *r._sampling([None] * (N * B)), BOARD, np.full(N * B, -1, np.int64), np.full(N * B, r.scratch_slot, np.int64)]
+    Pw = r._swa_pages(1, P)
+    if Pw:
+        raise SystemExit("--real-kv: sliding-window layers not covered")
+    host = r._with_state("decode", host, G(srow))
+    host = r._with_ngram("decode", host, [], N * B)
+    print(f"B={B}: real KV, contexts {int(ctx.min())}..{int(ctx.max())} tokens, {int((ctx // ps + 1).sum())} pages "
+          f"over {N} groups", flush=True)
+    t0 = time.perf_counter()
+    r._exec("decode", ("decode", B, P), host)
+    print(f"B={B}: first step (graph load or compile) {time.perf_counter() - t0:.1f}s", flush=True)
+    wall = []
+    for pieces in ([False, True] if a.pieces else [mr.PROFILE]):
+        mr.PROFILE = pieces
+        mr.PIECE_TIMES.clear()
+        mr.EXEC_TIMES.clear()
+        for i in range(a.steps + a.skip):
+            if i == a.skip:
+                mr.PIECE_TIMES.clear()
+                mr.EXEC_TIMES.clear()
+            host[0] = rng.integers(min(1000, vocab // 2), vocab, N * B).astype(np.int64)
+            t = time.perf_counter()
+            r._exec("decode", ("decode", B, P), host).cpu()
+            if i >= a.skip and not (a.pieces and pieces):
+                wall.append(time.perf_counter() - t)
+    report(mr, f"B={B} ")
+    wall.sort()
+    print(f"B={B} rows/group, {N * B} rows/step (real KV): wall p50 {wall[len(wall) // 2] * 1e3:.3f} ms min "
+          f"{wall[0] * 1e3:.3f} -> {N * B / wall[len(wall) // 2]:.1f} out tok/s", flush=True)
     return host, wall[len(wall) // 2]
 
 

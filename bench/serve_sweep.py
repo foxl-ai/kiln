@@ -81,8 +81,13 @@ def build_parser() -> argparse.ArgumentParser:
     # instead of the default power-of-two ladders, and compiles them before the clock starts.
     ap.add_argument("--decode-buckets", default=None, help="comma list (per DP-attention group)")
     ap.add_argument("--page-buckets", default=None, help="comma list of pages per sequence")
+    ap.add_argument("--page-size", type=int, default=0,
+                    help="tokens per KV page (default the engine's 32); context-parallel DSA wants 32 x attention TP")
     ap.add_argument("--prefill-buckets", default=None, help="comma list of chunk sizes (per group)")
     ap.add_argument("--warmup", action="store_true", help="compile every bucket before timing")
+    ap.add_argument("--skip-warm-request", action="store_true",
+                    help="no full-length warm-up request after the bucket warmup (a 1M one is ~30 min): the first level's "
+                         "TTFT then includes the first loads of the graphs the bucket warmup did not run; ITL does not")
     # Every loaded NEFF reserves its own DMA-ring spill memory (docs/neuron-notes.md "HBM per
     # NeuronCore"), so on trn1 a big model runs ONE decode bucket per engine: one sweep run per
     # concurrency level. max_num_seqs is a graph input shape (state-pool rows, KV pool), so it is
@@ -124,6 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "per value on one engine, each from a flushed cache with the same requests")
     ap.add_argument("--dp-prefill-pack-min", type=int, default=None)
     ap.add_argument("--dp-prefill-hold-steps", type=int, default=None)
+    ap.add_argument("--eplb-rebalance", action="store_true",
+                    help="after every level, rebalance the redundant expert slots (KILN_EP_REDUNDANT, models/eplb.py) "
+                         "from the counts that level recorded: a level repeated (--concurrency 64 64) then measures the "
+                         "placement a warm-up window gives; the pause is printed, outside both levels")
+    ap.add_argument("--eplb-dump", default=None, help="with --eplb-rebalance: save each level's all-reduced counts "
+                                                       "to <this>.L<level>.pt (KILN_EPLB_INIT files)")
     ap.add_argument("--keep-cache", action="store_true",
                     help="do not flush the prefix cache between levels: a level repeated (--shared-prefix-len N N) "
                          "then measures a warm cache, a server's steady state")
@@ -168,6 +179,7 @@ def engine_config(args, core_base: int = 0):
            if getattr(args, "state_checkpoint_interval", None) is not None else {}),
         **({"state_checkpoint_lookahead": False} if getattr(args, "no_ckpt_lookahead", False) else {}),
         **({"hicache_host_gb": args.hicache_host_gb} if getattr(args, "hicache_host_gb", 0) else {}),
+        **({"page_size": args.page_size} if getattr(args, "page_size", 0) else {}),
     )
 
 
@@ -184,6 +196,8 @@ def warm(eng, args, prompt, params, reverse: bool = False) -> None:
     if args.warmup:
         w = eng.warmup(reverse=reverse)
         print(f"bucket warmup {w['seconds']:.1f}s over {w['graphs']} graphs", flush=True)
+    if getattr(args, "skip_warm_request", False):
+        return
     t = time.perf_counter()
     eng.generate([getattr(prompt, "unique", prompt)()], params() if callable(params) else params)
     print(f"warm-up request {time.perf_counter() - t:.1f}s (includes compiles)", flush=True)
@@ -216,6 +230,10 @@ def run_level(eng, args, conc: int, n_req: int, prompt, params):
         live = still
         running.append(sum(r.status == Status.RUNNING for r in live))
     wall = time.perf_counter() - t0
+    from kiln import profiling
+
+    profiling.record("level", t0, t0 + wall, conc, len(done))  # KILN_TIMELINE
+    profiling.flush()
     kv_report(eng, args, conc, running, done)
     if eng.cfg.spec_method:
         spec_report(eng, conc, spec0, wall)
@@ -525,6 +543,16 @@ def main() -> None:
                                                   mixes[n] if n else prompt, params)
                     rows.append({**summarize(conc, recs, wall, prices, providers, split), "shared_prefix_len": n,
                                  **({"dp_prefill_pack": pack} if pack else {})})
+                    if args.eplb_rebalance:
+                        t = time.perf_counter()
+                        dump = f"{args.eplb_dump}.L{len(rows)}.pt" if args.eplb_dump else None
+                        moved = eng.runner.eplb_rebalance(dump=dump)
+                        r = eng.runner
+                        print(f"eplb: rebalanced after the level, {moved} redundant slots moved over all ranks and "
+                              f"layers, rank 0 reloaded {getattr(r, 'eplb_loaded', 0)} in "
+                              f"{getattr(r, 'eplb_load_seconds', 0.0):.2f} s on its host thread, commit pause "
+                              f"{getattr(r, 'eplb_commit_seconds', 0.0):.3f} s, {time.perf_counter() - t:.2f} s in all",
+                              flush=True)
         print_profile()
     else:
         import multiprocessing as mp

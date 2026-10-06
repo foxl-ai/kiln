@@ -685,11 +685,24 @@ def _mix_joint(model, layer, x: torch.Tensor, positions: torch.Tensor, slot_mapp
     scan = _nki_chunk if nki else (lambda *a: chunk_scan(*a, CHUNK or CHUNKS[sp.kind]))
     o_c, S_c = scan(qc, kc, v[:C], g_c, beta_c, S_c)
     # The decode rows: one recurrent step each from its own row.
-    S_d = layer.rec_state[dec_state]
-    S_d = torch.where(keep_d.view(D, 1, 1, 1), S_d, torch.zeros_like(S_d))
-    o_d, S_d = recurrent_step(heads(q[C:], D), heads(k[C:], D), v[C:], g[C:], beta[C:], S_d)
-    _write_rows(layer.rec_state, torch.cat([state_slot, dec_state]), torch.cat([S_c.unsqueeze(0), S_d]))
-    o = torch.cat([o_c, o_d])
+    from . import mla
+    from ..kernels import kda_decode
+
+    if (mla.MIXED_KERNELS and kda_decode.KERNEL == "nki" and x.device.type != "cpu"
+            and kda_decode.takes(dk, dv, sp.kind == "kda" and g.dim() == 3)):
+        # The KDA decode kernel, as _mix_rows runs a decode call: it reads and writes the decode rows' pool rows
+        # itself, in place. The chunk's row (another request's) is written first, so the kernel's in-place update is
+        # the pool's last write in this layer, as in an unmixed decode graph.
+        _write_rows(layer.rec_state, state_slot, S_c.unsqueeze(0))
+        o_d = kda_decode.decode_step(layer.rec_state, dec_state, keep_d.view(D), heads(q[C:], D), heads(k[C:], D),
+                                     v[C:], g[C:], beta[C:])
+        o = torch.cat([o_c, o_d])
+    else:
+        S_d = layer.rec_state[dec_state]
+        S_d = torch.where(keep_d.view(D, 1, 1, 1), S_d, torch.zeros_like(S_d))
+        o_d, S_d = recurrent_step(heads(q[C:], D), heads(k[C:], D), v[C:], g[C:], beta[C:], S_d)
+        _write_rows(layer.rec_state, torch.cat([state_slot, dec_state]), torch.cat([S_c.unsqueeze(0), S_d]))
+        o = torch.cat([o_c, o_d])
     of = o.to(dt).float()
     of = of * torch.rsqrt(of.pow(2).mean(-1, keepdim=True) + cfg.rms_norm_eps)
     if sp.kind == "gdn":

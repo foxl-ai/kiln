@@ -187,6 +187,30 @@ def test_glm5_next_mixed_decode_split(glm, monkeypatch):
           max_num_seqs=4)
 
 
+@pytest.mark.parametrize("pool", ["inplace", "separate"])
+def test_glm5_next_mixed_dsa_kernels(glm, monkeypatch, pool):
+    """KILN_MIXED_KERNELS (default on): a mixed call's chunk rows take the fused selection-and-attention kernel and its
+    decode rows the DSA decode kernel (their host emulations here) where an unmixed call of the same rows does
+    (models/mla.py attention_joint), so mixed and unmixed engines with both kernels on agree; each branch ran."""
+    from kiln.kernels import dsa_decode, dsa_fused
+    from kiln.models import mla
+
+    monkeypatch.setattr(mla, "POOL_CACHE", pool)
+    monkeypatch.setattr(dsa_fused, "FUSED", True)
+    monkeypatch.setattr(dsa_decode, "KERNEL", "nki")
+    seen = {"fused": 0, "decode": 0}
+    real_f, real_d = mla._fused_rows, mla._decode_rows
+    monkeypatch.setattr(mla, "_fused_rows", lambda *a: seen.__setitem__("fused", seen["fused"] + 1) or real_f(*a))
+    monkeypatch.setattr(mla, "_decode_rows", lambda *a: seen.__setitem__("decode", seen["decode"] + 1) or real_d(*a))
+    ps = prompts(19, (5, 300, 9, 200, 41, 130))
+    # The fused kernel's shapes (dsa_fused.supported): key buckets of whole 128-key tiles, chunks of whole query tiles;
+    # prompts of 2-3 chunks, so that decodes ride in the later chunks' calls.
+    kw = dict(page_size=32, num_pages=96, page_buckets=(4, 8, 12), max_model_len=384, max_prefill_tokens=128,
+              prefill_token_buckets=(128,))
+    check(glm, ps, [{}, dict(piecewise=True, piecewise_group=2), dict(overlap=True)], **kw)
+    assert seen["fused"] > 0 and seen["decode"] > 0, seen
+
+
 def test_qwen3_mixed(tmp_path):
     """Plain GQA attention layers (DecoderForCausalLM._gqa per batch form), plain and DP attention."""
     build_arch("qwen3", str(tmp_path))

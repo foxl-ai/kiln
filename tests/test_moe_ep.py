@@ -163,6 +163,42 @@ def test_emulation_is_the_local_pairs_sum():
     assert err < 0.02
 
 
+def test_small2_emulation_mixes_the_two_arithmetics():
+    """kiln_moe_ep_small2 (KILN_MOE_EP_SMALL_V=2) runs a local expert with at most SMALL_LW pairs by the small-lane
+    arithmetic (expert_out_small) and one with more by the dequantize-first one (expert_out), small ones first, each
+    group in local-expert order; emulate(small=2) is that, and equals the composition done by hand here."""
+    from kiln.kernels import moe_ep
+
+    H, I, E, K, El, rank, T = 512, 256, 8, 2, 4, 1, 48
+    ws = _experts(El, H, I, seed=5, block=True)
+    owner = torch.arange(E) // El
+    lmap = moe_ep.local_map(owner, rank)
+    g = torch.Generator().manual_seed(6)
+    x = torch.randn(T, H, generator=g).bfloat16()
+    topi = torch.stack([torch.randperm(E, generator=g)[:K] for _ in range(T)])
+    topi[:20, 0] = 4  # local expert 0 (expert 4 on rank 1) gets more than SMALL_LW pairs
+    topi[:20, 1] = torch.where(topi[:20, 1] == 4, 5, topi[:20, 1])
+    topv = (torch.rand(T, K, generator=g) + 0.1).bfloat16()
+    loc = lmap.view(-1)[topi]
+    n = [int((loc == le).sum()) for le in range(El)]
+    assert n[0] > moe_ep.SMALL_LW and any(0 < c <= moe_ep.SMALL_LW for c in n[1:])
+    got = moe_ep.emulate(x, topv, topi, lmap, *ws, act=1, lim=10.0, small=2)
+    out = torch.zeros(T, H, dtype=torch.bfloat16)
+    order = [le for le in range(El) if n[le] <= moe_ep.SMALL_LW] + [le for le in range(El) if n[le] > moe_ep.SMALL_LW]
+    for le in order:
+        t, k = (loc == le).nonzero(as_tuple=True)
+        if not t.numel():
+            continue
+        args = (x[t], ws[0][le], ws[1][le], ws[2][le], ws[3][le], 1, 10.0)
+        y = moe_ep.expert_out(*args, rounded=False) if n[le] > moe_ep.SMALL_LW else moe_ep.expert_out_small(*args)
+        out[t] = (out[t].float() + (y * topv[t, k].float().unsqueeze(1)).bfloat16().float()).bfloat16()
+    assert torch.equal(got, out)
+    small1 = moe_ep.emulate(x, topv, topi, lmap, *ws, act=1, lim=10.0, small=True).float()
+    err = (got.float() - small1).abs().max().item() / small1.abs().max().item()
+    print(f"small2 vs small-lane emulation: rel {err:.4f}")
+    assert err < 0.02
+
+
 def test_ep_default_is_glm5_next_on_trn1(monkeypatch):
     """KILN_MOE_EP unset (auto): on for the glm5_next family (GLM-5.3-Flash) on trn1 / trn1n and on a host without
     a Neuron device, off for other models and on trn2 / trn3 / inf2 (not measured there); 1 / 0 force it; the
@@ -212,13 +248,18 @@ def test_ep_default_builds_glm5_next_expert_parallel(tmp_path, monkeypatch):
 
 
 def test_ep_default_needs_eight_decode_rows_per_group(tmp_path, monkeypatch):
-    """The automatic default stays off below 8 decode rows per DP-attention group (max_num_seqs / dp_attention):
-    G16's 16 sequences over 4 groups (4 rows) measured EP 2.9% below TP, F0's 32 over 4 (8 rows) 8.9% above
-    (models/decoder.py moe_ep_enabled); KILN_MOE_EP=1 still forces it, and an unknown max_num_seqs leaves it on."""
+    """Under KILN_MOE_EP_SMALL_V=1 the automatic default stays off below 8 decode rows per DP-attention group
+    (max_num_seqs / dp_attention): G16's 16 sequences over 4 groups (4 rows) measured EP 2.9% below TP, F0's 32 over 4
+    (8 rows) 8.9% above (models/decoder.py moe_ep_enabled); KILN_MOE_EP=1 still forces it, and an unknown max_num_seqs
+    leaves it on."""
     pytest.importorskip("transformers.models.glm5_next.modeling_glm5_next")
     from kiln.config import ModelConfig
     from kiln.models.decoder import DecoderForCausalLM
     from tests.test_glm5_next import build
+
+    import importlib
+
+    from kiln.kernels import moe_ep
 
     monkeypatch.delenv("KILN_MOE_EP", raising=False)
     monkeypatch.delenv("NEURON_PLATFORM_TARGET_OVERRIDE", raising=False)
@@ -229,8 +270,39 @@ def test_ep_default_needs_eight_decode_rows_per_group(tmp_path, monkeypatch):
         with torch.device("meta"):
             return DecoderForCausalLM(glm, torch.float32, 64, 0, 4, dp_attention=dp, max_num_seqs=seqs).moe_ep
 
-    assert not ep(4, 16) and ep(4, 32) and ep(4, 64)  # G16 / F0 / G64
-    assert not ep(1, 4) and ep(1, 8) and ep(2, 16) and not ep(2, 15)
+    monkeypatch.setenv("KILN_MOE_EP_SMALL_V", "1")
+    try:
+        importlib.reload(moe_ep)
+        assert not ep(4, 16) and ep(4, 32) and ep(4, 64)  # G16 / F0 / G64
+        assert not ep(1, 4) and ep(1, 8) and ep(2, 16) and not ep(2, 15)
+        assert ep(4, None)
+    finally:
+        monkeypatch.delenv("KILN_MOE_EP_SMALL_V", raising=False)
+        importlib.reload(moe_ep)
+
+
+def test_ep_default_needs_four_decode_rows_per_group(tmp_path, monkeypatch):
+    """With the default decode kernel (kiln_moe_ep_small2) the automatic default turns expert parallelism on from 4
+    decode rows per DP-attention group: conc 16 at 4 rows per group measured EP v2 98.0 against TP 86.9 out tok/s
+    (models/decoder.py moe_ep_enabled); below that it stays on TP, unmeasured."""
+    pytest.importorskip("transformers.models.glm5_next.modeling_glm5_next")
+    from kiln.config import ModelConfig
+    from kiln.kernels import moe_ep
+    from kiln.models.decoder import DecoderForCausalLM, ep_auto_min_decode_rows
+    from tests.test_glm5_next import build
+
+    monkeypatch.delenv("KILN_MOE_EP", raising=False)
+    monkeypatch.delenv("NEURON_PLATFORM_TARGET_OVERRIDE", raising=False)
+    assert moe_ep.SMALL_V == 2 and ep_auto_min_decode_rows() == 4
+    build(str(tmp_path))
+    glm = ModelConfig.from_pretrained(str(tmp_path))
+
+    def ep(dp, seqs):
+        with torch.device("meta"):
+            return DecoderForCausalLM(glm, torch.float32, 64, 0, 4, dp_attention=dp, max_num_seqs=seqs).moe_ep
+
+    assert ep(4, 16) and ep(4, 32) and ep(4, 64) and not ep(4, 15)  # G16 / F0 / G64
+    assert ep(1, 4) and not ep(1, 3) and ep(2, 8) and not ep(2, 7)
     assert ep(4, None)
     monkeypatch.setenv("KILN_MOE_EP", "1")
     assert ep(4, 16)
@@ -316,3 +388,34 @@ def test_expert_parallel_layers_hold_whole_experts(tmp_path, monkeypatch):
     assert l.w_gu.shape == (2, 2 * cfg.moe_intermediate_size, cfg.hidden_size)
     assert l.router.shape[0] == cfg.num_experts
     assert l.ep_lmap.tolist() == [[2, 2, 0, 1, 2, 2, 2, 2, 2]]
+
+
+def test_small_kernel_default_is_v2(monkeypatch):
+    """KILN_MOE_EP_SMALL_V unset runs kiln_moe_ep_small2 (one pass per local expert with pairs) for decode-sized calls,
+    and the host emulation then follows its arithmetic (small=2); v1 stays selectable by the variable."""
+    import importlib
+
+    from kiln.kernels import moe_ep
+
+    monkeypatch.delenv("KILN_MOE_EP_SMALL_V", raising=False)
+    try:
+        m = importlib.reload(moe_ep)
+        assert m.SMALL_V_DEFAULT == 2 and m.SMALL_V == 2
+        H, I, E, K, El, rank, T = 512, 256, 8, 2, 4, 1, 48
+        ws = _experts(El, H, I, seed=7, block=True)
+        lmap = m.local_map(torch.arange(E) // El, rank)
+        g = torch.Generator().manual_seed(8)
+        x = torch.randn(T, H, generator=g).bfloat16()
+        topi = torch.stack([torch.randperm(E, generator=g)[:K] for _ in range(T)])
+        topi[:20, 0] = 4
+        topi[:20, 1] = torch.where(topi[:20, 1] == 4, 5, topi[:20, 1])
+        topv = (torch.rand(T, K, generator=g) + 0.1).bfloat16()
+        assert m.uses_small(T)
+        assert torch.equal(m.emulate(x, topv, topi, lmap, *ws), m.emulate(x, topv, topi, lmap, *ws, small=2))
+        monkeypatch.setenv("KILN_MOE_EP_SMALL_V", "1")
+        m = importlib.reload(moe_ep)
+        assert m.SMALL_V == 1
+        assert torch.equal(m.emulate(x, topv, topi, lmap, *ws), m.emulate(x, topv, topi, lmap, *ws, small=True))
+    finally:
+        monkeypatch.delenv("KILN_MOE_EP_SMALL_V", raising=False)
+        importlib.reload(moe_ep)

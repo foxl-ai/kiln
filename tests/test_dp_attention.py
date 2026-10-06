@@ -404,7 +404,7 @@ def test_sequence_parallel_streams_default_per_platform(monkeypatch):
 
 def test_sp_group_collectives_default_per_platform(monkeypatch):
     """KILN_SP_GROUP=auto (the default): the token mixers' group gather and group reduce-scatter on the trn1
-    families, where they are measured (models/decoder.py SP_GROUP_FAMILIES), off on trn2, trn3 and inf2;
+    families and trn2, where they are measured (models/decoder.py SP_GROUP_FAMILIES), off on trn3 and inf2;
     KILN_SP_GROUP=1 / 0 force it either way."""
     from kiln.models import decoder as hybrid
 
@@ -413,11 +413,12 @@ def test_sp_group_collectives_default_per_platform(monkeypatch):
             monkeypatch.delenv("KILN_SP_GROUP", raising=False)
         else:
             monkeypatch.setenv("KILN_SP_GROUP", v)
-        for target, want in (("trn1", True), ("trn1n", True), ("trn2", False), ("trn3", False), ("inf2", False)):
+        for target, want in (("trn1", True), ("trn1n", True), ("trn2", True), ("trn3", False), ("inf2", False)):
             monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", target)
             assert hybrid.sp_group_enabled() is want, (v, target)
     monkeypatch.setenv("KILN_SP_GROUP", "1")
-    assert hybrid.sp_group_enabled()  # trn2 above, forced on
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn3")
+    assert hybrid.sp_group_enabled()  # trn3, forced on
     monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn1")
     monkeypatch.setenv("KILN_SP_GROUP", "0")
     assert not hybrid.sp_group_enabled()

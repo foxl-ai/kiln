@@ -409,3 +409,113 @@ def test_clamped_moe_reads_a_128_block_tile_blob_exactly():
     a = hybrid._moe_clamped(m, nat, x, 0.05)
     b = hybrid._moe_clamped(m, tiles, x, 0.05)
     assert torch.equal(a, b)
+
+
+def test_one_call_up_to_256_tokens_fits_the_slot_bound():
+    """kiln_moe_dedupe_v9 takes 129-256 tokens in one call while the static slot count fits its slot table (SLOTS9):
+    GLM-5.3-Flash's rank shapes (288 experts, top-8, lanes 8) at 192 and 256 rows; v8's 128-token calls are unchanged."""
+    assert mdd.n_slots(192, 8, 288, 8) == (448, 128)
+    assert mdd.n_slots(256, 8, 288, 8) == (512, 128)
+    assert mdd.n_slots(128, 8, 288, 8) == (384, 128) and mdd.n_slots(64, 8, 288, 4) == (352, 128)
+    assert mdd.fits(192, 8, 288) and mdd.fits(256, 8, 288) and mdd.fits(128, 8, 288)
+    assert not mdd.fits(257, 8, 288)
+    assert not mdd.fits(256, 8, 512)  # 704 slots: more than one PSUM row
+    assert mdd.fits(200, 8, 288) and mdd.fits(256, 8, 288, 8)  # 1600 / 2048 pairs
+    x, topv, topi = routing(192, E=288)
+    blob = torch.zeros(288, 128, mdd.blob_cols(H, 4), dtype=torch.uint8)
+    a9 = mdd.kernel_inputs(x, topv, topi, blob)
+    assert a9["rev"] == mdd.REV9 and a9["slots"] == 448
+    a8 = mdd.kernel_inputs(x[:128], topv[:128], topi[:128], blob)
+    assert a8["rev"] == mdd.REV and "spl" in a8
+    with pytest.raises(ValueError):
+        mdd.kernel_inputs(*routing(260, E=288), blob)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")
+@pytest.mark.parametrize("T,E,L", [(130, 128, 8), (200, 128, 8), (136, 288, 8), (256, 160, 16)])
+def test_nki_simulator_v9_matches_emulation(T, E, L, monkeypatch):
+    """The one-call kernel for 128 < T <= 256 (two token tiles) under the simulator: fp32 128-block scales, the clamped
+    SiLU, experts drawn from a few so that slots hold many lanes, ids in the last expert tile."""
+    import nki
+
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn1")
+    ws = experts128(e=E, h=H)
+    blob = mdd.pack(*ws)
+    g = torch.Generator().manual_seed(7)
+    x = torch.randn(T, H, generator=g).bfloat16()
+    topi = torch.stack([torch.randperm(16, generator=g)[:8] for _ in range(T)]) * (E // 16)
+    topi[0, 0], topi[T - 1, 1] = E - 1, E - 2
+    topv = (torch.rand(T, 8, generator=g) + 0.1).bfloat16()
+    args = mdd.kernel_inputs(x, topv, topi, blob, lanes=L, act=1, limit=0.02)
+    st = {k: args.pop(k) for k in ("lanes", "group", "ring", "slots", "block", "keep", "act", "limit", "alpha", "debug")}
+    got = torch.as_tensor(nki.simulate(mdd.kernel9())(**args, **st)).float()
+    want = mdd.emulate(x, topv, topi, blob, 1, 0.02).float()
+    assert (got - want).abs().max() <= 0.01 * want.abs().max()
+
+
+@pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")
+@pytest.mark.parametrize("T,E,few", [(200, 288, True), (200, 288, False), (136, 160, True)])
+def test_nki_simulator_v9_skipped_segments_match_emulation(T, E, few, monkeypatch):
+    """kiln_moe_dedupe_v9 with skp = 2 (the slot tail in device-loop segments of two blocks): routing on 16 experts (most
+    segments past the real slots, not run) and on distinct random experts (every segment real), exact as without."""
+    import nki
+
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn1")
+    ws = experts128(e=E, h=H)
+    blob = mdd.pack(*ws)
+    g = torch.Generator().manual_seed(8)
+    x = torch.randn(T, H, generator=g).bfloat16()
+    if few:
+        topi = torch.stack([torch.randperm(16, generator=g)[:8] for _ in range(T)]) * (E // 16)
+    else:
+        topi = torch.stack([torch.randperm(E, generator=g)[:8] for _ in range(T)])
+    topi[0, 0] = E - 1
+    topv = (torch.rand(T, 8, generator=g) + 0.1).bfloat16()
+    want = mdd.emulate(x, topv, topi, blob, 1, 0.02).float()
+    for skp, hdf in ((0, 0), (2, 0), (6, 75)):
+        args = mdd.kernel_inputs(x, topv, topi, blob, act=1, limit=0.02)
+        args["skp"], args["hdf"] = skp, hdf
+        st = {k: args.pop(k) for k in ("lanes", "group", "ring", "slots", "block", "keep", "act", "limit", "alpha", "debug",
+                                       "skp", "hdf")}
+        got = torch.as_tensor(nki.simulate(mdd.kernel9())(**args, **st)).float()
+        assert (got - want).abs().max() <= 0.01 * want.abs().max(), (skp, hdf)
+
+
+def test_v10_takes_up_to_512_tokens():
+    """kiln_moe_dedupe_v10: 257-512 tokens (multiples of 16, top-8) in one call within SLOTS10."""
+    assert mdd.n_slots(320, 8, 288, 8) == (576, 128) and mdd.n_slots(512, 8, 288, 8) == (768, 128)
+    assert mdd.fits10(320, 8, 288) and mdd.fits10(384, 8, 288) and mdd.fits10(512, 8, 288)
+    assert not mdd.fits10(520, 8, 288) and not mdd.fits10(330, 8, 288) and not mdd.fits10(320, 4, 288)
+    x, topv, topi = routing(320, E=288)
+    blob = torch.zeros(288, 128, mdd.blob_cols(H, 4), dtype=torch.uint8)
+    a = mdd.kernel_inputs(x, topv, topi, blob)
+    assert a["rev"] == mdd.REV10 and a["slots"] == 576
+
+
+@pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="needs the NKI package (Neuron venv)")
+@pytest.mark.parametrize("T,E,few,skp,hdf", [(320, 288, False, 0, 0), (384, 160, True, 6, 75), (512, 128, False, 2, 0),
+                                             (272, 288, True, 0, 0)])
+def test_nki_simulator_v10_matches_emulation(T, E, few, skp, hdf, monkeypatch):
+    """The 512-token kernel under the simulator: x gathered by indirect DMA, R and the lanes' tokens by matmuls of the
+    pairs' one-hot, up to 4 token tiles, with and without the slot-tail segments."""
+    import nki
+
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn1")
+    ws = experts128(e=E, h=H)
+    blob = mdd.pack(*ws)
+    g = torch.Generator().manual_seed(9)
+    x = torch.randn(T, H, generator=g).bfloat16()
+    if few:
+        topi = torch.stack([torch.randperm(16, generator=g)[:8] for _ in range(T)]) * (E // 16)
+    else:
+        topi = torch.stack([torch.randperm(E, generator=g)[:8] for _ in range(T)])
+    topi[0, 0], topi[T - 1, 1] = E - 1, E - 2
+    topv = (torch.rand(T, 8, generator=g) + 0.1).bfloat16()
+    args = mdd.kernel_inputs(x, topv, topi, blob, act=1, limit=0.02)
+    assert args["rev"] == mdd.REV10
+    args["skp"], args["hdf"] = skp, hdf
+    st = {k: args.pop(k) for k in ("lanes", "group", "ring", "slots", "block", "keep", "act", "limit", "alpha", "debug",
+                                   "skp", "hdf")}
+    got = torch.as_tensor(nki.simulate(mdd.kernel10())(**args, **st)).float()
+    want = mdd.emulate(x, topv, topi, blob, 1, 0.02).float()
+    assert (got - want).abs().max() <= 0.01 * want.abs().max()

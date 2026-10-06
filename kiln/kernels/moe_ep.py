@@ -202,22 +202,30 @@ def expert_out_small(x: torch.Tensor, w_gu, s_gu, w_down, s_down, act: int = 1, 
 
 
 def emulate(x, topv, topi, lmap, w_gu, s_gu, w_down, s_down, act: int = 1, lim: float = 10.0,
-            small: bool | None = None) -> torch.Tensor:
+            small: bool | int | None = None) -> torch.Tensor:
     """The kernel's output in torch: for every token, its pairs whose expert is local (lmap[e] < El, the local
     index; w_* are the El local experts) in local-expert order, out = bf16(out + bf16(w y)) with y the expert's fp32
     output (kiln_moe_ep_kernel: the drain scales by w and rounds once, a bf16 read-modify-write adds). small (default:
-    the kernel moe_ep() runs for this many rows): kiln_moe_ep_small's arithmetic, y = expert_out_small (bf16)."""
+    the kernel moe_ep() runs for this many rows): kiln_moe_ep_small's arithmetic, y = expert_out_small (bf16); small=2
+    kiln_moe_ep_small2's: experts with at most SMALL_LW pairs that way, first, then the others dequantized
+    (expert_out), each group in local-expert order."""
     El = w_gu.shape[0]
     T, H = x.shape
     if small is None:
-        small = uses_small(T)
+        small = (2 if SMALL_V in (2, 3, 5) else True) if uses_small(T) else False
     out = torch.zeros(T, H, dtype=torch.bfloat16)
     loc = lmap.view(-1)[topi.long()]  # [T, k] local index or El
-    for le in range(El):
+    order = list(range(El))
+    if small == 2:
+        n = [int((loc == le).sum()) for le in range(El)]
+        order = [le for le in order if n[le] <= SMALL_LW] + [le for le in order if n[le] > SMALL_LW]
+    for le in order:
         t, k = (loc == le).nonzero(as_tuple=True)
         if t.numel() == 0:
             continue
-        if small:
+        if small == 2 and t.numel() > SMALL_LW:
+            y = expert_out(x[t], w_gu[le], s_gu[le], w_down[le], s_down[le], act, lim, rounded=False)
+        elif small:
             y = expert_out_small(x[t], w_gu[le], s_gu[le], w_down[le], s_down[le], act, lim)
         else:
             y = expert_out(x[t], w_gu[le], s_gu[le], w_down[le], s_down[le], act, lim, rounded=False)
@@ -238,6 +246,8 @@ except ImportError:
 
 
 if nki is not None:
+    DGU = nisa.dge_mode.unknown  # the compiler picks the DGE mode (dma_copy's default)
+
     def _consts(bc: int):
         """The 0/1 stationaries [3, 128] of the scale broadcast: bc 1 one all-ones (hi + mid + lo summed inside
         one matmul), bc 3 three row selectors (one matmul per part, accumulated in PSUM in that order)."""
@@ -279,7 +289,7 @@ if nki is not None:
         xr = io["xr"][sb]
         nisa.dma_copy(dst=xr, src=io["x"].ap(pattern=[[H, 128], [1, H]], offset=0,
                                               vector_offset=io["ts"].ap(pattern=[[S["NS"], 128], [1, 1]], offset=sb),
-                                              indirect_dim=0), oob_mode=oob_mode.skip)
+                                              indirect_dim=0), oob_mode=oob_mode.skip, dge_mode=S.get("DG", DGU))
         return xr
 
     def _wsrc(S, io, name, m_off, pattern):
@@ -305,6 +315,47 @@ if nki is not None:
         else:
             nisa.activation(dst=dst, op=nl.copy, data=src, scale=sc)
 
+    def _lnc_setup(spl: int, M: int, H: int, lws):
+        """The LNC layout of a kernel call: dict(npg, pid, sp, wr, rcv). At LNC=2 (trn2) every kernel of this module is
+        launched with grid 2 and traced once per program, the two physical cores of the logical core ("kernel is
+        traced LNC times with different program_id_value", nki/_backends/mlir_tracer, so npg / pid are Python ints).
+        Grid 1 is not an option there: neuronx-cc compiles a grid-1 kernel's device loops on core 0 only and refuses
+        the graph ("[NCC_IXGM002] Expected function sg0001 in subgraph 1 to have 9 basic blocks, but on core 1 it has
+        1 basic blocks", measured on the EP prefill kernel, 2026-10-05). sp (spl 1 and two programs): the split, each
+        program half of the I-chunks and half of the output columns (_pass), with the receive buffers of the a^T swap
+        allocated here, before anything else, in the same order in both traces, so they sit at the same SBUF address
+        on both cores (the peer's sendrecv writes there). Two programs without the split: both run the whole kernel
+        (the same device loops on both cores, as NCC_IXGM002 requires) and only program 0 writes out (wr), since every
+        write is a read-modify-write add that a second program would repeat. One program (trn1): exactly the kernel
+        as before."""
+        npg, pid = (nl.num_programs(axes=0), nl.program_id(axis=0)) if nl.program_ndim() != 0 else (1, 0)
+        sp = spl == 1 and npg == 2  # split() checks that M and H // 512 are even
+        rcv = {}  # str keys: the NKI tracer takes no other dict keys ("'in' expected ... (str, dict)")
+        if sp:
+            for lw in lws:
+                if str(lw) not in rcv:
+                    rcv[str(lw)] = nl.ndarray((128, M // 2, lw), dtype=nl.bfloat16, buffer=nl.sbuf)
+        return dict(npg=npg, pid=pid, sp=sp, wr=sp or pid == 0, rcv=rcv)
+
+    def _rcv(rcv, lw):
+        """The swap buffer of passes of lw lanes, or None (unsplit)."""
+        return rcv[str(lw)] if str(lw) in rcv else None
+
+    def _zero_out(out, C, H, L):
+        """out = 0 by the programs that write it (L: _lnc_setup), each its own columns when split."""
+        h_lo, hw = (L["pid"] * (H // 2), H // 2) if L["sp"] else (0, H)
+        zt = nl.ndarray((128, hw), dtype=out.dtype, buffer=nl.sbuf)
+        nisa.memset(dst=zt, value=0.0)
+        if L["wr"]:
+            for t in range(C // 128):
+                nisa.dma_copy(dst=out[t * 128:(t + 1) * 128, h_lo:h_lo + hw], src=zt)
+
+    def _lnc_end(out, L):
+        """With two programs, both wait until out is whole before either kernel ends: whatever runs next on either
+        physical core reads it (nisa.core_barrier on a shared HBM tensor, nki/isa/_lnc.py)."""
+        if L["npg"] == 2:
+            nisa.core_barrier(data=out, cores=(0, 1))
+
     def _pass(S, io):
         """One pass of a local expert over its LW lanes: x rows from _x_rows; outputs y bf16 [128, H] per 128-lane
         sub-block either stored to io["y"] rows io["r0"] + sb 128 (ykind "rows", the core probe) or (ykind "rmw")
@@ -315,6 +366,16 @@ if nki is not None:
         one, act, lim = S["sels"], S["act"], S["lim"]
         f32, bf16, fp8, u8 = nl.float32, nl.bfloat16, nl.float8_e4m3, nl.uint8
         Q = H // 512
+        # LNC split (S["npg"] 2: trn2 at LNC=2 with KILN_LNC_SPLIT naming moe_ep): program pid computes gate_up for its
+        # half of the I-chunks, the two halves of a^T are swapped between the physical cores (nisa.sendrecv into
+        # S["rcv"], allocated before anything else so it sits at the same SBUF address in both programs' traces),
+        # and each program computes the down projection for its half of the output columns from the whole a^T,
+        # accumulated over all I-chunks in one PSUM tile in the unsplit order: every output value is the unsplit
+        # kernel's, bit for bit. Each program read-modify-writes only its own columns of out.
+        sp, pid, wr = S.get("sp", False), S.get("pid", 0), S.get("wr", True)
+        Mh, Qh = M // 2, Q // 2
+        m_lo, m_hi = (pid * Mh, (pid + 1) * Mh) if sp else (0, M)
+        q_lo, q_hi = (pid * Qh, (pid + 1) * Qh) if sp else (0, Q)
         xT = nl.ndarray((128, CT, LW), dtype=bf16, buffer=nl.sbuf)  # x^T [h, c, lane]
         for sb in range(NS):
             xr = _x_rows(S, io, sb)
@@ -326,7 +387,7 @@ if nki is not None:
                     nisa.nc_transpose(dst=px[:, j, :], data=xr[:, c * 128:(c + 1) * 128], engine=nisa.tensor_engine)
                 nisa.activation(dst=xT[:, c4 * 4:(c4 + 1) * 4, sb * 128:(sb + 1) * 128], op=nl.copy, data=px)
         aT = nl.ndarray((128, M, LW), dtype=bf16, buffer=nl.sbuf)  # a^T [i, m, lane]
-        for m in range(M):
+        for m in range(m_lo, m_hi):
             wq = nl.ndarray((128, 2, CT * 128), dtype=u8, buffer=nl.sbuf)
             nisa.dma_copy(dst=wq, src=_wsrc(S, io, "gu", m * 2 * CT * 128, [[M * 2 * CT * 128, 128], [1, 2 * CT * 128]]))
             if S["tsc"]:  # chunk m's 2 CT tile scales on every partition
@@ -369,10 +430,17 @@ if nki is not None:
             sl = nl.ndarray((128, LW), dtype=f32, buffer=nl.sbuf)
             nisa.activation(dst=sl, op=nl.silu, data=gc)
             nisa.tensor_tensor(dst=aT[:, m, :], data1=sl, data2=uc, op=nl.multiply, engine=nisa.vector_engine)
+        # (no inner function for "which half holds chunk m": the NKI tracer refuses a direct call of one inside a
+        # device-loop body, "inner functions can only be used as fori_loop/while_loop body arguments")
+        rcv = S["rcv"] if sp else aT
+        if sp:  # the other program's half of a^T, I-chunks (1 - pid) Mh .. into rcv
+            nisa.sendrecv(src=aT[:, m_lo:m_hi, :], dst=rcv, send_to_rank=1 - pid, recv_from_rank=1 - pid, pipe_id=0)
+        o_lo = (1 - pid) * Mh if sp else 0  # the first I-chunk rcv holds
+
         ys = []
         for sb in range(NS):
             ys.append(nl.ndarray((128, H), dtype=bf16, buffer=nl.sbuf))
-        for q in range(Q):
+        for q in range(q_lo, q_hi):
             dq8 = nl.ndarray((128, M, 512), dtype=u8, buffer=nl.sbuf)
             nisa.dma_copy(dst=dq8, src=_wsrc(S, io, "dn", q * 512, [[M * H, 128], [H, M], [1, 512]]))
             dd = nl.ndarray((128, M, 512), dtype=bf16, buffer=nl.sbuf)
@@ -393,37 +461,43 @@ if nki is not None:
             for sb in range(NS):
                 py = nl.ndarray((128, 512), dtype=f32, buffer=nl.psum)
                 for m in range(M):
-                    nisa.nc_matmul(dst=py, stationary=aT[:, m, sb * 128:(sb + 1) * 128], moving=dd[:, m, :],
+                    a_src, a_m = (aT, m) if (not sp or m_lo <= m < m_hi) else (rcv, m - o_lo)
+                    nisa.nc_matmul(dst=py, stationary=a_src[:, a_m, sb * 128:(sb + 1) * 128], moving=dd[:, m, :],
                                    accumulate=(m > 0))
                 if io["ykind"] == "rmw":  # y w, rounded once
                     nisa.activation(dst=ys[sb][:, q * 512:(q + 1) * 512], op=nl.copy, data=py, scale=io["w"][:, sb:sb + 1])
                 else:
                     nisa.activation(dst=ys[sb][:, q * 512:(q + 1) * 512], op=nl.copy, data=py)
-        for sb in range(NS):
+        h_lo, hw = (pid * (H // 2), H // 2) if sp else (0, H)  # this program's output columns
+        for sb in range(NS if wr else 0):  # unsplit with two programs: program 0 alone writes
             if io["ykind"] == "rows":
                 r0 = io["r0"] + sb * 128
-                nisa.dma_copy(dst=io["y"][r0:r0 + 128, :], src=ys[sb])
+                nisa.dma_copy(dst=io["y"][r0:r0 + 128, h_lo:h_lo + hw], src=ys[sb][:, h_lo:h_lo + hw])
             else:
-                dst = io["out"].ap(pattern=[[H, 128], [1, H]], offset=0,
+                dst = io["out"].ap(pattern=[[H, 128], [1, hw]], offset=h_lo,
                                    vector_offset=io["ts"].ap(pattern=[[NS, 128], [1, 1]], offset=sb), indirect_dim=0)
-                nisa.dma_compute(dst=dst, srcs=[dst, ys[sb]], reduce_op=nl.add, oob_mode=oob_mode.skip)
+                nisa.dma_compute(dst=dst, srcs=[dst, ys[sb][:, h_lo:h_lo + hw]], reduce_op=nl.add,
+                                 oob_mode=oob_mode.skip)
 
     @nki.jit
-    def kiln_moe_ep_core(xe, ex, gu, sgu, dn, sdn, LW: int, act: int, lim: float, bc: int, rev: int, tsc: int = 0):
+    def kiln_moe_ep_core(xe, ex, gu, sgu, dn, sdn, LW: int, act: int, lim: float, bc: int, rev: int, tsc: int = 0,
+                         spl: int = 0):
         """The passes alone (a probe of the per-pass cost): xe bf16 [NP LW, H] the lanes' rows of NP passes in
         order, ex int32 [1, NP] each pass's local expert; returns y bf16 [NP LW, H]."""
         R, H = xe.shape
         NP = ex.shape[1]
         M = gu.shape[2]
         CT = H // 128
+        L = _lnc_setup(spl, M, H, [LW])
         S = dict(H=H, M=M, CT=CT, LW=LW, NS=LW // 128, gu=gu, sgu=sgu, dn=dn, sdn=sdn, sels=_consts(bc), act=act,
-                 lim=lim, tsc=tsc)
+                 lim=lim, tsc=tsc, sp=L["sp"], pid=L["pid"], wr=L["wr"], rcv=_rcv(L["rcv"], LW))
         exs = nl.ndarray((1, NP), dtype=nl.int32, buffer=nl.sbuf)
         nisa.dma_copy(dst=exs, src=ex)
         y = nl.ndarray((R, H), dtype=xe.dtype, buffer=nl.shared_hbm)
         for p in range(NP):
             _pass(S, dict(xkind="rows", ykind="rows", ekind="dyn", e_sb=exs.ap(pattern=[[NP, 1], [1, 1]], offset=p),
                           xe=xe, y=y, r0=p * LW))
+        _lnc_end(y, L)
         return y
 
     def _lane_tokens(S, P, ngi, nt0, sb, ts):
@@ -455,11 +529,11 @@ if nki is not None:
             lr = nl.ndarray((128, K), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(dst=lr, src=P["loc_h"].ap(pattern=[[K, 128], [1, K]], offset=0,
                                                     vector_offset=ts.ap(pattern=[[NS, 128], [1, 1]], offset=sb),
-                                                    indirect_dim=0), oob_mode=oob_mode.skip)
+                                                    indirect_dim=0), oob_mode=oob_mode.skip, dge_mode=S.get("DG", DGU))
             wr = nl.ndarray((128, K), dtype=nl.bfloat16, buffer=nl.sbuf)
             nisa.dma_copy(dst=wr, src=P["wts"].ap(pattern=[[K, 128], [1, K]], offset=0,
                                                   vector_offset=ts.ap(pattern=[[NS, 128], [1, 1]], offset=sb),
-                                                  indirect_dim=0), oob_mode=oob_mode.skip)
+                                                  indirect_dim=0), oob_mode=oob_mode.skip, dge_mode=S.get("DG", DGU))
             mk = nl.ndarray((128, K), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_scalar(dst=mk, data=lr, op0=nl.equal, operand0=e_cmp, engine=nisa.vector_engine)
             pr = nl.ndarray((128, K), dtype=nl.float32, buffer=nl.sbuf)
@@ -468,7 +542,7 @@ if nki is not None:
 
     @nki.jit
     def kiln_moe_ep_kernel(x, topi, wts, lmap, gu, sgu, dn, sdn, LW: int, LW2: int, PMAX: int, act: int, lim: float,
-                           bc: int, rev: int, tsc: int = 0):
+                           bc: int, rev: int, tsc: int = 0, spl: int = 0, dge: int = 0):
         """x bf16 [C, H] (C a multiple of 128); topi int32 [C, K] each token's experts and wts bf16 [C, K] their
         routing weights; lmap int32 [1, E + 1]: each expert's index among this rank's El local experts, El for
         another rank's and for the padding expert E (local_map; data, so every rank traces the same graph); gu,
@@ -501,10 +575,15 @@ if nki is not None:
         LB2 = 7  # LW2 = 2 ** LB2 (128, 256 or 512)
         while (1 << LB2) < LW2:
             LB2 += 1
+        L = _lnc_setup(spl, M, H, [LW, LW2])  # first: the swap buffers at the same address on both cores
         sels = _consts(bc)
-        S = dict(H=H, M=M, CT=CT, LW=LW, NS=NS, gu=gu, sgu=sgu, dn=dn, sdn=sdn, sels=sels, act=act, lim=lim, tsc=tsc)
+        # (keys spelled out: the NKI tracer has no ** expansion)
+        # dge 1 (KILN_MOE_EP_DGE=sw, experiment): the kernel's gathers on software DGE (dge_mode swdge)
+        DG = nisa.dge_mode.swdge if dge else DGU
+        S = dict(H=H, M=M, CT=CT, LW=LW, NS=NS, gu=gu, sgu=sgu, dn=dn, sdn=sdn, sels=sels, act=act, lim=lim, tsc=tsc,
+                 rcv=_rcv(L["rcv"], LW), sp=L["sp"], pid=L["pid"], wr=L["wr"], DG=DG)
         S2 = dict(H=H, M=M, CT=CT, LW=LW2, NS=NS2, gu=gu, sgu=sgu, dn=dn, sdn=sdn, sels=sels, act=act, lim=lim,
-                  tsc=tsc)
+                  tsc=tsc, rcv=_rcv(L["rcv"], LW2), sp=L["sp"], pid=L["pid"], wr=L["wr"], DG=DG)
 
         # 0. The plan.
         tk = nl.ndarray((128, NT, K), dtype=i32, buffer=nl.sbuf)  # topi[T 128 + p, k]
@@ -607,10 +686,7 @@ if nki is not None:
 
         # 1. out = 0.
         out = nl.ndarray((C, H), dtype=x.dtype, buffer=nl.shared_hbm)
-        zt = nl.ndarray((128, H), dtype=x.dtype, buffer=nl.sbuf)
-        nisa.memset(dst=zt, value=0.0)
-        for t in range(NT):
-            nisa.dma_copy(dst=out[t * 128:(t + 1) * 128, :], src=zt)
+        _zero_out(out, C, H, L)
 
         # 2. Each local expert's first pass (static), then the overflow passes in a device loop.
         for e in range(El):
@@ -651,6 +727,7 @@ if nki is not None:
             _ep_overflow_pass(S, Pd, T1, it)
 
         nl.fori_loop(0, rq, body1)
+        _lnc_end(out, L)
         return out
 
     def _ovtable(ov, b, Lp, El, PMAX):
@@ -908,6 +985,12 @@ if nki is not None:
         gu, dsg, dn, dsd, act, lim = S["gu"], S["dsg"], S["dn"], S["dsd"], S["act"], S["lim"]
         f32, bf16, fp8, u8 = nl.float32, nl.bfloat16, nl.float8_e4m3, nl.uint8
         CG = min(CT, 512 // LW)  # h-tiles per PSUM stack (2 KB per partition)
+        # LNC split as in _pass: gate_up over this program's half of the I-chunks, a^T halves swapped, down for its
+        # half of the 512-column output chunks from the whole a^T (the unsplit arithmetic, bit for bit).
+        sp, pid, wr = S.get("sp", False), S.get("pid", 0), S.get("wr", True)
+        Mh, Q = M // 2, H // 512
+        m_lo, m_hi = (pid * Mh, (pid + 1) * Mh) if sp else (0, M)
+        q_lo, q_hi = (pid * (Q // 2), (pid + 1) * (Q // 2)) if sp else (0, Q)
         wom = oob_mode.skip if skip else oob_mode.error
         nisa.dma_copy(dst=xr, src=S["x"].ap(pattern=[[H, LW], [1, H]], offset=0,
                                              vector_offset=ts.ap(pattern=[[1, LW], [1, 1]], offset=0), indirect_dim=0),
@@ -921,7 +1004,7 @@ if nki is not None:
                 nisa.nc_transpose(dst=px[:, j, :], data=xr[:, c * 128:(c + 1) * 128], engine=nisa.tensor_engine)
             nisa.activation(dst=xT[:, c4 * 4:(c4 + 1) * 4, :], op=nl.copy, data=px)
         aT = nl.ndarray((128, M, LW), dtype=bf16, buffer=nl.sbuf)
-        for m in range(M):
+        for m in range(m_lo, m_hi):
             wq = nl.ndarray((128, 2, CT * 128), dtype=u8, buffer=nl.sbuf)
             nisa.dma_copy(dst=wq, src=gu.ap(pattern=[[M * 2 * CT * 128, 128], [1, 2 * CT * 128]], offset=m * 2 * CT * 128,
                                             scalar_offset=e_dma, indirect_dim=0), oob_mode=wom)
@@ -961,15 +1044,23 @@ if nki is not None:
             sl = nl.ndarray((128, LW), dtype=f32, buffer=nl.sbuf)
             nisa.activation(dst=sl, op=nl.silu, data=gc)
             nisa.tensor_tensor(dst=aT[:, m, :], data1=sl, data2=uc, op=nl.multiply, engine=nisa.vector_engine)
+        rcv = S["rcv"] if sp else aT  # (no inner function: see _pass)
+        if sp:  # the other program's half of a^T into rcv
+            nisa.sendrecv(src=aT[:, m_lo:m_hi, :], dst=rcv, send_to_rank=1 - pid, recv_from_rank=1 - pid, pipe_id=0)
+        o_lo = (1 - pid) * Mh if sp else 0
+
         ys = nl.ndarray((LW, H), dtype=bf16, buffer=nl.sbuf)
-        for q in range(H // 512):
+        for q in range(q_lo, q_hi):
             dq8 = nl.ndarray((128, M, 512), dtype=u8, buffer=nl.sbuf)
             nisa.dma_copy(dst=dq8, src=dn.ap(pattern=[[M * H, 128], [H, M], [1, 512]], offset=q * 512,
                                              scalar_offset=e_dma, indirect_dim=0), oob_mode=wom)
             sd = nl.ndarray((128, 4, M), dtype=f32, buffer=nl.sbuf)  # [h, the chunk's 4 h-tiles, m]
             nisa.dma_copy(dst=sd, src=dsd.ap(pattern=[[CT * M, 128], [M, 4], [1, M]], offset=q * 4 * M,
                                              scalar_offset=e_dma, indirect_dim=0), oob_mode=wom)
-            py = nl.ndarray((LW, 512), dtype=f32, buffer=nl.psum)
+            # the transposes of yt write it: fp32 PSUM on gen2, the input's bf16 from gen3 on ("nc_matmul (transpose
+            # mode) dst dtype must match input dtype on gen3+", nki/isa/_validation.py); the same bf16 values
+            py = nl.ndarray((LW, 512), dtype=f32 if nisa.get_nc_version() == nisa.nc_version.gen2 else bf16,
+                            buffer=nl.psum)
             MG = min(M, 512 // LW)  # I-chunks per PSUM stack (2 KB per partition)
             for hh in range(4):
                 yt = nl.ndarray((128, LW), dtype=bf16, buffer=nl.sbuf)
@@ -977,8 +1068,9 @@ if nki is not None:
                 for m0 in range(0, M, MG):
                     pd = nl.ndarray((128, MG, LW), dtype=f32, buffer=nl.psum)
                     for m in range(m0, m0 + MG):
+                        a_src, a_m = (aT, m) if (not sp or m_lo <= m < m_hi) else (rcv, m - o_lo)
                         nisa.nc_matmul(dst=pd[:, m - m0, :], stationary=dq8[:, m, hh * 128:(hh + 1) * 128].view(fp8),
-                                       moving=aT[:, m, :], accumulate=False)
+                                       moving=a_src[:, a_m, :], accumulate=False)
                     prod = nl.ndarray((128, MG, LW), dtype=f32, buffer=nl.sbuf)
                     nisa.tensor_tensor(dst=prod, data1=pd, data2=sd.ap(pattern=[[4 * M, 128], [1, MG], [0, LW]],
                                                                        offset=hh * M + m0),
@@ -998,9 +1090,11 @@ if nki is not None:
                             nisa.tensor_tensor(dst=yt, data1=ya, data2=part, op=nl.add, engine=nisa.vector_engine)
                 nisa.nc_transpose(dst=py[:, hh * 128:(hh + 1) * 128], data=yt, engine=nisa.tensor_engine)
             nisa.activation(dst=ys[:, q * 512:(q + 1) * 512], op=nl.copy, data=py, scale=w)
-        dst = out.ap(pattern=[[H, LW], [1, H]], offset=0, vector_offset=ts.ap(pattern=[[1, LW], [1, 1]], offset=0),
-                     indirect_dim=0)
-        nisa.dma_compute(dst=dst, srcs=[dst, ys], reduce_op=nl.add, oob_mode=oob_mode.skip)
+        h_lo, hw = (pid * (H // 2), H // 2) if sp else (0, H)  # this program's output columns
+        if wr:  # unsplit with two programs: program 0 alone writes
+            dst = out.ap(pattern=[[H, LW], [1, hw]], offset=h_lo,
+                         vector_offset=ts.ap(pattern=[[1, LW], [1, 1]], offset=0), indirect_dim=0)
+            nisa.dma_compute(dst=dst, srcs=[dst, ys[:, h_lo:h_lo + hw]], reduce_op=nl.add, oob_mode=oob_mode.skip)
 
     @nki.jit
     def kiln_moe_ep_small(x, topi, wts, lmap, gu, dsg, dn, dsd, LW: int, PMAX: int, act: int, lim: float, rev: int):
@@ -1062,8 +1156,581 @@ if nki is not None:
 
     # --- end of the small-lane kernel's source ---
 
+    # --- the small-lane kernel v2 (KILN_MOE_EP_SMALL_V=2): every local expert with pairs exactly once ---
+
+    def _plan_s2(topi, wts, lmap, C, K, E, El, LW):
+        """_plan_s's membership, prefix counts and lane-token bias rows (ngi, ngi_h), and two pass tables in place of
+        static first passes and overflow passes: the experts with 1 .. LW pairs (one small-lane pass each) and the
+        experts with more (one dequantize-first pass of 128 lanes each: C <= 128 rows, so no expert has more than 128
+        pairs). Each table is local-expert order (_ovtable with one pass per selected expert, first rank 0), its
+        count an int32 SBUF scalar for a device loop, so an expert with no pair costs nothing and none is loaded
+        twice."""
+        f32, bf16, i32 = nl.float32, nl.bfloat16, nl.int32
+        NT = C // 128
+        tk = nl.ndarray((128, NT, K), dtype=i32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=tk, src=topi.ap(pattern=[[K, 128], [128 * K, NT], [1, K]], offset=0))
+        tku = nl.ndarray((128, NT, K), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=tku, src=tk, engine=nisa.vector_engine)
+        lmi = nl.ndarray((128, E), dtype=i32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=lmi, src=lmap.ap(pattern=[[0, 128], [1, E]], offset=0))
+        lmf = nl.ndarray((128, E), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=lmf, src=lmi, engine=nisa.vector_engine)
+        loc = nl.ndarray((128, NT, K), dtype=f32, buffer=nl.sbuf)
+        nisa.nc_n_gather(dst=loc, data=lmf, indices=tku)
+        loc_h = nl.ndarray((C, K), dtype=f32, buffer=nl.private_hbm)
+        nisa.dma_copy(dst=loc_h.ap(pattern=[[K, 128], [128 * K, NT], [1, K]], offset=0), src=loc)
+        EN = El * NT
+        mem = nl.ndarray((128, EN), dtype=bf16, buffer=nl.sbuf)
+        for e in range(El):
+            eq = nl.ndarray((128, NT, K), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=eq, data=loc, op0=nl.equal, operand0=float(e), engine=nisa.vector_engine)
+            nisa.tensor_reduce(dst=mem[:, e * NT:(e + 1) * NT], op=nl.add, data=eq, axis=2)
+        uu = nl.ndarray((128, 128), dtype=i32, buffer=nl.sbuf)
+        nisa.iota(dst=uu, pattern=[[1, 128]], offset=0, channel_multiplier=-1)
+        uuf = nl.ndarray((128, 128), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=uuf, src=uu, engine=nisa.vector_engine)
+        lt = nl.ndarray((128, 128), dtype=bf16, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=lt, data=uuf, op0=nl.greater, operand0=0.0, engine=nisa.vector_engine)
+        on128 = nl.ndarray((128, 128), dtype=bf16, buffer=nl.sbuf)
+        nisa.memset(dst=on128, value=1.0)
+        wit = nl.ndarray((128, EN), dtype=f32, buffer=nl.sbuf)
+        tot = nl.ndarray((128, EN), dtype=f32, buffer=nl.sbuf)
+        for c0 in range(0, EN, 512):
+            cw = min(512, EN - c0)
+            pw = nl.ndarray((128, cw), dtype=f32, buffer=nl.psum)
+            nisa.nc_matmul(dst=pw, stationary=lt, moving=mem[:, c0:c0 + cw], accumulate=False)
+            nisa.tensor_copy(dst=wit[:, c0:c0 + cw], src=pw, engine=nisa.vector_engine)
+            pt = nl.ndarray((128, cw), dtype=f32, buffer=nl.psum)
+            nisa.nc_matmul(dst=pt, stationary=on128, moving=mem[:, c0:c0 + cw], accumulate=False)
+            nisa.tensor_copy(dst=tot[:, c0:c0 + cw], src=pt, engine=nisa.vector_engine)
+        inc = nl.ndarray((128, El, NT), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=inc, src=tot.ap(pattern=[[EN, 128], [NT, El], [1, NT]], offset=0), engine=nisa.vector_engine)
+        sh = 1
+        while sh < NT:
+            prev = nl.ndarray((128, El, NT), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=prev, src=inc, engine=nisa.vector_engine)
+            nisa.tensor_tensor(dst=inc[:, :, sh:NT], data1=prev[:, :, sh:NT], data2=prev[:, :, 0:NT - sh], op=nl.add,
+                               engine=nisa.vector_engine)
+            sh *= 2
+        ngi = nl.ndarray((128, EN), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=ngi, data1=inc.ap(pattern=[[EN, 128], [1, EN]], offset=0), data2=tot, op=nl.subtract,
+                           engine=nisa.vector_engine)
+        nisa.tensor_tensor(dst=ngi, data1=ngi, data2=wit, op=nl.add, engine=nisa.vector_engine)
+        nisa.tensor_tensor(dst=ngi, data1=ngi, data2=mem, op=nl.add, engine=nisa.vector_engine)
+        nisa.tensor_scalar(dst=ngi, data=ngi, op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=0.5,
+                           engine=nisa.vector_engine)
+        ngi_h = nl.ndarray((El, 128, NT), dtype=f32, buffer=nl.private_hbm)
+        nisa.dma_copy(dst=ngi_h.ap(pattern=[[NT, 128], [128 * NT, El], [1, NT]], offset=0), src=ngi)
+        cnt = nl.ndarray((1, El), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=cnt, src=inc[0:1, :, NT - 1], engine=nisa.vector_engine)
+        big = nl.ndarray((1, El), dtype=f32, buffer=nl.sbuf)  # [n_e > LW]
+        nisa.tensor_scalar(dst=big, data=cnt, op0=nl.greater, operand0=float(LW), engine=nisa.vector_engine)
+        sml = nl.ndarray((1, El), dtype=f32, buffer=nl.sbuf)  # [n_e > 0] - [n_e > LW]
+        nisa.tensor_scalar(dst=sml, data=cnt, op0=nl.greater, operand0=0.0, engine=nisa.vector_engine)
+        nisa.tensor_tensor(dst=sml, data1=sml, data2=big, op=nl.subtract, engine=nisa.vector_engine)
+        b0 = nl.ndarray((1, El + 1), dtype=f32, buffer=nl.sbuf)
+        nisa.memset(dst=b0, value=0.0)
+        tsm = _ovtable(sml, b0, LW, El, El)
+        tbg = _ovtable(big, b0, 128, El, El)
+        ji = nl.ndarray((128, LW), dtype=i32, buffer=nl.sbuf)
+        nisa.iota(dst=ji, pattern=[[1, LW]], offset=0, channel_multiplier=0)
+        jr = nl.ndarray((128, LW), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=jr, src=ji, engine=nisa.vector_engine)
+        jb = nl.ndarray((128, 128), dtype=i32, buffer=nl.sbuf)
+        nisa.iota(dst=jb, pattern=[[1, 128]], offset=0, channel_multiplier=0)
+        jbf = nl.ndarray((128, 128), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=jbf, src=jb, engine=nisa.vector_engine)
+        ones1 = nl.ndarray((128, 1), dtype=bf16, buffer=nl.sbuf)
+        nisa.memset(dst=ones1, value=1.0)
+        return dict(NT=NT, C=C, K=K, loc_h=loc_h, wts=wts, ngi_h=ngi_h, tsm=tsm, tbg=tbg, jrow=jr, jrow_b=[jbf],
+                    ones1=ones1)
+
+    def _table_pass(P, tab, it, LWp):
+        """Pass `it` of a two-table plan: its expert (int32 SBUF scalar, and fp32 on LWp partitions) and the expert's
+        lane-token bias rows (its first rank is 0)."""
+        e_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=e_sb, src=tab["e"].ap(pattern=[[1, 1], [1, 1]], offset=0, scalar_offset=it, indirect_dim=0))
+        ef = nl.ndarray((LWp, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=ef, src=tab["ef"].ap(pattern=[[0, LWp], [1, 1]], offset=0, scalar_offset=it, indirect_dim=0))
+        ng = nl.ndarray((128, P["NT"]), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=ng, src=P["ngi_h"].ap(pattern=[[P["NT"], 128], [1, P["NT"]]], offset=0, scalar_offset=e_sb,
+                                                indirect_dim=0))
+        return e_sb, ef, ng
+
+    @nki.jit
+    def kiln_moe_ep_small2(x, topi, wts, lmap, gu, dsg, dn, dsd, sgu, sdn, LW: int, act: int, lim: float, bc: int,
+                           rev: int, tsc: int = 1, spl: int = 0):
+        """kiln_moe_ep_small's contract (C <= 128 rows), every local expert with pairs run exactly once and nothing
+        run for one without: experts with 1 .. LW pairs by a small-lane pass (_pass_s: per-row scales dsg / dsd, the
+        fp8 weights as stored, no dequantization), experts with more by one dequantize-first pass of 128 lanes
+        (_pass: the scales sgu / sdn, tile scales with tsc as kiln_moe_ep_kernel takes them), each kind in its own
+        device loop over the plan's table (_plan_s2). Per token the pairs are added small passes first, then the
+        dequantized ones, each in local-expert order (emulate(..., small=2))."""
+        C, H = x.shape
+        K = topi.shape[1]
+        E = lmap.shape[1]
+        El = gu.shape[0]
+        M = gu.shape[2]
+        CT = H // 128
+        f32, bf16, i32 = nl.float32, nl.bfloat16, nl.int32
+        L = _lnc_setup(spl, M, H, [LW, 128])  # first: the swap buffers at the same address on both cores
+        P = _plan_s2(topi, wts, lmap, C, K, E, El, LW)
+        S = dict(H=H, M=M, CT=CT, LW=LW, gu=gu, dsg=dsg, dn=dn, dsd=dsd, act=act, lim=lim, x=x, rcv=_rcv(L["rcv"], LW),
+                 sp=L["sp"], pid=L["pid"], wr=L["wr"])
+        SB = dict(H=H, M=M, CT=CT, LW=128, NS=1, gu=gu, sgu=sgu, dn=dn, sdn=sdn, sels=_consts(bc), act=act, lim=lim,
+                  tsc=tsc, rcv=_rcv(L["rcv"], 128), sp=L["sp"], pid=L["pid"], wr=L["wr"])
+        Pd = dict(NT=P["NT"], C=C, K=K, jrow=P["jrow_b"], ones1=P["ones1"], loc_h=P["loc_h"], wts=wts)
+        out = nl.ndarray((C, H), dtype=x.dtype, buffer=nl.shared_hbm)
+        _zero_out(out, C, H, L)
+        xrs = nl.ndarray((LW, H), dtype=bf16, buffer=nl.sbuf)  # the small loop's x rows, zeroed once
+        nisa.memset(dst=xrs, value=0.0)
+        xrb = nl.ndarray((128, H), dtype=bf16, buffer=nl.sbuf)  # the dequantize-first loop's
+        nisa.memset(dst=xrb, value=0.0)
+        rs = nisa.register_alloc()
+        nisa.register_load(rs, P["tsm"]["n"])
+
+        def body_s(it):
+            e_sb, ef, ng = _table_pass(P, P["tsm"], it, LW)
+            ts = nl.ndarray((LW, 1), dtype=i32, buffer=nl.sbuf)
+            _lanes_s(P, ng, 0, LW, ts)
+            w = nl.ndarray((LW, 1), dtype=f32, buffer=nl.sbuf)
+            _weights_s(P, ts, ef, LW, w)
+            _pass_s(S, e_sb, ts, w, xrs, out, False)
+
+        nl.fori_loop(0, rs, body_s)
+        rb = nisa.register_alloc()
+        nisa.register_load(rb, P["tbg"]["n"])
+
+        def body_b(it):
+            e_sb, ef, ng = _table_pass(P, P["tbg"], it, 128)
+            ts = nl.ndarray((128, 1), dtype=i32, buffer=nl.sbuf)
+            _lane_tokens(SB, Pd, ng, 0, 0, ts)
+            w = nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf)
+            _lane_weights(SB, Pd, ts, ef, w)
+            _pass(SB, dict(xkind="gather", ykind="rmw", ekind="dyn", e_sb=e_sb, x=x, ts=ts, xr=[xrb], w=w, out=out))
+
+        nl.fori_loop(0, rb, body_b)
+        _lnc_end(out, L)
+        return out
+
+    # --- end of the small-lane kernel v2's source ---
+
+    # --- the small-lane kernel v3 (KILN_MOE_EP_SMALL_V=3): v2 with a small pass's weights in few, large DMAs ---
+
+    def _pass_s3(S, e_reg, ts, w, xr, out):
+        """_pass_s's arithmetic, instruction for instruction (the same matmuls, PSUM stacks, products and reductions on
+        the same values), with the expert's bytes moved in 12 DMAs instead of 48, all offset by one register instead of a
+        TENSOR_LOAD each: the whole down projection [128, M, H] (64 KB per partition, one DMA), gate_up two I-chunks
+        per DMA ([128, 2, 2, CT 128], 16 KB per partition) through a ring three deep, and the tile scales tsg [M, 2, CT]
+        and tsd [M, CT] broadcast to every partition (on a block-fitted checkpoint each is the per-row scale dsg / dsd of
+        every row of its tile, so the products are the same numbers)."""
+        H, M, CT, LW = S["H"], S["M"], S["CT"], S["LW"]
+        gu, tsg, dn, tsd, act, lim = S["gu"], S["tsg"], S["dn"], S["tsd"], S["act"], S["lim"]
+        f32, bf16, fp8, u8 = nl.float32, nl.bfloat16, nl.float8_e4m3, nl.uint8
+        CG = min(CT, 512 // LW)
+        MP = 2  # I-chunks per gate_up DMA
+        NP = M // MP
+        GU = M * 2 * CT * 128  # gate_up bytes per partition and expert
+        sg = nl.ndarray((128, M, 2, CT), dtype=f32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=sg, src=tsg.ap(pattern=[[0, 128], [1, M * 2 * CT]], offset=0, scalar_offset=e_reg,
+                                         indirect_dim=0))
+        gq = []
+        for k in range(min(2, NP)):
+            b = nl.ndarray((128, MP, 2, CT * 128), dtype=u8, buffer=nl.sbuf)
+            nisa.dma_copy(dst=b, src=gu.ap(pattern=[[GU, 128], [1, MP * 2 * CT * 128]], offset=k * MP * 2 * CT * 128,
+                                           scalar_offset=e_reg, indirect_dim=0))
+            gq.append(b)
+        nisa.dma_copy(dst=xr, src=S["x"].ap(pattern=[[H, LW], [1, H]], offset=0,
+                                             vector_offset=ts.ap(pattern=[[1, LW], [1, 1]], offset=0), indirect_dim=0),
+                      oob_mode=oob_mode.skip)
+        dw = nl.ndarray((128, M, H), dtype=u8, buffer=nl.sbuf)
+        nisa.dma_copy(dst=dw, src=dn.ap(pattern=[[M * H, 128], [1, M * H]], offset=0, scalar_offset=e_reg, indirect_dim=0))
+        sdt = nl.ndarray((128, M, CT), dtype=f32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=sdt, src=tsd.ap(pattern=[[0, 128], [1, M * CT]], offset=0, scalar_offset=e_reg, indirect_dim=0))
+        xT = nl.ndarray((128, CT, LW), dtype=bf16, buffer=nl.sbuf)
+        for c4 in range(CT // 4):
+            px = nl.ndarray((128, 4, LW), dtype=f32 if nisa.get_nc_version() == nisa.nc_version.gen2 else bf16,
+                            buffer=nl.psum)
+            for j in range(4):
+                c = c4 * 4 + j
+                nisa.nc_transpose(dst=px[:, j, :], data=xr[:, c * 128:(c + 1) * 128], engine=nisa.tensor_engine)
+            nisa.activation(dst=xT[:, c4 * 4:(c4 + 1) * 4, :], op=nl.copy, data=px)
+        aT = nl.ndarray((128, M, LW), dtype=bf16, buffer=nl.sbuf)
+        for m in range(M):
+            k = m // MP
+            if m % MP == 0 and k + 2 < NP:  # the pair two ahead
+                b = nl.ndarray((128, MP, 2, CT * 128), dtype=u8, buffer=nl.sbuf)
+                nisa.dma_copy(dst=b, src=gu.ap(pattern=[[GU, 128], [1, MP * 2 * CT * 128]],
+                                               offset=(k + 2) * MP * 2 * CT * 128, scalar_offset=e_reg, indirect_dim=0))
+                gq.append(b)
+            wq = gq[k]
+            gs = []
+            for g in range(2):
+                acc = nl.ndarray((128, LW), dtype=f32, buffer=nl.sbuf)
+                for h0 in range(0, CT, CG):
+                    pp = nl.ndarray((128, CG, LW), dtype=f32, buffer=nl.psum)
+                    for c in range(h0, h0 + CG):
+                        nisa.nc_matmul(dst=pp[:, c - h0, :], stationary=wq[:, m % MP, g, c * 128:(c + 1) * 128].view(fp8),
+                                       moving=xT[:, c, :], accumulate=False)
+                    prod = nl.ndarray((128, CG, LW), dtype=f32, buffer=nl.sbuf)
+                    nisa.tensor_tensor(dst=prod, data1=pp, data2=sg.ap(pattern=[[M * 2 * CT, 128], [1, CG], [0, LW]],
+                                                                       offset=m * 2 * CT + g * CT + h0),
+                                       op=nl.multiply, engine=nisa.vector_engine)
+                    if h0 == 0:
+                        nisa.tensor_reduce(dst=acc, op=nl.add, data=prod.ap(pattern=[[CG * LW, 128], [1, LW], [LW, CG]],
+                                                                             offset=0), axis=2)
+                    else:
+                        part = nl.ndarray((128, LW), dtype=f32, buffer=nl.sbuf)
+                        nisa.tensor_reduce(dst=part, op=nl.add, data=prod.ap(pattern=[[CG * LW, 128], [1, LW], [LW, CG]],
+                                                                              offset=0), axis=2)
+                        nisa.tensor_tensor(dst=acc, data1=acc, data2=part, op=nl.add, engine=nisa.vector_engine)
+                gs.append(acc)
+            gc = nl.ndarray((128, LW), dtype=bf16, buffer=nl.sbuf)
+            uc = nl.ndarray((128, LW), dtype=bf16, buffer=nl.sbuf)
+            if act == 1:
+                nisa.tensor_scalar(dst=gc, data=gs[0], op0=nl.minimum, operand0=lim, engine=nisa.vector_engine)
+                nisa.tensor_scalar(dst=uc, data=gs[1], op0=nl.minimum, operand0=lim, op1=nl.maximum, operand1=-lim,
+                                   engine=nisa.vector_engine)
+            else:
+                nisa.tensor_copy(dst=gc, src=gs[0], engine=nisa.vector_engine)
+                nisa.tensor_copy(dst=uc, src=gs[1], engine=nisa.vector_engine)
+            sl = nl.ndarray((128, LW), dtype=f32, buffer=nl.sbuf)
+            nisa.activation(dst=sl, op=nl.silu, data=gc)
+            nisa.tensor_tensor(dst=aT[:, m, :], data1=sl, data2=uc, op=nl.multiply, engine=nisa.vector_engine)
+        ys = nl.ndarray((LW, H), dtype=bf16, buffer=nl.sbuf)
+        MG = min(M, 512 // LW)  # I-chunks per PSUM stack (2 KB per partition)
+        for q in range(H // 512):
+            # the transposes of yt write it: fp32 PSUM on gen2, the input's bf16 from gen3 on ("nc_matmul (transpose
+            # mode) dst dtype must match input dtype on gen3+", nki/isa/_validation.py); the same bf16 values
+            py = nl.ndarray((LW, 512), dtype=f32 if nisa.get_nc_version() == nisa.nc_version.gen2 else bf16,
+                            buffer=nl.psum)
+            for hh in range(4):
+                b0 = q * 512 + hh * 128
+                yt = nl.ndarray((128, LW), dtype=bf16, buffer=nl.sbuf)
+                ya = None
+                for m0 in range(0, M, MG):
+                    pd = nl.ndarray((128, MG, LW), dtype=f32, buffer=nl.psum)
+                    for m in range(m0, m0 + MG):
+                        nisa.nc_matmul(dst=pd[:, m - m0, :], stationary=dw[:, m, b0:b0 + 128].view(fp8),
+                                       moving=aT[:, m, :], accumulate=False)
+                    prod = nl.ndarray((128, MG, LW), dtype=f32, buffer=nl.sbuf)
+                    nisa.tensor_tensor(dst=prod, data1=pd, data2=sdt.ap(pattern=[[M * CT, 128], [CT, MG], [0, LW]],
+                                                                        offset=m0 * CT + 4 * q + hh),
+                                       op=nl.multiply, engine=nisa.vector_engine)
+                    red = prod.ap(pattern=[[MG * LW, 128], [1, LW], [LW, MG]], offset=0)
+                    if MG == M:
+                        nisa.tensor_reduce(dst=yt, op=nl.add, data=red, axis=2)
+                    elif m0 == 0:
+                        ya = nl.ndarray((128, LW), dtype=f32, buffer=nl.sbuf)
+                        nisa.tensor_reduce(dst=ya, op=nl.add, data=red, axis=2)
+                    else:
+                        part = nl.ndarray((128, LW), dtype=f32, buffer=nl.sbuf)
+                        nisa.tensor_reduce(dst=part, op=nl.add, data=red, axis=2)
+                        if m0 + MG < M:
+                            nisa.tensor_tensor(dst=ya, data1=ya, data2=part, op=nl.add, engine=nisa.vector_engine)
+                        else:
+                            nisa.tensor_tensor(dst=yt, data1=ya, data2=part, op=nl.add, engine=nisa.vector_engine)
+                nisa.nc_transpose(dst=py[:, hh * 128:(hh + 1) * 128], data=yt, engine=nisa.tensor_engine)
+            nisa.activation(dst=ys[:, q * 512:(q + 1) * 512], op=nl.copy, data=py, scale=w)
+        dst = out.ap(pattern=[[H, LW], [1, H]], offset=0, vector_offset=ts.ap(pattern=[[1, LW], [1, 1]], offset=0),
+                     indirect_dim=0)
+        nisa.dma_compute(dst=dst, srcs=[dst, ys], reduce_op=nl.add, oob_mode=oob_mode.skip)
+
+    @nki.jit
+    def kiln_moe_ep_small3(x, topi, wts, lmap, gu, dn, tsg, tsd, LW: int, act: int, lim: float, bc: int, rev: int):
+        """kiln_moe_ep_small2 (the same plan, tables, pass kinds and arithmetic) on the tile-scale layout only, its small
+        passes through _pass_s3 (few large weight DMAs, one register offset); the dequantize-first passes as v2's."""
+        C, H = x.shape
+        K = topi.shape[1]
+        E = lmap.shape[1]
+        El = gu.shape[0]
+        M = gu.shape[2]
+        CT = H // 128
+        f32, bf16, i32 = nl.float32, nl.bfloat16, nl.int32
+        P = _plan_s2(topi, wts, lmap, C, K, E, El, LW)
+        S = dict(H=H, M=M, CT=CT, LW=LW, gu=gu, tsg=tsg, dn=dn, tsd=tsd, act=act, lim=lim, x=x)
+        SB = dict(H=H, M=M, CT=CT, LW=128, NS=1, gu=gu, sgu=tsg, dn=dn, sdn=tsd, sels=_consts(bc), act=act, lim=lim,
+                  tsc=1)
+        Pd = dict(NT=P["NT"], C=C, K=K, jrow=P["jrow_b"], ones1=P["ones1"], loc_h=P["loc_h"], wts=wts)
+        out = nl.ndarray((C, H), dtype=x.dtype, buffer=nl.shared_hbm)
+        zt = nl.ndarray((128, H), dtype=x.dtype, buffer=nl.sbuf)
+        nisa.memset(dst=zt, value=0.0)
+        for t in range(C // 128):
+            nisa.dma_copy(dst=out[t * 128:(t + 1) * 128, :], src=zt)
+        xrs = nl.ndarray((LW, H), dtype=bf16, buffer=nl.sbuf)
+        nisa.memset(dst=xrs, value=0.0)
+        xrb = nl.ndarray((128, H), dtype=bf16, buffer=nl.sbuf)
+        nisa.memset(dst=xrb, value=0.0)
+        er = nisa.register_alloc()
+        rs = nisa.register_alloc()
+        nisa.register_load(rs, P["tsm"]["n"])
+
+        def body_s(it):
+            e_sb, ef, ng = _table_pass(P, P["tsm"], it, LW)
+            nisa.register_load(er, e_sb)
+            ts = nl.ndarray((LW, 1), dtype=i32, buffer=nl.sbuf)
+            _lanes_s(P, ng, 0, LW, ts)
+            w = nl.ndarray((LW, 1), dtype=f32, buffer=nl.sbuf)
+            _weights_s(P, ts, ef, LW, w)
+            _pass_s3(S, er, ts, w, xrs, out)
+
+        nl.fori_loop(0, rs, body_s)
+        rb = nisa.register_alloc()
+        nisa.register_load(rb, P["tbg"]["n"])
+
+        def body_b(it):
+            e_sb, ef, ng = _table_pass(P, P["tbg"], it, 128)
+            ts = nl.ndarray((128, 1), dtype=i32, buffer=nl.sbuf)
+            _lane_tokens(SB, Pd, ng, 0, 0, ts)
+            w = nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf)
+            _lane_weights(SB, Pd, ts, ef, w)
+            _pass(SB, dict(xkind="gather", ykind="rmw", ekind="dyn", e_sb=e_sb, x=x, ts=ts, xr=[xrb], w=w, out=out))
+
+        nl.fori_loop(0, rb, body_b)
+        return out
+
+    # --- end of the small-lane kernel v3's source ---
+
+    # --- the small-lane kernel v5 (KILN_MOE_EP_SMALL_V=5): v3's small passes two per loop iteration ---
+
+    def _pass_s5(S, e_reg, ts, w, xr, out):
+        """_pass_s3 (the same instructions on the same values) with the whole-down DMA issued right after the last gate_up
+        DMA instead of after the first two: alone a pass is no faster (its down phase waits for those bytes either way),
+        but two passes in one loop iteration (kiln_moe_ep_small5) then stream the second expert's gate_up under the
+        first one's down phase."""
+        H, M, CT, LW = S["H"], S["M"], S["CT"], S["LW"]
+        gu, tsg, dn, tsd, act, lim = S["gu"], S["tsg"], S["dn"], S["tsd"], S["act"], S["lim"]
+        f32, bf16, fp8, u8 = nl.float32, nl.bfloat16, nl.float8_e4m3, nl.uint8
+        CG = min(CT, 512 // LW)
+        MP = 2  # I-chunks per gate_up DMA
+        NP = M // MP
+        GU = M * 2 * CT * 128  # gate_up bytes per partition and expert
+        sg = nl.ndarray((128, M, 2, CT), dtype=f32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=sg, src=tsg.ap(pattern=[[0, 128], [1, M * 2 * CT]], offset=0, scalar_offset=e_reg,
+                                         indirect_dim=0))
+        gq = []
+        for k in range(min(2, NP)):
+            b = nl.ndarray((128, MP, 2, CT * 128), dtype=u8, buffer=nl.sbuf)
+            nisa.dma_copy(dst=b, src=gu.ap(pattern=[[GU, 128], [1, MP * 2 * CT * 128]], offset=k * MP * 2 * CT * 128,
+                                           scalar_offset=e_reg, indirect_dim=0))
+            gq.append(b)
+        nisa.dma_copy(dst=xr, src=S["x"].ap(pattern=[[H, LW], [1, H]], offset=0,
+                                             vector_offset=ts.ap(pattern=[[1, LW], [1, 1]], offset=0), indirect_dim=0),
+                      oob_mode=oob_mode.skip)
+        sdt = nl.ndarray((128, M, CT), dtype=f32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=sdt, src=tsd.ap(pattern=[[0, 128], [1, M * CT]], offset=0, scalar_offset=e_reg, indirect_dim=0))
+        dw = nl.ndarray((128, M, H), dtype=u8, buffer=nl.sbuf)
+        dwq = []
+        xT = nl.ndarray((128, CT, LW), dtype=bf16, buffer=nl.sbuf)
+        for c4 in range(CT // 4):
+            px = nl.ndarray((128, 4, LW), dtype=f32 if nisa.get_nc_version() == nisa.nc_version.gen2 else bf16,
+                            buffer=nl.psum)
+            for j in range(4):
+                c = c4 * 4 + j
+                nisa.nc_transpose(dst=px[:, j, :], data=xr[:, c * 128:(c + 1) * 128], engine=nisa.tensor_engine)
+            nisa.activation(dst=xT[:, c4 * 4:(c4 + 1) * 4, :], op=nl.copy, data=px)
+        aT = nl.ndarray((128, M, LW), dtype=bf16, buffer=nl.sbuf)
+        for m in range(M):
+            k = m // MP
+            if m % MP == 0 and k + 2 < NP:  # the pair two ahead
+                b = nl.ndarray((128, MP, 2, CT * 128), dtype=u8, buffer=nl.sbuf)
+                nisa.dma_copy(dst=b, src=gu.ap(pattern=[[GU, 128], [1, MP * 2 * CT * 128]],
+                                               offset=(k + 2) * MP * 2 * CT * 128, scalar_offset=e_reg, indirect_dim=0))
+                gq.append(b)
+            if m % MP == 0 and len(dwq) == 0 and (k + 2 >= NP - 1):  # the last gate_up DMA is out: the down weights next
+                nisa.dma_copy(dst=dw, src=dn.ap(pattern=[[M * H, 128], [1, M * H]], offset=0, scalar_offset=e_reg,
+                                                indirect_dim=0))
+                dwq.append(dw)
+            wq = gq[k]
+            gs = []
+            for g in range(2):
+                acc = nl.ndarray((128, LW), dtype=f32, buffer=nl.sbuf)
+                for h0 in range(0, CT, CG):
+                    pp = nl.ndarray((128, CG, LW), dtype=f32, buffer=nl.psum)
+                    for c in range(h0, h0 + CG):
+                        nisa.nc_matmul(dst=pp[:, c - h0, :], stationary=wq[:, m % MP, g, c * 128:(c + 1) * 128].view(fp8),
+                                       moving=xT[:, c, :], accumulate=False)
+                    prod = nl.ndarray((128, CG, LW), dtype=f32, buffer=nl.sbuf)
+                    nisa.tensor_tensor(dst=prod, data1=pp, data2=sg.ap(pattern=[[M * 2 * CT, 128], [1, CG], [0, LW]],
+                                                                       offset=m * 2 * CT + g * CT + h0),
+                                       op=nl.multiply, engine=nisa.vector_engine)
+                    if h0 == 0:
+                        nisa.tensor_reduce(dst=acc, op=nl.add, data=prod.ap(pattern=[[CG * LW, 128], [1, LW], [LW, CG]],
+                                                                             offset=0), axis=2)
+                    else:
+                        part = nl.ndarray((128, LW), dtype=f32, buffer=nl.sbuf)
+                        nisa.tensor_reduce(dst=part, op=nl.add, data=prod.ap(pattern=[[CG * LW, 128], [1, LW], [LW, CG]],
+                                                                              offset=0), axis=2)
+                        nisa.tensor_tensor(dst=acc, data1=acc, data2=part, op=nl.add, engine=nisa.vector_engine)
+                gs.append(acc)
+            gc = nl.ndarray((128, LW), dtype=bf16, buffer=nl.sbuf)
+            uc = nl.ndarray((128, LW), dtype=bf16, buffer=nl.sbuf)
+            if act == 1:
+                nisa.tensor_scalar(dst=gc, data=gs[0], op0=nl.minimum, operand0=lim, engine=nisa.vector_engine)
+                nisa.tensor_scalar(dst=uc, data=gs[1], op0=nl.minimum, operand0=lim, op1=nl.maximum, operand1=-lim,
+                                   engine=nisa.vector_engine)
+            else:
+                nisa.tensor_copy(dst=gc, src=gs[0], engine=nisa.vector_engine)
+                nisa.tensor_copy(dst=uc, src=gs[1], engine=nisa.vector_engine)
+            sl = nl.ndarray((128, LW), dtype=f32, buffer=nl.sbuf)
+            nisa.activation(dst=sl, op=nl.silu, data=gc)
+            nisa.tensor_tensor(dst=aT[:, m, :], data1=sl, data2=uc, op=nl.multiply, engine=nisa.vector_engine)
+        ys = nl.ndarray((LW, H), dtype=bf16, buffer=nl.sbuf)
+        MG = min(M, 512 // LW)  # I-chunks per PSUM stack (2 KB per partition)
+        for q in range(H // 512):
+            # the transposes of yt write it: fp32 PSUM on gen2, the input's bf16 from gen3 on ("nc_matmul (transpose
+            # mode) dst dtype must match input dtype on gen3+", nki/isa/_validation.py); the same bf16 values
+            py = nl.ndarray((LW, 512), dtype=f32 if nisa.get_nc_version() == nisa.nc_version.gen2 else bf16,
+                            buffer=nl.psum)
+            for hh in range(4):
+                b0 = q * 512 + hh * 128
+                yt = nl.ndarray((128, LW), dtype=bf16, buffer=nl.sbuf)
+                ya = None
+                for m0 in range(0, M, MG):
+                    pd = nl.ndarray((128, MG, LW), dtype=f32, buffer=nl.psum)
+                    for m in range(m0, m0 + MG):
+                        nisa.nc_matmul(dst=pd[:, m - m0, :], stationary=dw[:, m, b0:b0 + 128].view(fp8),
+                                       moving=aT[:, m, :], accumulate=False)
+                    prod = nl.ndarray((128, MG, LW), dtype=f32, buffer=nl.sbuf)
+                    nisa.tensor_tensor(dst=prod, data1=pd, data2=sdt.ap(pattern=[[M * CT, 128], [CT, MG], [0, LW]],
+                                                                        offset=m0 * CT + 4 * q + hh),
+                                       op=nl.multiply, engine=nisa.vector_engine)
+                    red = prod.ap(pattern=[[MG * LW, 128], [1, LW], [LW, MG]], offset=0)
+                    if MG == M:
+                        nisa.tensor_reduce(dst=yt, op=nl.add, data=red, axis=2)
+                    elif m0 == 0:
+                        ya = nl.ndarray((128, LW), dtype=f32, buffer=nl.sbuf)
+                        nisa.tensor_reduce(dst=ya, op=nl.add, data=red, axis=2)
+                    else:
+                        part = nl.ndarray((128, LW), dtype=f32, buffer=nl.sbuf)
+                        nisa.tensor_reduce(dst=part, op=nl.add, data=red, axis=2)
+                        if m0 + MG < M:
+                            nisa.tensor_tensor(dst=ya, data1=ya, data2=part, op=nl.add, engine=nisa.vector_engine)
+                        else:
+                            nisa.tensor_tensor(dst=yt, data1=ya, data2=part, op=nl.add, engine=nisa.vector_engine)
+                nisa.nc_transpose(dst=py[:, hh * 128:(hh + 1) * 128], data=yt, engine=nisa.tensor_engine)
+            nisa.activation(dst=ys[:, q * 512:(q + 1) * 512], op=nl.copy, data=py, scale=w)
+        return ys
+
+    def _rmw_s(S, ts, ys, out):
+        """A small pass's output rows added into out at its lanes' tokens (the scatter read-modify-write that ends
+        _pass_s; kiln_moe_ep_small5 issues it after both passes of an iteration, so that the DMA queue does not wait
+        on the first pass's last drain before the second pass's weights are requested)."""
+        H, LW = S["H"], S["LW"]
+        dst = out.ap(pattern=[[H, LW], [1, H]], offset=0, vector_offset=ts.ap(pattern=[[1, LW], [1, 1]], offset=0),
+                     indirect_dim=0)
+        nisa.dma_compute(dst=dst, srcs=[dst, ys], reduce_op=nl.add, oob_mode=oob_mode.skip)
+
+
+    @nki.jit
+    def kiln_moe_ep_small5(x, topi, wts, lmap, gu, dn, tsg, tsd, LW: int, act: int, lim: float, bc: int, rev: int):
+        """kiln_moe_ep_small3's plan, pass kinds and arithmetic, its small passes two per device-loop iteration (table
+        entries 2 it and 2 it + 1, _pass_s5 each, in program order, so the second expert's weights stream while the
+        first one's down phase computes) and an odd last one in a second loop of trip count n % 2; the
+        dequantize-first passes as v2's."""
+        C, H = x.shape
+        K = topi.shape[1]
+        E = lmap.shape[1]
+        El = gu.shape[0]
+        M = gu.shape[2]
+        CT = H // 128
+        f32, bf16, i32 = nl.float32, nl.bfloat16, nl.int32
+        P = _plan_s2(topi, wts, lmap, C, K, E, El, LW)
+        S = dict(H=H, M=M, CT=CT, LW=LW, gu=gu, tsg=tsg, dn=dn, tsd=tsd, act=act, lim=lim, x=x)
+        SB = dict(H=H, M=M, CT=CT, LW=128, NS=1, gu=gu, sgu=tsg, dn=dn, sdn=tsd, sels=_consts(bc), act=act, lim=lim,
+                  tsc=1)
+        Pd = dict(NT=P["NT"], C=C, K=K, jrow=P["jrow_b"], ones1=P["ones1"], loc_h=P["loc_h"], wts=wts)
+        out = nl.ndarray((C, H), dtype=x.dtype, buffer=nl.shared_hbm)
+        zt = nl.ndarray((128, H), dtype=x.dtype, buffer=nl.sbuf)
+        nisa.memset(dst=zt, value=0.0)
+        for t in range(C // 128):
+            nisa.dma_copy(dst=out[t * 128:(t + 1) * 128, :], src=zt)
+        xra = nl.ndarray((LW, H), dtype=bf16, buffer=nl.sbuf)  # the pair loop's x rows (two sets), zeroed once
+        nisa.memset(dst=xra, value=0.0)
+        xrc = nl.ndarray((LW, H), dtype=bf16, buffer=nl.sbuf)
+        nisa.memset(dst=xrc, value=0.0)
+        xrb = nl.ndarray((128, H), dtype=bf16, buffer=nl.sbuf)
+        nisa.memset(dst=xrb, value=0.0)
+        # trip counts: n // 2 pairs, then n % 2; the remainder is table entry n - 1
+        n_s = P["tsm"]["n"]
+        npr = nl.ndarray((1, 1), dtype=i32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=npr, data=n_s, op0=nl.right_shift, operand0=1)
+        n2 = nl.ndarray((1, 1), dtype=i32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=n2, data=npr, op0=nl.left_shift, operand0=1)
+        nrm = nl.ndarray((1, 1), dtype=i32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=nrm, data1=n_s, data2=n2, op=nl.subtract, engine=nisa.vector_engine)
+        ilast = nl.ndarray((1, 1), dtype=i32, buffer=nl.sbuf)  # n - 1 (only read when n is odd)
+        nisa.tensor_scalar(dst=ilast, data=n2, op0=nl.add, operand0=0)
+        # the pair tables: entries 0, 2, 4, .. and 1, 3, 5, .. of the small table, by strided HBM -> HBM copies (a loop
+        # register cannot be stored to SBUF on trn1, NCC_IXCG832, so the loop indexes these directly)
+        PA = (El + 1) // 2  # entries 0, 2, .. < El
+        PC = El // 2  # entries 1, 3, .. < El
+        tae = nl.ndarray((PA, 1), dtype=i32, buffer=nl.private_hbm)
+        nisa.dma_copy(dst=tae, src=P["tsm"]["e"].ap(pattern=[[2, PA], [1, 1]], offset=0))
+        taf = nl.ndarray((PA, 1), dtype=f32, buffer=nl.private_hbm)
+        nisa.dma_copy(dst=taf, src=P["tsm"]["ef"].ap(pattern=[[2, PA], [1, 1]], offset=0))
+        tce = nl.ndarray((PC, 1), dtype=i32, buffer=nl.private_hbm)
+        nisa.dma_copy(dst=tce, src=P["tsm"]["e"].ap(pattern=[[2, PC], [1, 1]], offset=1))
+        tcf = nl.ndarray((PC, 1), dtype=f32, buffer=nl.private_hbm)
+        nisa.dma_copy(dst=tcf, src=P["tsm"]["ef"].ap(pattern=[[2, PC], [1, 1]], offset=1))
+        tpa = dict(e=tae, ef=taf)
+        tpc = dict(e=tce, ef=tcf)
+        era = nisa.register_alloc()
+        erc = nisa.register_alloc()
+        rp = nisa.register_alloc()
+        nisa.register_load(rp, npr)
+
+        def body_p(it):
+            ea, efa, nga = _table_pass(P, tpa, it, LW)
+            nisa.register_load(era, ea)
+            tsa = nl.ndarray((LW, 1), dtype=i32, buffer=nl.sbuf)
+            _lanes_s(P, nga, 0, LW, tsa)
+            wa = nl.ndarray((LW, 1), dtype=f32, buffer=nl.sbuf)
+            _weights_s(P, tsa, efa, LW, wa)
+            ec, efc, ngc = _table_pass(P, tpc, it, LW)
+            nisa.register_load(erc, ec)
+            tsc_ = nl.ndarray((LW, 1), dtype=i32, buffer=nl.sbuf)
+            _lanes_s(P, ngc, 0, LW, tsc_)
+            wc = nl.ndarray((LW, 1), dtype=f32, buffer=nl.sbuf)
+            _weights_s(P, tsc_, efc, LW, wc)
+            ysa = _pass_s5(S, era, tsa, wa, xra, out)
+            ysc = _pass_s5(S, erc, tsc_, wc, xrc, out)
+            _rmw_s(S, tsa, ysa, out)
+            _rmw_s(S, tsc_, ysc, out)
+
+        nl.fori_loop(0, rp, body_p)
+        rr = nisa.register_alloc()
+        nisa.register_load(rr, nrm)
+
+        def body_r(it):
+            e_sb, ef, ng = _table_pass(P, P["tsm"], ilast, LW)
+            nisa.register_load(era, e_sb)
+            ts = nl.ndarray((LW, 1), dtype=i32, buffer=nl.sbuf)
+            _lanes_s(P, ng, 0, LW, ts)
+            w = nl.ndarray((LW, 1), dtype=f32, buffer=nl.sbuf)
+            _weights_s(P, ts, ef, LW, w)
+            ys = _pass_s5(S, era, ts, w, xra, out)
+            _rmw_s(S, ts, ys, out)
+
+        nl.fori_loop(0, rr, body_r)
+        rb = nisa.register_alloc()
+        nisa.register_load(rb, P["tbg"]["n"])
+
+        def body_b(it):
+            e_sb, ef, ng = _table_pass(P, P["tbg"], it, 128)
+            ts = nl.ndarray((128, 1), dtype=i32, buffer=nl.sbuf)
+            _lane_tokens(SB, Pd, ng, 0, 0, ts)
+            w = nl.ndarray((128, 1), dtype=f32, buffer=nl.sbuf)
+            _lane_weights(SB, Pd, ts, ef, w)
+            _pass(SB, dict(xkind="gather", ykind="rmw", ekind="dyn", e_sb=e_sb, x=x, ts=ts, xr=[xrb], w=w, out=out))
+
+        nl.fori_loop(0, rb, body_b)
+        return out
+
+    # --- end of the small-lane kernel v5's source ---
+
 else:
-    kiln_moe_ep_core = kiln_moe_ep_kernel = kiln_moe_ep_small = None
+    kiln_moe_ep_core = kiln_moe_ep_kernel = kiln_moe_ep_small = kiln_moe_ep_small2 = kiln_moe_ep_small3 = kiln_moe_ep_small5 = None
 
 
 def _kernel_rev(end: str = "    # --- end of the dequantize-first kernel's source") -> int:
@@ -1073,13 +1740,16 @@ def _kernel_rev(end: str = "    # --- end of the dequantize-first kernel's sourc
     import zlib
 
     src = open(__file__).read()
-    a = src.index("if nki is not None:\n    def _consts")
+    a = src.index("if nki is not None:\n    DGU = ")
     b = src.index(end, a)
     return zlib.crc32(src[a:b].encode())
 
 
 REV = _kernel_rev()
 REV_SMALL = _kernel_rev("    # --- end of the small-lane kernel's source")
+REV_SMALL2 = _kernel_rev("    # --- end of the small-lane kernel v2's source")
+REV_SMALL3 = _kernel_rev("    # --- end of the small-lane kernel v3's source")
+REV_SMALL5 = _kernel_rev("    # --- end of the small-lane kernel v5's source")
 # The scale broadcast (kernel argument bc): 3 matmuls per 512-column scale row (hi, mid, lo selected and
 # accumulated in PSUM, exact by construction) or 1 (one ones matmul over the three parts: exact only if the
 # tensor engine's sum over its three partitions is, which tools/probe_moe_ep.py --bc 1 checks).
@@ -1109,6 +1779,18 @@ def overflow_lanes(LW: int, M: int) -> int:
 # with passes of SMALL_LW lanes; larger ones the dequantize-first kernel. KILN_MOE_EP_SMALL_ROWS=0 turns it off.
 SMALL_ROWS = int(os.environ.get("KILN_MOE_EP_SMALL_ROWS", "128"))
 SMALL_LW = int(os.environ.get("KILN_MOE_EP_SMALL_LW", "16"))
+# Which small-lane kernel: 1 kiln_moe_ep_small (every local expert's first pass static, an expert with more than
+# SMALL_LW pairs reloading its weights per overflow pass); 2 kiln_moe_ep_small2 (one pass per expert WITH pairs: a
+# small-lane pass for at most SMALL_LW pairs, else one dequantize-first pass of 128 lanes; none for an expert without);
+# 3 kiln_moe_ep_small3 (v2 with each small pass's weights in 12 large DMAs; tile-scale layouts only, else v2); 5
+# kiln_moe_ep_small5 (v3's small passes two per loop iteration; tile-scale layouts only). v2, v3 and v5 give the same
+# output bit for bit. Default 2 (2026-10-05, docs/neuron-notes.md "Decode v2 in serving": G64 122.8 -> 129.5 and F0
+# 110.1 -> 117.1 out tok/s on trn1.32xlarge against v1; decode-path NLL change +0.0005 / -0.0008 nats per token on
+# LONG_TEXT / wikitext-2, every flip at a near-tie: "The decode-path numerics gate").
+SMALL_V_DEFAULT = 2
+# KILN_MOE_EP_DGE=sw (experiment, kiln_moe_ep_kernel's dge): its gathers on software DGE.
+DGE = os.environ.get("KILN_MOE_EP_DGE", "")
+SMALL_V = int(os.environ.get("KILN_MOE_EP_SMALL_V", str(SMALL_V_DEFAULT)))
 
 
 def uses_small(T: int) -> bool:
@@ -1137,9 +1819,14 @@ def kernel_inputs(x, topv, topi, blob, lmap, act: int = 1, lim: float = 10.0, LW
     PM = max_passes(C, K, El, LW2)
     tsc = tile_scales(blob) if tsc is None else tsc
     sg, sd = (blob["tsg"], blob["tsd"]) if tsc else (blob["sgu"], blob["sdn"])
-    return dict(x=x, topi=topi.to(torch.int32), wts=topv.to(torch.bfloat16), lmap=lmap.to(torch.int32),
+    args = dict(x=x, topi=topi.to(torch.int32), wts=topv.to(torch.bfloat16), lmap=lmap.to(torch.int32),
                 gu=blob["gu"], sgu=sg, dn=blob["dn"], sdn=sd, LW=LW, LW2=LW2, PMAX=PM,
                 act=act, lim=float(lim), bc=BCAST if bc is None else bc, rev=REV, tsc=int(tsc))
+    if split(blob["gu"].shape[2], x.shape[1]):  # only then: an unsplit call's arguments, and so its graph key, are as before
+        args["spl"] = 1
+    if DGE == "sw":
+        args["dge"] = 1
+    return args
 
 
 def local_map(owner: torch.Tensor, rank: int) -> torch.Tensor:
@@ -1151,6 +1838,36 @@ def local_map(owner: torch.Tensor, rank: int) -> torch.Tensor:
     idx = torch.cumsum(mine.to(torch.int64), 0) - 1
     m = torch.where(mine, idx, torch.full_like(idx, El))
     return torch.cat([m, torch.full((1,), El, dtype=m.dtype, device="cpu")]).to(torch.int32).view(1, -1)
+
+
+def grid() -> int:
+    """The grid every kernel of this module is launched at: the runtime's LNC (platform.nki_grid: 1 on trn1, 2 on
+    trn2). At LNC=2 the kernels see two programs (_lnc_setup): unsplit, both cores run the whole kernel and only
+    program 0 writes out (each pass is a read-modify-write add, so a second writer would add every pair twice: what
+    engine-v0's grid-2 launch did on trn2, 2026-10-05); split (split()), each core does half. Grid 1 at LNC=2 does not
+    compile: neuronx-cc builds the kernel's device loops for core 0 only ("[NCC_IXGM002] Expected function sg0001 in
+    subgraph 1 to have 9 basic blocks, but on core 1 it has 1 basic blocks")."""
+    from .. import platform
+
+    return platform.nki_grid()
+
+
+def split(M: int | None = None, H: int | None = None) -> int:
+    """1 when kiln_moe_ep_kernel / kiln_moe_ep_small2 / kiln_moe_ep_core split their work over the two physical cores
+    of an LNC=2 logical core (kiln/platform.py KILN_LNC_SPLIT names moe_ep, and the runtime's LNC is 2): each program
+    computes gate_up for half of the I-chunks and the down projection for half of the output columns, with the two
+    halves of a^T swapped between the cores (_pass), the unsplit arithmetic bit for bit. Launched with grid 2 then.
+    Part of the graph key (the kernels' `spl` argument). M (I-chunks) and H: the split needs both halves whole
+    (M and H / 512 even); otherwise the call runs unsplit."""
+    from .. import platform
+
+    try:
+        lnc = platform.nki_grid()
+    except RuntimeError:  # no runtime configured (host tests, emulation): nothing is launched
+        return 0
+    if M is not None and (M % 2 or (H // 512) % 2):
+        return 0
+    return int(lnc == 2 and platform.lnc_split("moe_ep"))
 
 
 def moe_ep(x, topv, topi, blob, lmap, act: int = 1, lim: float = 10.0) -> torch.Tensor:
@@ -1166,15 +1883,32 @@ def moe_ep(x, topv, topi, blob, lmap, act: int = 1, lim: float = 10.0) -> torch.
         x = torch.cat([x, x.new_zeros(pad, x.shape[1])])
         topi = torch.cat([topi, topi.new_full((pad, topi.shape[1]), lmap.shape[1] - 1)])
         topv = torch.cat([topv, topv.new_zeros(pad, topv.shape[1])])
-    if uses_small(T):
+    if uses_small(T) and SMALL_V in (3, 5) and tile_scales(blob):
+        kern, rev = {3: (kiln_moe_ep_small3, REV_SMALL3), 5: (kiln_moe_ep_small5, REV_SMALL5)}[SMALL_V]
+        if grid() != 1:
+            raise ValueError(f"KILN_MOE_EP_SMALL_V={SMALL_V} has no LNC=2 form: use the default 2")
+        out = wrap_nki(kern)[grid()](
+            x=x, topi=topi.to(torch.int32), wts=topv.to(torch.bfloat16), lmap=lmap.to(torch.int32), gu=blob["gu"],
+            dn=blob["dn"], tsg=blob["tsg"], tsd=blob["tsd"], LW=SMALL_LW, act=act, lim=float(lim), bc=BCAST, rev=rev)
+    elif uses_small(T) and SMALL_V in (2, 3, 5):
+        tsc = tile_scales(blob)
+        sg, sd = (blob["tsg"], blob["tsd"]) if tsc else (blob["sgu"], blob["sdn"])
+        spl = split(blob["gu"].shape[2], x.shape[1])
+        out = wrap_nki(kiln_moe_ep_small2)[grid()](
+            x=x, topi=topi.to(torch.int32), wts=topv.to(torch.bfloat16), lmap=lmap.to(torch.int32), gu=blob["gu"],
+            dsg=blob["dsg"], dn=blob["dn"], dsd=blob["dsd"], sgu=sg, sdn=sd, LW=SMALL_LW, act=act, lim=float(lim),
+            bc=BCAST, rev=REV_SMALL2, tsc=int(tsc), **({"spl": 1} if spl else {}))
+    elif uses_small(T):
         C, K = topi.shape
         El = blob["gu"].shape[0]
-        out = wrap_nki(kiln_moe_ep_small)[platform.nki_grid()](
+        if grid() != 1:
+            raise ValueError("KILN_MOE_EP_SMALL_V=1 has no LNC=2 form: use the default 2")
+        out = wrap_nki(kiln_moe_ep_small)[grid()](
             x=x, topi=topi.to(torch.int32), wts=topv.to(torch.bfloat16), lmap=lmap.to(torch.int32), gu=blob["gu"],
             dsg=blob["dsg"], dn=blob["dn"], dsd=blob["dsd"], LW=SMALL_LW, PMAX=max_passes(C, K, El, SMALL_LW), act=act,
             lim=float(lim), rev=REV_SMALL)
     else:
-        out = wrap_nki(kiln_moe_ep_kernel)[platform.nki_grid()](**kernel_inputs(x, topv, topi, blob, lmap, act, lim))
+        out = wrap_nki(kiln_moe_ep_kernel)[grid()](**kernel_inputs(x, topv, topi, blob, lmap, act, lim))
     return out[:T] if pad else out
 
 
@@ -1186,6 +1920,7 @@ def core(xe, ex, blob, LW: int, act: int = 1, lim: float = 10.0, bc: int | None 
 
     tsc = tile_scales(blob) if tsc is None else tsc
     sg, sd = (blob["tsg"], blob["tsd"]) if tsc else (blob["sgu"], blob["sdn"])
-    return wrap_nki(kiln_moe_ep_core)[platform.nki_grid()](
+    spl = split(blob["gu"].shape[2], xe.shape[1])
+    return wrap_nki(kiln_moe_ep_core)[grid()](
         xe=xe, ex=ex.to(torch.int32), gu=blob["gu"], sgu=sg, dn=blob["dn"], sdn=sd, LW=LW, act=act,
-        lim=float(lim), bc=BCAST if bc is None else bc, rev=REV, tsc=int(tsc))
+        lim=float(lim), bc=BCAST if bc is None else bc, rev=REV, tsc=int(tsc), **({"spl": 1} if spl else {}))

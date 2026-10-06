@@ -276,14 +276,14 @@ def verify_inputs(model, B: int, Q: int, P: int, ps: int):
                 table_w=d(tab), bias_w=d(bias), Q=Q)
 
 
-def prefill_inputs(model, C: int, P: int, ps: int):
-    """One sequence's C-token chunk at positions 0..C-1 on pages 1..P (ModelRunner.prefill)."""
+def prefill_inputs(model, C: int, P: int, ps: int, off: int = 0):
+    """One sequence's C-token chunk at positions off..off+C-1 on pages 1..P (ModelRunner.prefill)."""
     import numpy as np
 
     from kiln.engine.model_runner import ModelRunner
 
     table = np.arange(1, 1 + P, dtype=np.int64)
-    pos = np.arange(C, dtype=np.int64)
+    pos = np.arange(off, off + C, dtype=np.int64)
     slot = table[pos // ps] * ps + pos % ps
     win = model.window
     shim = type("S", (), {"window": win, "ps": ps})()
@@ -928,6 +928,9 @@ def main() -> None:
     ap.add_argument("--verify", type=int, default=0,
                     help="time the speculative verify form instead of decode: --batch sequences x Q positions")
     ap.add_argument("--pages", type=int, default=16, help="page bucket of the full-attention table")
+    ap.add_argument("--prefill-offset", type=int, default=0,
+                    help="prefill: the chunk's first position (the KV of the positions before it is whatever the cache "
+                         "holds; positions + chunk must fit the page bucket)")
     ap.add_argument("--page-size", type=int, default=32)
     ap.add_argument("--layers", type=int, default=12, help="layers built (0..n-1)")
     ap.add_argument("--group", type=int, default=6, help="layers per piecewise graph")
@@ -1042,7 +1045,7 @@ def run(args, rank: int = 0, port: int = 0) -> None:
             model.attn_tp, model.attn_group, model.attn_rank = atp, _tp.attention_group(args.ranks, atp), rank % atp
         model.dp_buffers(DEV)
     if args.prefill:
-        inp = prefill_inputs(model, T, P, ps)
+        inp = prefill_inputs(model, T, P, ps, args.prefill_offset)
     else:
         inp = verify_inputs(model, B, Qv, P, ps) if Qv else decode_inputs(model, B, P, ps)
     form = f"prefill C={T}" if args.prefill else (f"verify B={B} x Q={Qv}" if Qv else f"decode B={B}")

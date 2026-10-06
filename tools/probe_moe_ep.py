@@ -217,12 +217,15 @@ def full(args) -> None:
         if args.save_inputs:
             import glob
             path = f"{args.save_inputs}.C{C}.pt"
-            torch.save(dict(x=x, topv=topv, topi=topi.to(torch.int32), lmap=lmap, **blob), path)
+            # keyed as the kernel graph's placeholders (x, topv, topi, lmap, bt_<i> in bn order), for prof_engines.py
+            torch.save(dict(x=x, topv=topv, topi=topi.to(torch.int32), lmap=lmap,
+                            **{f"bt_{i}": blob[k] for i, k in enumerate(bn)}), path)
             cache = "/root/.cache/neuron_libtorch/neuron/compile_cache"
             hs = [h for h in sorted(glob.glob(f"{cache}/*/fxgraph.txt"), key=os.path.getmtime)
-                  if "L_lmap_" in open(h).read() and "sum" in open(h).read()]
-            print(f"    inputs saved to {path}; graph {os.path.basename(os.path.dirname(hs[-1])) if hs else '?'}",
-                  flush=True)
+                  if "L_lmap_" in open(h).read() and "L_bt_0_" in open(h).read()
+                  and f"Shape: ({C}, 4096)" in open(os.path.join(os.path.dirname(h), "example_inputs.txt")).read()]
+            print(f"    inputs saved to {path}; kernel graph (the newest {C}-row one) "
+                  f"{os.path.basename(os.path.dirname(hs[-1])) if hs else '?'}", flush=True)
         ts = pl.timed(f"  the same sum over [{C}, {H}]", lambda a: a.float().sum(0), (x.to(pl.DEV),), args.iters)
         if tk == tk:
             print(f"  -> C={C}: {(tk - (ts - null)) * 1e3:.3f} ms without the readback reduction", flush=True)

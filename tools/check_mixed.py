@@ -95,7 +95,7 @@ def main() -> None:
 
     conc = args.concurrency[0]
     n_req = args.requests or conc
-    eng = LLMEngine(serve_sweep.engine_config(args))
+    eng = LLMEngine(serve_sweep.engine_config(args, args.core_base))  # the sweep's --core-base
     text = LONG_TEXT
     if args.text_file:
         with open(args.text_file) as f:

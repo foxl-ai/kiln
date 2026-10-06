@@ -63,7 +63,7 @@ class Metrics:
             if req.finish_time is not None:
                 self.e2e.observe(req.finish_time - req.arrival_time)
 
-    def render(self, engine) -> str:
+    def render(self, engine, loop=None) -> str:
         s = engine.scheduler
         # Every DP-attention group's pool (one without DP attention).
         pools, radixes = getattr(engine, "pools", [engine.pool]), getattr(engine, "radixes", [engine.radix])
@@ -81,6 +81,7 @@ class Metrics:
             "# TYPE kiln:jump_forward_tokens_total counter",
             f"kiln:jump_forward_tokens_total {engine.jump_forward_tokens}",
         ]
+        lines += pd_lines(engine, loop)
         with self.lock:
             lines += [
                 "# TYPE kiln:prompt_tokens_total counter", f"kiln:prompt_tokens_total {self.prompt_tokens}",
@@ -97,3 +98,50 @@ class Metrics:
                 lines.append(f"# TYPE {name} histogram")
                 lines += h.lines(name)
         return "\n".join(lines) + "\n"
+
+
+def pd_lines(engine, loop=None) -> list[str]:
+    """Prefill / decode disaggregation (engine/disagg.py): the engine's role, its handoff counts, the decode
+    side's queue of handed-off requests and receive buffer (a part that waited for room counts in
+    buffer_full_events / _seconds: backpressure is visible, never a silent retry), the per-handoff transfer
+    time (first frame to complete), the copies' time on each side and the prefill side's send queue."""
+    role = getattr(engine, "pd_role", None)
+    if role is None:
+        return []
+    out = [f'kiln:pd_role{{role="{role}"}} 1']
+    for k, v in sorted(getattr(engine, "pd_counts", {}).items()):
+        out += [f"# TYPE kiln:pd_{k}_total counter", f"kiln:pd_{k}_total {v}"]
+    r = engine.runner
+    out.append(f"kiln:pd_extract_seconds_total {getattr(r, 'pd_extract_seconds', 0.0):.6f}")
+    out.append(f"kiln:pd_inject_seconds_total {getattr(r, 'pd_inject_seconds', 0.0):.6f}")
+    out.append(f"kiln:pd_inject_read_seconds_total {getattr(r, 'pd_inject_read_seconds', 0.0):.6f}")
+    out.append(f"kiln:pd_inject_copies_total {getattr(r, 'pd_inject_copies', 0)}")
+    out.append(f"kiln:pd_extract_runs_total {getattr(r, 'pd_extract_runs', 0)}")
+    snd = getattr(r, "_pd_snd", None)
+    if snd is not None:
+        st = snd.stats
+        out += [f"kiln:pd_send_bytes_total {st.bytes}", f"kiln:pd_send_frames_total {st.frames}",
+                f"kiln:pd_send_queued_bytes {st.queued_bytes}", f"kiln:pd_send_blocked_seconds_total {st.blocked_seconds:.6f}",
+                f"kiln:pd_send_seconds_total {st.send_seconds:.6f}", f"kiln:pd_send_errors_total {st.errors}"]
+    if role == "decode":
+        sch = engine.scheduler
+        out += ["# TYPE kiln:pd_decode_queue gauge", f"kiln:pd_decode_queue {len(sch.prefilled)}",
+                f"kiln:pd_prefilled_preemptions_total {getattr(sch, 'num_prefilled_preemptions', 0)}"]
+        rcv = getattr(engine, "pd_receiver", None)
+        if rcv is not None:
+            st = rcv.stats
+            out += ["# TYPE kiln:pd_buffer_bytes gauge", f"kiln:pd_buffer_bytes {st.held_bytes}",
+                    f"kiln:pd_buffer_max_bytes {st.max_held_bytes}", f"kiln:pd_buffer_budget_bytes {rcv.budget}",
+                    f"kiln:pd_buffer_full_events_total {st.buffer_full_events}",
+                    f"kiln:pd_buffer_full_seconds_total {st.buffer_full_seconds:.6f}",
+                    f"kiln:pd_recv_bytes_total {st.bytes}", f"kiln:pd_recv_complete_total {st.complete}",
+                    f"kiln:pd_recv_refused_total {st.refused}"]
+            h = Histogram()
+            for t in list(st.transfer_seconds):
+                h.observe(t)
+            out.append("# TYPE kiln:pd_transfer_seconds histogram")
+            out += h.lines("kiln:pd_transfer_seconds")
+        if loop is not None:
+            out += [f"kiln:pd_awaiting {len(loop.awaits)}", f"kiln:pd_arrived_unclaimed {len(loop.arrived)}",
+                    f"kiln:pd_expired_total {loop.pd_expired}"]
+    return out

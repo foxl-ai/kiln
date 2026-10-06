@@ -114,14 +114,22 @@ if nki is not None:
                                            indirect_dim=0), src=Sx, oob_mode=nisa.oob_mode.skip)
 
     @nki.jit
-    def kiln_kda_decode_kernel(pool, slots, q, k, v, g, beta, ident, rev: int):
+    def kiln_kda_decode_kernel(pool, slots, q, k, v, g, beta, ident, rev: int, spl: int = 0):
         """pool fp32 [R, H, D, D] (rows slots[1] rewritten in place and returned), slots int32 [2, B] (read rows,
         R = none; write rows), q (scaled), k, v, g (log decay) fp32 [B, H, D], beta fp32 [B, H], ident fp32
         [128, 128] the identity (PE transposes); rev: this module's kernel source revision. Returns o fp32
-        [B, H, D] and pool."""
+        [B, H, D] and pool.
+
+        LNC split (spl 1, grid 2: trn2 at LNC=2; KILN_LNC_SPLIT names kda_decode): each program (physical core) runs
+        the head pipeline of its half of the rows, b_lo .. b_hi - 1, on the column tiles both build (rows are
+        independent: disjoint o rows and state rows; padding rows share a scratch write row, whose content no one
+        reads); both barrier on o and the pool before the kernel ends. spl 0 or one program: the kernel as before."""
         R, H, D, _ = pool.shape
         B = q.shape[0]
         N = B * H
+        npg, pid = (nl.num_programs(axes=0), nl.program_id(axis=0)) if spl == 1 and nl.program_ndim() != 0 else (1, 0)
+        b_lo, b_hi = (0, B) if npg == 1 else ((0, (B + 1) // 2) if pid == 0 else ((B + 1) // 2, B))
+        c_lo, c_hi = b_lo * H, b_hi * H
         o = nl.ndarray((B, H, D), dtype=F32, buffer=nl.shared_hbm)
         sl = _sb((1, 2 * B), I32)
         nisa.dma_copy(dst=sl, src=slots.reshape((1, 2 * B)))
@@ -174,15 +182,18 @@ if nki is not None:
              "KE": KE, "KT": KT, "NVT": NVT, "E": E, "I": I, "NBR": NBR, "QK": QK, "of": of, "B": B, "H": H, "D": D}
         # Software pipeline: the in-order engine queues get head c's stage A before head c - SKEW's stage B, so the
         # tensor engine's outer product of a head never waits on the scalar engine's copies of the same head.
-        for b in range(min(PD, B)):
+        for b in range(b_lo, min(b_lo + PD, b_hi)):
             _load(X, b)
-        for c in range(N + SKEW):
-            if c < N and c % H == 0 and c // H + PD < B:
+        for c in range(c_lo, c_hi + SKEW):
+            if c < c_hi and c % H == 0 and c // H + PD < b_hi:
                 _load(X, c // H + PD)
-            if c < N:
+            if c < c_hi:
                 _stage_a(X, c)
-            if c >= SKEW:
+            if c >= c_lo + SKEW:
                 _stage_b(X, c - SKEW)
+        if npg > 1:  # LNC: both programs' rows written before either ends (whatever runs next reads all of them)
+            nisa.core_barrier(data=o, cores=(0, 1))
+            nisa.core_barrier(data=pool, cores=(0, 1))
         return o, pool
 else:
     kiln_kda_decode_kernel = None
@@ -221,12 +232,26 @@ def decode_step(pool: torch.Tensor, state_slot: torch.Tensor, keep: torch.Tensor
     rd = torch.where(keep, state_slot, torch.full_like(state_slot, R))
     slots = torch.stack([rd, state_slot]).to(torch.int32)
     ident = torch.eye(128, dtype=torch.float32, device=q.device)
+    spl = {"spl": 1} if platform.nki_grid() == 2 and platform.lnc_split("kda_decode") else {}  # in the key only then
     o, _ = wrap_nki(kiln_kda_decode_kernel)[platform.nki_grid()](
         pool=pool, slots=slots, q=q.float().contiguous(), k=k.float().contiguous(), v=v.float().contiguous(),
-        g=g.float().contiguous(), beta=beta.float().contiguous(), ident=ident, rev=REV)
+        g=g.float().contiguous(), beta=beta.float().contiguous(), ident=ident, rev=REV, **spl)
     return o
 
 
-KERNEL = os.environ.get("KILN_KDA_DECODE_KERNEL", "xla")
+# where the decode-path NLL check and the A/Bs ran: trn1 (G16 / F0 / G64), and trn2 (trn2.48xlarge, 2026-10-05, feat/trn2-fast: decode-only step at 16 / 32 / 64 rows per DP group 143.6 / 219.7 / 1438.7 ms -> 110.7 / 154.8 / 264.2 with the decode kernels and SP decode streams; decode-path gate check_mixed 28 / 32 equal, signed dlogprob +0.00020 (docs/neuron-notes.md "trn2 on engine-v0 70ddc1b"))
+DECODE_KERNEL_FAMILIES = ("trn1", "trn2")
+
+
+def _default_kernel() -> str:
+    """KILN_KDA_DECODE_KERNEL unset: nki on a trn1 / trn2 target, xla elsewhere (inf2, trn3 and a host without a Neuron
+    device)."""
+    from .. import platform
+
+    t = platform.target()
+    return "nki" if t is not None and platform.family_of(t) in DECODE_KERNEL_FAMILIES else "xla"
+
+
+KERNEL = os.environ.get("KILN_KDA_DECODE_KERNEL") or _default_kernel()
 if KERNEL not in ("xla", "nki"):
     raise ValueError(f"KILN_KDA_DECODE_KERNEL must be xla or nki, not {KERNEL!r}")

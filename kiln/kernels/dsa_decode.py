@@ -66,7 +66,8 @@ if nki is not None:
     F32, BF16, I32 = nl.float32, nl.bfloat16, nl.int32
 
     @nki.jit
-    def kiln_dsa_decode_kernel(q_lat, kc, rows_t, bias_t, identb, scale: float, fp8: int, rev: int, dbg: int = 0):
+    def kiln_dsa_decode_kernel(q_lat, kc, rows_t, bias_t, identb, scale: float, fp8: int, rev: int, dbg: int = 0,
+                               spl: int = 0):
         """q_lat bf16 [B, H, R]; kc [N / KP, KP R] the latent cache's token rows, KP to a row (pool rows), fp8 e4m3fn (fp8 = 1; the graph is compiled
         with --experimental-unsafe-fp8e4m3fn-as-fp8e4m3 and Kiln's FP8 KV values are clamped to 240, so it is trn1's
         e4m3, which nc_matmul takes) or bf16; rows_t int32 [128, B, NCH] the pool row of slot ch * 128 + p of row b
@@ -76,6 +77,11 @@ if nki is not None:
         B, H, R = q_lat.shape
         LC = R // 128
         assert kc.shape[1] == KP * R
+        # LNC split (spl 1, grid 2: trn2 at LNC=2; KILN_LNC_SPLIT names dsa_decode): each program (physical core)
+        # attends its half of the rows, b_lo .. b_hi - 1 (rows are independent, o rows disjoint), and both barrier
+        # on o before the kernel ends; q_lat^T is built by both. spl 0 or one program: the kernel as before.
+        npg, pid = (nl.num_programs(axes=0), nl.program_id(axis=0)) if spl == 1 and nl.program_ndim() != 0 else (1, 0)
+        b_lo, b_hi = (0, B) if npg == 1 else ((0, (B + 1) // 2) if pid == 0 else ((B + 1) // 2, B))
         T = NCH * KP * 128
         o = nl.ndarray((B, H, R), dtype=F32, buffer=nl.shared_hbm)
         sd = nl.ndarray((B, H, NCH * KP * 128), dtype=F32, buffer=nl.shared_hbm)  # debug: the scores
@@ -129,7 +135,7 @@ if nki is not None:
                                accumulate=False)
             nisa.tensor_copy(dst=QT[:, :, t0:t0 + n], src=pq[:, :, 0:n], engine=nisa.vector_engine)
         bf = bias_t.reshape((B, T))
-        for b in range(B):
+        for b in range(b_lo, b_hi):
             x = b % 2
             # the row's slots: NCH tiles of [128 p, KP R] (trn1's e4m3 for an fp8 cache: under
             # --experimental-unsafe-fp8e4m3fn-as-fp8e4m3 the cache input is that type too, and an e4m3fn tile beside
@@ -204,6 +210,8 @@ if nki is not None:
             ob = OBr[x]
             nisa.tensor_scalar(dst=ob, data=po, op0=nl.multiply, operand0=rden, engine=nisa.vector_engine)
             nisa.dma_copy(dst=o[b], src=ob)
+        if npg > 1:  # LNC: both programs' rows written before either ends
+            nisa.core_barrier(data=o, cores=(0, 1))
         if dbg == 2:
             return o, kd
         if dbg == 3:
@@ -247,11 +255,24 @@ def attend(q_lat: torch.Tensor, kc: torch.Tensor, rows: torch.Tensor, bias: torc
     rows_t = rows.to(torch.int32).reshape(B, NCH, 128).permute(2, 0, 1).contiguous()
     bias_t = bias.float().reshape(B, NCH, 128, KP).permute(0, 1, 3, 2).contiguous()
     eye = torch.eye(128, device=q_lat.device)
+    spl = {"spl": 1} if platform.nki_grid() == 2 and platform.lnc_split("dsa_decode") else {}  # in the key only then
     return wrap_nki(kiln_dsa_decode_kernel)[platform.nki_grid()](
         q_lat=q_lat.to(torch.bfloat16).contiguous(), kc=kc2, rows_t=rows_t,
-        bias_t=bias_t, identb=eye.to(torch.bfloat16), scale=float(scale), fp8=int(fp8), rev=REV, dbg=dbg)
+        bias_t=bias_t, identb=eye.to(torch.bfloat16), scale=float(scale), fp8=int(fp8), rev=REV, dbg=dbg, **spl)
 
 
-KERNEL = os.environ.get("KILN_DSA_DECODE_KERNEL", "xla")
+DECODE_KERNEL_FAMILIES = ("trn1", "trn2")  # where the decode-path checks and A/Bs ran (kernels/kda_decode.py)
+
+
+def _default_kernel() -> str:
+    """KILN_DSA_DECODE_KERNEL unset: nki on a trn1 / trn2 target, xla elsewhere (inf2, trn3 and a host without a Neuron
+    device)."""
+    from .. import platform
+
+    t = platform.target()
+    return "nki" if t is not None and platform.family_of(t) in DECODE_KERNEL_FAMILIES else "xla"
+
+
+KERNEL = os.environ.get("KILN_DSA_DECODE_KERNEL") or _default_kernel()
 if KERNEL not in ("xla", "nki"):
     raise ValueError(f"KILN_DSA_DECODE_KERNEL must be xla or nki, not {KERNEL!r}")

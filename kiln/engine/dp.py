@@ -77,8 +77,37 @@ class DPScheduler:
         return [r for g in self.groups for r in g.waiting]
 
     @property
+    def prefilled(self) -> list[Request]:
+        return [r for g in self.groups for r in g.prefilled]
+
+    @property
     def num_preemptions(self) -> int:
         return sum(g.num_preemptions for g in self.groups)
+
+    @property
+    def num_prefilled_preemptions(self) -> int:
+        return sum(g.num_prefilled_preemptions for g in self.groups)
+
+    @property
+    def prefill_only(self) -> bool:
+        return self.groups[0].prefill_only
+
+    @prefill_only.setter
+    def prefill_only(self, v: bool) -> None:
+        for g in self.groups:
+            g.prefill_only = v
+
+    def add_prefilled(self, req: Request) -> None:
+        """A handed-off request (Scheduler.add_prefilled) goes to the group with a free slot and the fewest
+        live requests: its KV is already computed, so there is no prefix to place it by."""
+        best = None
+        for i, g in enumerate(self.groups):
+            live = len(g.running) + len(g.waiting) + len(g.prefilled)
+            key = (live >= g.cfg.max_num_seqs, live, i)
+            if best is None or key < best:
+                best = key
+        req.dp_group = best[2]
+        self.groups[best[2]].add_prefilled(req)
 
     @property
     def in_flight(self) -> bool:
@@ -160,6 +189,7 @@ class DPScheduler:
             plan.decodes += p.decodes
             plan.prefills += p.prefills
             plan.deferred += p.deferred
+            plan.pd_injected += p.pd_injected
         return plan
 
     def _pack(self, parts: list[StepPlan]) -> None:

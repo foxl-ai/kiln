@@ -45,6 +45,10 @@ PENDING = -1  # placeholder for a token sampled by a step whose results are not 
 LPM_MAX_QUEUE = 128  # SGLang falls back to FCFS above this queue length; so do we
 
 
+# A blind speculative draft (engine/spec_async.py): the drafts are on the device, not known to the host.
+BLIND = -2
+
+
 class NeedSync(Exception):
     """Scheduling needs a preemption while a step is in flight. A preempted request must be
     recomputed from REAL tokens, so the caller commits the in-flight step and retries."""
@@ -129,6 +133,9 @@ class StepPlan:
     decodes: list[ScheduledSeq] = field(default_factory=list)
     prefills: list[ScheduledSeq] = field(default_factory=list)
     deferred: int = 0  # prefill chunks planned and then deferred to a later step (engine/dp.py packing)
+    # Decode side of a disaggregated deployment: transfer ids whose parts this step's launch copied onto
+    # the device (engine._pd_inject_plan); their files are deleted once the step's outputs are read back.
+    pd_injected: list = field(default_factory=list)
 
     def seqs(self) -> list[ScheduledSeq]:
         return self.decodes + self.prefills
@@ -153,6 +160,18 @@ class Scheduler:
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []  # admission order, oldest first
         self.num_preemptions = 0
+        # Prefill / decode disaggregation (engine/disagg.py). prefill_only (a prefill engine): requests end
+        # at their first sampled token, so a request that has one is never scheduled again (under overlap
+        # it is "decoding" until the commit that ends it). prefilled (a decode engine): requests handed off
+        # by a prefill engine, waiting for pages; admitted ahead of every decode of the step.
+        self.prefill_only = False
+        self.prefilled: deque[Request] = deque()
+        # A decode engine holds the pages and state rows of requests that ended in the last commit until the step in
+        # flight then is read back (PagePool.hold): `cooling` counts those requests' slots, which admission may not
+        # reuse yet (engine.LLMEngine._pd_cool).
+        self.cooling = 0
+        self.admit_ok = True  # the engine's admission gate for handed-off requests (engine.LLMEngine._pd_gate)
+        self.num_prefilled_preemptions = 0
 
     # -- public API ---------------------------------------------------------------
 
@@ -257,7 +276,46 @@ class Scheduler:
         self.waiting = deque(sorted(self.waiting, key=key))
 
     def has_work(self) -> bool:
-        return bool(self.waiting or self.running)
+        return bool(self.waiting or self.running or self.prefilled)
+
+    def add_prefilled(self, req: Request) -> None:
+        """A request a prefill engine handed off (engine.LLMEngine.add_prefilled): its prompt's KV and
+        state are in a complete handoff, its first token is the last of token_ids. Admitted by
+        _admit_prefilled."""
+        if req.num_tokens > self.cfg.max_model_len:
+            raise ValueError(f"handed-off request of {req.num_tokens} tokens does not fit "
+                             f"max_model_len={self.cfg.max_model_len}")
+        self.prefilled.append(req)
+
+    def _admit_prefilled(self) -> None:
+        """Admit handed-off requests, oldest first, while there are slots and pages: pages for every known
+        token (the prompt's KV arrives into them, the first token's is written by its first decode), and
+        under "reserve" admission the whole reserve the running requests and this one may still need, as
+        for a waiting request. A request admitted here is running and decoding, with num_computed at the
+        prompt's end; its first decode is in this step (step 1 of _schedule)."""
+        ps = self.cfg.page_size
+        reserve = self.cfg.admission == "reserve"
+        owed = sum(self._still_needs(r) for r in self.running) if reserve else 0
+        while self.prefilled and len(self.running) + self.cooling < self.cfg.max_num_seqs:
+            req = self.prefilled[0]
+            need = -(-req.num_tokens // ps)
+            if reserve and self.running:
+                full = -(-self._target_tokens(req) // ps)
+                if self.pool.num_free + self.radix.evictable_pages < full + owed:
+                    return
+            if self.pool.num_free < need:
+                self.radix.evict(need - self.pool.num_free)
+            pages = self.pool.alloc(need)
+            if pages is None:
+                return
+            self.prefilled.popleft()
+            req.pages = pages
+            req.node = None
+            req.num_computed = req.num_prompt
+            req.status = Status.RUNNING
+            self.running.append(req)
+            if reserve:
+                owed += self._still_needs(req)
 
     def schedule(self) -> StepPlan:
         """The next step's work. A NeedSync aborts the plan (rollback)."""
@@ -301,16 +359,26 @@ class Scheduler:
     def _schedule(self) -> StepPlan:
         plan = StepPlan()
         ps = self.cfg.page_size
+        if self.prefilled and self.admit_ok:
+            self._admit_prefilled()
 
         # 1. Every decoding sequence gets its one token, preempting the youngest if KV
         #    runs out. Iterating oldest-first while preempting youngest-first means a
         #    victim is never a sequence already scheduled this step.
         for req in list(self.running):
-            if req.status is not Status.RUNNING or not req.is_decoding:
+            if req.status is not Status.RUNNING or not req.is_decoding or self.prefill_only:
                 continue
             draft = self.draft_fn(req) if self.draft_fn is not None else []
-            while not self._reserve(req, req.num_computed + 1 + len(draft)):
-                if draft:  # under pressure, drop the draft before preempting anyone
+            blind = bool(draft) and draft[0] == BLIND
+            # A blind speculative row (engine/spec_async.py): the steps still in flight may each have advanced the
+            # request by up to 1 + k positions, so its newest token is at most this far on, and its pages cover the
+            # verify past that bound.
+            start = req.num_computed + (1 + len(draft)) * req.spec_inflight if blind else req.num_computed
+            if blind:  # the request finishes by max_model_len: pages past it are never needed (padding writes go
+                start = min(start, self.cfg.max_model_len - 1)  # to the null page)
+            while not self._reserve(req, min(start + 1 + len(draft), self.cfg.max_model_len) if blind
+                                    else start + 1 + len(draft)):
+                if draft and not blind:  # under pressure, drop the draft before preempting anyone
                     draft = []
                     continue
                 if self.in_flight:
@@ -323,14 +391,16 @@ class Scheduler:
                 save = None
                 if not draft and self.cfg.recurrent and self.cfg.ckpt_track and self.cfg.prefix_cache:
                     save = self.track(req, req.num_computed, 1)
-                plan.decodes.append(ScheduledSeq(req, req.num_computed, 1 + len(draft), True, draft, save=save))
+                plan.decodes.append(ScheduledSeq(req, start, 1 + len(draft), True, draft, save=save))
 
         # 2. Continue partial prefills, oldest first.
         budget = self.cfg.max_prefill_tokens
         for req in self.running:
             if budget <= 0:
                 break
-            if req.is_decoding:
+            # A prompt whose chunks left exactly its last token "decodes" it; a prefill engine has no decode
+            # graph and runs it as a one-token chunk (a request that has sampled has a token past the prompt).
+            if req.is_decoding and not (self.prefill_only and req.num_tokens == req.num_prompt):
                 continue
             n = min(req.remaining_prefill, budget)
             if not self._reserve(req, req.num_computed + n):
@@ -533,6 +603,9 @@ class Scheduler:
         entry gets a PENDING placeholder where its new token will go."""
         for s in plan.seqs():
             req = s.req
+            if s.draft and s.draft[0] == BLIND:  # its tokens and progress are on the device until commit
+                req.spec_inflight += 1
+                continue
             req.num_computed = s.end
             if s.sample:
                 req.token_ids.append(PENDING)
@@ -546,6 +619,14 @@ class Scheduler:
         finished = []
         for s, tok in zip(plan.seqs(), tokens):
             req = s.req
+            if s.draft and s.draft[0] == BLIND:
+                req.spec_inflight -= 1
+                if req.status is not Status.RUNNING:
+                    continue
+                reason = self._commit_blind(req, tok, now)
+                if reason is not None:
+                    finished.append(req)
+                continue
             if req.status is not Status.RUNNING:
                 continue  # finished or aborted while this step was in flight
             if not s.sample:
@@ -584,6 +665,25 @@ class Scheduler:
                 self._cache(req)
         return finished
 
+    def _commit_blind(self, req: Request, tok: list, now: float):
+        """A blind speculative entry's emitted tokens (accepted drafts, then the replacement or the bonus), in
+        order: appended as a verify's are, the newest one's position becoming num_computed (the KV of the newest
+        token and of the accepted drafts is written; a rejected draft's lies beyond). Returns the finish reason."""
+        reason = None
+        for t in tok:
+            req.token_ids.append(int(t))
+            reason = self._finish_reason(req, int(t), length=len(req.token_ids))
+            if reason is not None:
+                break
+        req.num_computed = len(req.token_ids) - 1
+        if req.first_token_time is None:
+            req.first_token_time = now
+        if reason is not None:
+            req.finish_reason = reason
+            req.finish_time = now
+            self._release(req, Status.FINISHED)
+        return reason
+
     @staticmethod
     def shared_tokens(req: Request) -> int:
         """Leading positions of `req` whose KV pages belong to the radix tree: other requests
@@ -607,7 +707,10 @@ class Scheduler:
         self._release(req, Status.FINISHED)
 
     def abort(self, req: Request) -> None:
-        if req.status is Status.WAITING:
+        if req.status is Status.WAITING and req in self.prefilled:
+            self.prefilled.remove(req)
+            req.status = Status.FINISHED
+        elif req.status is Status.WAITING:
             self.waiting.remove(req)
             req.status = Status.FINISHED
         elif req.status is Status.RUNNING:
@@ -681,7 +784,11 @@ class Scheduler:
             req.ckpt_pending = keep
 
     def _release(self, req: Request, status: Status) -> None:
+        if self.pool.hold:
+            self.cooling += 1
         self._cache(req)
+        if req.handoff is not None:  # the pages its handoff reads (engine._pd_handoff), before any is reused
+            req.handoff_pages = list(req.pages)
         for _, row, _ in req.ckpt_pending:  # past the KV the request keeps: never valid
             self.states.free_ckpt(row, self.dp_group)
         req.ckpt_pending, req.ckpt_targets, req.ckpt_restore = [], [], None
@@ -700,8 +807,16 @@ class Scheduler:
         self.running.remove(req)
 
     def _preempt(self, req: Request) -> None:
+        if req.pd_meta is not None:
+            # A handed-off request recomputes its prompt and output with this engine's prefill graphs, which a
+            # decode engine loads only with pd_bypass_prefill; "reserve" admission (the default) sizes the pool
+            # so that it does not happen.
+            self.num_prefilled_preemptions += 1
+            print(f"kiln pd: preempting handed-off request {req.rid} ({req.num_tokens} tokens): it recomputes "
+                  "with this engine's prefill graphs", flush=True)
         self._release(req, Status.WAITING)
         req.num_computed = 0
+        req.spec_ready = False  # its recompute rebuilds the speculative board row (engine/spec_async.py)
         req.num_preemptions += 1
         self.num_preemptions += 1
         self.waiting.appendleft(req)

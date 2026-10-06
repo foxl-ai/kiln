@@ -222,7 +222,7 @@ def decode_slots(d: DSASpec, q, w: torch.Tensor, pk: torch.Tensor, vis: torch.Te
     # One NeuronCore of trn1.32xlarge, 2112 pools, 512 kept (/opt/kiln/prof/probe_compact.py on kiln-g2-trn1,
     # 2026-10-04): the int64 scatter of each pool to its rank 5.2 ms at 16 rows (GpSimd, element by element), the
     # count over all pools in int64 16.1 ms, in fp32 0.91 ms (2.45 ms at 64 rows), these two levels 0.40 ms (0.96).
-    C = s01.cumsum(-1)  # [B, P]
+    C = prefix_counts(s01)  # [B, P]
     G = 8 if P % 8 == 0 else 1
     kk = torch.arange(keep, device=vis.device, dtype=C.dtype).view(1, keep, 1)
     Cg = C.view(B, P // G, G)
@@ -247,6 +247,35 @@ def decode_slots(d: DSASpec, q, w: torch.Tensor, pk: torch.Tensor, vis: torch.Te
                     torch.zeros(B, slots - keep - 1, kp, dtype=torch.bool, device=vis.device)], dim=1)
     bias = torch.where(ok, 0.0, NEG_INF).to(torch.float32)
     return rows, bias
+
+
+# KILN_DSA_PREFIX (decode_slots' inclusive count of selected pools): "xla" (default) torch.cumsum, which neuronx-cc
+# 2.27 lowers to a reduce-window on the tensor engine: 415 us of each GLM-5.3-Flash DSA decode layer at 4 rows per DP
+# group, 2112 pools (tools/prof_step.py on a replay of the layers 12-23 decode graph with captured inputs, trn1.32xlarge,
+# engine-v0 70ddc1b, 2026-10-05: 27% of the 1.54 ms DSA mixer); "mm": the same counts as two small matmuls with 0 / 1
+# triangular matrices (within groups of 8 pools, then the groups' exclusive prefix), exact in fp32 (0 / 1 inputs,
+# counts below 2^24). For at most MM_GROUPS groups (the prefix matrix is groups^2 fp32); cumsum above that.
+PREFIX = os.environ.get("KILN_DSA_PREFIX", "xla")
+if PREFIX not in ("xla", "mm"):
+    raise ValueError(f"KILN_DSA_PREFIX must be xla or mm, not {PREFIX!r}")
+MM_GROUPS = 4096
+
+
+def prefix_counts(s01: torch.Tensor) -> torch.Tensor:
+    """Inclusive prefix sums of a 0 / 1 fp32 tensor [B, P] along its last axis (KILN_DSA_PREFIX)."""
+    B, P = s01.shape
+    G = 8 if P % 8 == 0 else 1
+    NG = P // G
+    if PREFIX != "mm" or G == 1 or NG > MM_GROUPS:
+        return s01.cumsum(-1)
+    i = torch.arange(G, device=s01.device)
+    ug = (i.view(G, 1) <= i.view(1, G)).to(s01.dtype)  # ug[a, b] = 1 for a <= b: inclusive within a group
+    x = s01.view(B, NG, G)
+    inner = torch.matmul(x, ug)  # [B, NG, G]
+    j = torch.arange(NG, device=s01.device)
+    uq = (j.view(NG, 1) < j.view(1, NG)).to(s01.dtype)  # strictly upper: the groups before
+    pre = torch.matmul(inner[:, :, G - 1], uq)  # [B, NG] exclusive prefix of the group totals
+    return (inner + pre.unsqueeze(-1)).view(B, P)
 
 
 # A prefill chunk's (one sequence's) pooled scores and selection as one NKI kernel when the selection

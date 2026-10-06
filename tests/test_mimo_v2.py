@@ -272,6 +272,42 @@ def test_piecewise_traces_one_graph_per_layer_kind(ref):
     assert cnt.frame_count == len(kinds) + 2, cnt.frame_count
 
 
+def test_decode_whole_is_one_graph_and_not_on_a_pipeline_stage(ref):
+    """KILN_DECODE_WHOLE (_piecewise decode_whole): a decode call under piecewise runs forward_decode whole, as one
+    graph (none of the prep, layer or post pieces), with the same greedy tokens; a pipeline stage (pp, engine/pp.py)
+    still refuses decode with it on."""
+    from kiln.config import EngineConfig
+    from kiln.engine.engine import LLMEngine
+    from kiln.engine.model_runner import _piecewise
+    from kiln.engine.request import SamplingParams
+
+    path, _ = ref
+    prompts = [[5, 6, 7, 8, 9, 10]]
+    sp = SamplingParams(max_new_tokens=4, ignore_eos=True)
+    eng = LLMEngine(EngineConfig(model_path=path, device="cpu", dtype=torch.float32, page_size=4, num_pages=64,
+                                 max_num_seqs=2, max_model_len=64, max_prefill_tokens=16))
+    want = [r.output_ids for r in eng.generate(prompts, sp)]
+    model, run = eng.model, eng.runner
+    calls = []
+
+    def compile_(f):
+        name = getattr(f, "__name__", "piece")
+
+        def g(*a, **k):
+            calls.append(name)
+            return f(*a, **k)
+
+        return g
+
+    run._decode, *_ = _piecewise(model, compile_, 1, decode_whole=True)
+    got = [r.output_ids for r in eng.generate(prompts, sp)]
+    assert got == want
+    assert calls and set(calls) == {"forward_decode"}, calls
+    decode, *_ = _piecewise(model, compile_, 1, decode_whole=True, pp=(0, len(model.layers), None))
+    with pytest.raises(NotImplementedError):
+        decode()
+
+
 def test_piecewise_gives_each_moe_layer_its_own_graph():
     """Dense layers are grouped up to the group size; a MoE layer is always a graph of its own
     (two attention + MoE layers in one graph ran 13x slower than two graphs, six 25x; see

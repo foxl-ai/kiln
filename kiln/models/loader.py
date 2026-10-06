@@ -180,7 +180,7 @@ def load_model(path: str, cfg: ModelConfig, dtype: torch.dtype, device: torch.de
                tp_rank: int = 0, tp_size: int = 1, tp_group=None, keep_fp8: bool = False,
                fp8_max: float = 240.0, vocab_parallel: bool = False, packed_mxfp4: bool = False,
                mtp: bool = False, moe_kernel: str = "xla", attn_tp: int | None = None, attn_group=None,
-               dp_attention: int = 1, max_num_seqs: int | None = None):
+               dp_attention: int = 1, max_num_seqs: int | None = None, pd_role: str | None = None):
     """keep_fp8: weights the checkpoint quantizes stay FP8 on the device (dequantized in-graph);
     otherwise they are dequantized to `dtype` here. fp8_max: the device's largest finite e4m3.
     attn_tp / attn_group: the attention TP (DecoderForCausalLM; None = its default); dp_attention:
@@ -196,7 +196,8 @@ def load_model(path: str, cfg: ModelConfig, dtype: torch.dtype, device: torch.de
     with torch.device("meta"):
         model = cls(cfg, dtype, max_positions, tp_rank, tp_size, tp_group, keep_fp8=keep_fp8,
                     vocab_parallel=vocab_parallel, packed_mxfp4=packed_mxfp4, mtp=mtp, moe_kernel=moe_kernel,
-                    attn_tp=attn_tp, attn_group=attn_group, dp_attention=dp_attention, max_num_seqs=max_num_seqs)
+                    attn_tp=attn_tp, attn_group=attn_group, dp_attention=dp_attention, max_num_seqs=max_num_seqs,
+                    pd_role=pd_role)
     model.materialize = lambda mod: _materialize(mod, device)
     _load_decoder(model, path, dtype, fp8_max)
     for name, (cos, sin) in model.rope_tables(max_positions).items():
@@ -528,17 +529,23 @@ def _load_ep_experts(layer, ck: _Checkpoint, m: str, cfg: ModelConfig, dtype, bk
     ("row"); a TP rank decides per (row, its 64-column half of a down block), so the layouts can halve codes
     differently, which changes only codes below 2^-5 (models/quant.fit_e4m3_max)."""
     first, El = layer.ep_first, layer.ep_count
+    # The logical expert of each local slot: the rank's primaries, then its redundant slots (models/eplb.py).
+    experts = list(getattr(layer, "ep_experts", range(first, first + El)))
     rg = 128 if EP_FIT == "block" else None
     layer.ep_tiles = False  # block-constant scales (kernels/moe_ep.pack tiles), from the format alone
     if m + "gate_up_proj_blocks" in ck or layer.w_gu.dtype == torch.uint8:
         raise NotImplementedError("KILN_MOE_EP=1 with MXFP4 experts (gpt-oss, packed MXFP4) is not implemented")
     if m + "gate_up_proj" in ck:  # transformers 5's fused [E, 2I, H] (gate rows first) and [E, H, I]
-        rows = slice(first, first + El)
-        _assign_experts(layer, ck.get(m + "gate_up_proj", rows), None, ck.get(m + "down_proj", rows), None, dtype, bk,
-                        fp8_max, rg)
+        if experts == list(range(first, first + len(experts))):
+            rows = slice(first, first + len(experts))
+            gu, dn = ck.get(m + "gate_up_proj", rows), ck.get(m + "down_proj", rows)
+        else:
+            gu = torch.cat([ck.get(m + "gate_up_proj", slice(e, e + 1)) for e in experts])
+            dn = torch.cat([ck.get(m + "down_proj", slice(e, e + 1)) for e in experts])
+        _assign_experts(layer, gu, None, dn, None, dtype, bk, fp8_max, rg)
         return
     tiles = rg == 128 and bk == 128
-    for le, e in enumerate(range(first, first + El)):
+    for le, e in enumerate(experts):
         g, gs = ck.linear(f"{m}{e}.gate_proj", block=bk)
         u, us = ck.linear(f"{m}{e}.up_proj", block=bk)
         d, ds = ck.linear(f"{m}{e}.down_proj", block=bk)
@@ -550,6 +557,48 @@ def _load_ep_experts(layer, ck: _Checkpoint, m: str, cfg: ModelConfig, dtype, bk
         # scale (per-tensor / per-channel FP8 and self-quantized weights keep per-row scales).
         tiles = tiles and all(f"{m}{e}.{n}.weight_scale_inv" in ck for n in ("gate_proj", "up_proj", "down_proj"))
     layer.ep_tiles = bool(tiles)
+
+
+def prepare_ep_slots(path: str, model, layer, index, slots: dict[int, int], fp8_max: float = 240.0,
+                     ck: "_Checkpoint | None" = None) -> dict[str, torch.Tensor]:
+    """Host tensors for local slots {slot: logical expert} of a loaded expert-parallel layer (an EPLB rebalance,
+    models/eplb.py): the experts read from the checkpoint and fitted exactly as at load (_load_ep_experts), packed
+    into the layer's layout (kernels/moe_ep.pack, when the layer is packed). {parameter name: [len(slots), ...]},
+    in the order of slots; write_ep_slots copies them in. Host work only, so it can run beside serving.
+    index: the layer's model.layers index (the MTP layer has no redundant slots)."""
+    from types import SimpleNamespace
+
+    if not slots:
+        return {}
+    cfg = model.cfg
+    ck = ck or _Checkpoint(path)
+    n = len(slots)
+    tmp = SimpleNamespace(ep_first=0, ep_count=n, ep_experts=list(slots.values()), down_t=layer.down_t, moe_ep=True)
+    for name, meta in layer.ep_meta.items():
+        setattr(tmp, name, None if meta is None else torch.nn.Parameter(torch.empty(n, *meta[0], dtype=meta[1]),
+                                                                       requires_grad=False))
+    _load_ep_experts(tmp, ck, f"model.layers.{index}.mlp.experts.", cfg, model.dtype, cfg.quant_expert_block, fp8_max)
+    if layer.moe_blob:
+        from ..kernels import moe_ep
+
+        blob = moe_ep.pack(tmp.w_gu.data, tmp.w_gu_scale.data, tmp.w_down.data, tmp.w_down_scale.data, tmp.ep_tiles)
+        return {"ep_" + k: v for k, v in blob.items() if hasattr(layer, "ep_" + k)}
+    return {k: getattr(tmp, k).data for k in layer.ep_meta if layer.ep_meta[k] is not None}
+
+
+def write_ep_slots(layer, slots: list[int], src: dict[str, torch.Tensor]) -> None:
+    """Copy prepare_ep_slots' tensors into the layer's slots, in place on its device (one eager copy per slot and
+    tensor: the other slots stay bit-identical, tools/probe_eplb_device.py)."""
+    for name, t in src.items():
+        dst = getattr(layer, name)
+        for i, sl in enumerate(slots):
+            dst.data[sl].copy_(t[i].to(dst.device))
+
+
+def load_ep_slots(path: str, model, layer, index, slots: dict[int, int], fp8_max: float = 240.0,
+                  ck: "_Checkpoint | None" = None) -> None:
+    """prepare_ep_slots then write_ep_slots."""
+    write_ep_slots(layer, list(slots), prepare_ep_slots(path, model, layer, index, slots, fp8_max, ck))
 
 
 class _Row:

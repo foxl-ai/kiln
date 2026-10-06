@@ -47,7 +47,213 @@ The workload is prefill-heavy (the GPU processed ~76K prompt tokens/s at concurr
 | prefix cache / speculation on KDA models | feat/linear-serving: prefix cache from state checkpoints (one per radix node; 4.6 MB per rank per checkpoint for GLM-5.3-Flash at attention TP 32, from the config), n-gram / suffix / MTP verify with a state row per drafted position, also per DP-attention group; GLM-5.3-Flash's MTP layer wired; on trn1.2xlarge, Qwen3.5-0.8B: a 1056-token cached prefix 167 -> 19.4 ms to first token, MTP 1.52x at B=1. **feat/prompt-cache (2026-10-04)**: GLM-5.3-Flash at tp=32 / DP 4 on trn1.32xlarge: hits bit-identical to cold runs, 18.45 MB per rank per checkpoint at DP 4, lookahead junctions, shared-prefix sweep: conc 64 with 75% of input cached 90.6 -> 165.7 out tok/s, $0.000923 per request (section "G1b" below) | **feat/glm-mtp (2026-10-04)**: GLM-5.3-Flash's MTP on real weights at tp=32, every level and the G1b warm prefix workload measured: 96-98% of drafts accepted on the sweep's prompts at k=1 (75-88% on wikitext / chat), yet slower at every level (EP conc 64 106.9 -> 102.0, G1b warm 229.6 -> 223.1): the sweep is prefill-bound, and where decode dominates (G1b warm) the ~7% of device time MTP saves is lost to its synchronous step (~31 s of host time and prefill calls over 612 steps); next: drafting on the device so MTP steps can overlap (docs/neuron-notes.md "MTP speculative decoding on GLM-5.3-Flash at serving scale") |
 | hardware | trn1: ~4x fewer FLOPS per chip than trn2 | trn2.48xlarge runs (feat/trn2 agent) |
 
-## Where it stands (engine-v0 ebe237e, final, 2026-10-05 03:30 UTC)
+## Where it stands (engine-v0 f70c14b, EPLB rows 25a45c9, 2026-10-05 14:00 UTC)
+
+GLM-5.3-Flash (real weights), 8192 in / 256 out, 128 requests per level, trn1.32xlarge spot $2.15/h, tp=32,
+DP attention 4, prefill 4096 per step, 12 MoE layers per graph, every default of engine-v0 f70c14b: on top of
+ebe237e's (expert parallelism and group attention collectives by their trn1 auto rules; FP8 KV with the separate
+pool-key cache at conc 64), the fused DSA selection-and-attention prefill kernel, the KDA / DSA decode kernels and SP
+decode streams, MoE decode v2, and EP from 4 decode rows per group (the conc-16 config is EP now), all trn1 defaults.
+One box (kiln-ak-32), farm graphs q/final-f70c14b and q/final-25a45c9 (EPLB), 0 device compiles. Logs
+s3://<your-bucket>/logs/kiln-ak-32/ab-fin3-<config>.log, each with a `.log.cmd` holding the exact command; what
+each config sets is in docs/neuron-notes.md "The final combined measurement". The trees after f70c14b (25a45c9's EPLB
+fix, 80c07a6's opt-in asynchronous MTP, a3ca12b's fleet change) change no default or EPLB serving graph; asynchronous
+MTP was measured on an older base and is not in this table.
+
+| concurrency | config | out tok/s | TTFT p50 / p90 | ITL p50 | Kiln spot $/1M out | p5en vLLM spot $/1M out | |
+|---|---|---|---|---|---|---|---|
+| 16 | G16-4096-KV0.65-S20-P12-K, default | **105.4** | 5.4 / 5.5 s | 131 ms | **$5.67** | $25.7-27.1 | **won, 78-79% below** |
+| 32 | F0-4096-KV1.5-S20-P12-K, default | **133.9** | 5.6 / 24.5 s | 213 ms | **$4.46** | $9.49-9.99 | **won, 53-55% below** |
+| 32 | F0 + EPLB (opt-in, one redundant slot per rank, after the online rebalance) | **143.3** | 5.0 / 21.4 s | 201 ms | **$4.17** | $9.49-9.99 | **won, 56-58% below** |
+| 32 | F0 + mixed batches (opt-in, `--decode-buckets 8,16`) | 128.8 | 5.9 / 26.5 s | 221 ms | $4.64 | $9.49-9.99 | won, 51-54% below; below the default |
+| 64 | G64-4096-KV1.5-S20-P12-K, default | **156.2** | 5.8 / 65.1 s | 363 ms | **$3.82** | $5.48-5.77 | **won, 30-34% below** |
+| 64 | G64 + EPLB (opt-in, after the online rebalance; 166.4 / $3.59 on the initial placement) | **167.2** | 5.3 / 58.9 s | 339 ms | **$3.57** | $5.48-5.77 | **won, 35-38% below** |
+| 64 | G64 + mixed batches (opt-in, `--decode-buckets 8,16`) | 152.1 | 6.0 / 68.9 s | 375 ms | $3.93 | $5.48-5.77 | won, 28-32% below; below the default |
+| 64 | G64 + mixed batches + EPLB (opt-in) | 163.3 | 5.4 / 62.2 s | 346 ms | $3.66 | $5.48-5.77 | won, 33-37% below; below EPLB alone |
+| 128 | does not fit trn1 (16 GiB per core); trn2 whole box 221.6 on feat/trn2-fast 118c6ea (decode kernels, SP decode, the decode LNC splits, SP_GROUP, MoE prefill skip; engine-v0 70ddc1b on the same box: 192.0) | | | | $19.23 at trn2 spot $15.343/h | $3.4-3.6 | far |
+
+Opt-in switches: EPLB `KILN_EP_REDUNDANT=1` with `KILN_EPLB_INIT=<placement>` and `--eplb-rebalance` (KV 1.5 still fits:
+<= 15.5 GiB per rank by the farm's calibrated estimate); mixed batches `KILN_MIXED_BATCH=1 --state-checkpoints 4`, which
+no longer pay on this tree (their joint mixers bypass the fused prefill kernel and the decode kernels, the likely reason,
+not measured on its own; docs/neuron-notes.md).
+Against provider list prices ($0.15 / $0.50 per 1M in / out, $0.00136 per 8192 / 256
+request): the default conc 64 level costs $0.00098 per request (28% below), with EPLB $0.00091 (33% below); DeepInfra's
+discounted $0.00068 is 1.35-1.44x below Kiln. On-demand is not won (trn1 on-demand is 10x its spot price), and latency
+is far behind the GPU (ITL 131-363 ms against 20-32 ms).
+
+Quality of the defaults against ebe237e: wikitext-2 -0.548 (-0.54753 against -0.54723); greedy check_mixed LONG_TEXT
+28 / 32 equal with the decode-path mean dlogprob -0.0004 +/- 0.0003 nats per token, wikitext-2 prompts 7 / 32 with
+-0.0011 +/- 0.0024; the per-stage attribution of that jitter (the decode kernels, the fused kernel and v2 each add about
+the same, none moves the mean) is in docs/neuron-notes.md. EPLB: wikitext is the defaults' by construction (no redundant slot enters
+check_ppl's graphs); greedy LONG_TEXT 28 / 32 with -0.0001 +/- 0.0004 against ebe237e and +0.0001 +/- 0.0002 against the
+defaults.
+
+## The v0.2.0 standing (engine-v0 8229c3d defaults, 2026-10-05)
+
+The rows "Where it stands" records are engine-v0 f70c14b's. Two trn1 defaults landed after it, the
+NKI world row gather (ca256b7) and the runtime hardware execution barrier, so the default numbers a
+v0.2.0 user gets are the base column of "The 8192-token prefill as ONE piece" in
+docs/neuron-notes.md, measured on engine-v0 8229c3d on kiln-pf-32c (G64) and kiln-pf-32 (F0, G16),
+128 requests per level, same box and tree back to back. $ per 1M out is $2.15 / 3600 / out tok/s;
+the "below" column is against the p5en vLLM spot band at that concurrency.
+
+| concurrency | config | out tok/s | Kiln spot $/1M out | p5en vLLM spot $/1M out | below |
+|---|---|---:|---:|---|---|
+| 16 | G16, default | 110.5 | **$5.40** | $25.7-27.1 | **79-80%** |
+| 32 | F0, default | 144.8 | **$4.12** | $9.49-9.99 | **57-59%** |
+| 64 | G64, default | 167.8 | **$3.56** | $5.48-5.77 | **35-38%** |
+| 64 | G64 + EPLB at KV 1.2 + CK4 + the one-piece 8192 prefill (opt-in) | 191.3 | **$3.12** | $5.48-5.77 | **43-46%** |
+
+G64's TTFT p50 / p90 is 5.37 / 59.9 s at the default and 4.64 / 47.2 s on the opt-in row; its decode
+call is 0.118 s and 0.119 s. trn2's best level ($17.47 per 1M out at conc 256, "trn2 standing") is
+4.9x the trn1 default's $3.56 per token, and 5.6x the opt-in row's $3.12.
+
+## Per request against provider list prices, derived from the rates above
+
+Each row is arithmetic on a measured rate, shown so it can be checked: a G1 request is 256 output
+tokens, so requests/s = out tok/s / 256 and $ per request = $2.15 / 3600 / that. List price for an
+8192 / 256 request is $0.00136 ($0.15 per 1M input and $0.50 per 1M output tokens); DeepInfra's
+discounted price for the same request is $0.00068.
+
+| configuration | out tok/s | req/s | $ / request | vs list | vs the discounted price |
+|---|---:|---:|---:|---|---|
+| engine-v0 f70c14b default, conc 64 | 156.2 | 0.6102 | $0.000979 | 28.0% below | 1.44x cheaper than Kiln |
+| engine-v0 f70c14b + EPLB, conc 64 | 167.2 | 0.6531 | $0.000914 | 32.8% below | 1.34x |
+| engine-v0 8229c3d default, conc 64 | 167.8 | 0.6555 | $0.000911 | 33.0% below | 1.34x |
+| + EPLB + the one-piece 8192 prefill | 191.3 | 0.7473 | $0.000799 | 41.2% below | 1.18x |
+
+## Prefill / decode disaggregation (G1, trn1, 2026-10-05/06)
+
+GLM-5.3-Flash@eb9eb208 real weights, 8192 in / 256 out, trn1.32xlarge spot $2.15/h per box, SDK 2.32, every
+graph from the compile farm under `NEURON_LIBTORCH_ASSERT_CACHE_HIT=1`. `bench/pd_sweep.py` against
+`kiln/server/pd_router.py` with `bench/pd_serve.py` engines. Boxes kiln-pd-d1 (decode, also the router) and
+kiln-pd-p1..p4 / kiln-pd-l1..l2 (prefill). Logs and the `.cmd` of every engine:
+s3://<your-bucket>/logs/kiln-pd-{d1,p1,p2,p3,p4,l1,l2}/pd-logs*.tgz. The trees are NOT e3ff411 and
+each row names its own; see docs/neuron-notes.md "Prefill / decode disaggregation on the device" for the
+per-box commands, the trees and what could not be reproduced.
+
+- **Prefill engine** (`--pd-role prefill`): tp 32, DP attention 4, the one-piece 8192 prefill
+  (`--prefill-tokens 8192 --prefill-buckets 2048 KILN_PIECEWISE_PREFILL_MOE_GROUP=45`) with EPLB
+  (`KILN_EP_REDUNDANT=1 KILN_EPLB_INIT=<placement> --eplb-rebalance`), KV 1.2 fp8, `--state-checkpoints 4`,
+  farm queue q/pf-p8-7ce6a12. That is the same configuration as the colocated $3.12 row below.
+- **Decode engine** (`--pd-role decode`): tp 32, DP attention 4, context-parallel DSA (`KILN_DSA_CP=1`),
+  256-token pages, page bucket 64, `--max-num-seqs 384 --decode-buckets 96` (96 rows per DP group, CP-96),
+  TP experts (`KILN_MOE_EP=0`), moe_dedupe v10, farm queue q/dc1-t1. From pd-logs2 on it also carries
+  `KILN_DSA_CP_ALL_LOCAL=1 KILN_DSA_CP_PAGE_KEYS=1`.
+- **Latency prefill engine** (`tools/pd_box.sh` TP1-P4K): the same env at DP attention 1 (attention TP 32,
+  one request per call over all 32 ranks) in 4096-row calls, farm queue q/pf-tp1-pdpre.
+
+**$ is attributed by role**: the prefill boxes' $/h over the input tokens, the decode box's $/h over the
+output tokens, and "all-in" is every box's $/h over the output tokens. Each figure below reproduces from the
+log's own rate (for example 3:1 steady: 3 x $2.15 / 3600 / (3.645 req/s x 8192) x 1e6 = $0.060 per 1M in;
+$2.15 / 3600 / 930.9 x 1e6 = $0.642 per 1M out; 4 x $2.15 / 3600 / 930.9 x 1e6 = $2.566 all-in).
+
+| prefill : decode | boxes, $/h | level | steady out tok/s (middle half) | steady all-in $/1M out | steady split $/1M in + $/1M out | whole-level out tok/s | whole-level all-in $/1M out | whole-level TTFT p50 / p90 | whole-level ITL p50 | log |
+|---|---|---|---:|---:|---|---:|---:|---|---:|---|
+| 3 : 1 | 4, $8.60 | conc 320 | **930.9** | **$2.566** | $0.060 + $0.6416 | 789.9 | $3.024 | 17.6 / 58.2 s | **277.0 ms** | g1-pd-f |
+| 4 : 1 (+ ALL_LOCAL + PAGE_KEYS) | 5, $10.75 | conc 440 | **1,139.5** / 1,094.5 | **$2.621** / $2.728 | $0.067 + **$0.5241** | 879.4 / 849.3 | $3.396 / $3.516 | 8.6 / 70.1 s | 353.5 ms | g1-pd-l |
+| 4 : 1, no ALL_LOCAL / PAGE_KEYS | 5, $10.75 | conc 440 | 1,002.2 / 967.5 / 967.4 | $2.980 / $3.086 / $3.087 | $0.087 + $0.5959 | 716.5-829.1 | $3.602-$4.167 | 8.4-11.2 / 60.9-79.1 s | 406.7-417.3 ms | g1-pd-k, -j, -i |
+
+Two readings, and they do not say the same thing:
+
+- **Steady (the middle half of a closed-loop level) against the colocated best is NOT like for like.** The
+  colocated best in this file is 191.3 out tok/s / **$3.12** per 1M out ("Where it stands" plus the one-piece
+  prefill, docs/neuron-notes.md "The 8192-token prefill as ONE piece"), and that is a WHOLE-LEVEL figure over
+  128 requests. No colocated steady middle-half figure was measured, so $2.57 against $3.12 compares a steady
+  rate with a whole-level one and overstates the gain. Whole level against whole level the 3:1 row is $3.024
+  against $3.12, **3.1% below**: on this workload disaggregation is close to a wash on cost.
+- **Per box it is a real gain**: 930.9 / 4 = 232.7 out tok/s per box steady against the colocated 191.3,
+  and the decode box alone sustains 96 rows per DP group at $0.524 per 1M output tokens. The win is that one
+  decode box carries the concurrency of four prefill boxes; the cost of the prefill boxes is what eats it.
+- **ITL improves, TTFT does not** (both whole level, conc 320 against the colocated conc 64's 363 ms at
+  f70c14b): 277.0 ms against 363 ms. TTFT p50 17.6 s and p90 58.2 s are far worse than the colocated 5.8 /
+  65.1 s at conc 64, because the level holds 320 requests.
+
+**Latency prefill boxes (2 latency prefill + 1 decode, 3 boxes, $6.45/h), the TTFT-SLO arm.** Post-fix tree
+only (the `dsa_fused` MIN_HEADS bug made a DP-attention-1 prefill wrong on the device before engine-v0
+4e5f226, so the pre-fix latency runs are timing only and their text is not cited). Logs
+logs/kiln-pd-l1/pd-logs4-l1.tgz, logs/kiln-pd-l2/pd-logs4-l2.tgz, driver slo4.log on kiln-pd-d1:
+
+| arm | TTFT p50 / p90 | ITL p50 | served req/s | log |
+|---|---|---:|---|---|
+| idle, one request at a time | **1595 / 1607 ms** | 267.3 ms | 0.014 | slo4-idle-lat |
+| open loop, requested 0.4 / 0.6 / 0.8 / 1.0 req/s | 1554 / 1530 / 1559 / **1596** ms; p90 2126 / 1775 / 2078 / **2268** ms | 269.2-270.5 ms | 0.234 / 0.357 / 0.449 / 0.579 (steady 0.292 / 0.476 / 0.589 / 0.743) | slo4-open-lat |
+| threshold routing, no latency box, idle | 4334 / 4338 ms | 267.3 ms | 0.014 | slo2-idle-thr |
+| colocated one box, idle | 4013 / 4175 ms | 87.6 ms | 0.038 | colo-idle (kiln-pd-p1) |
+
+So the latency arm takes an idle 8K TTFT from **4.01 s colocated to 1.60 s**, and **no arm reaches a p90 TTFT
+of 1 s**: the best p90 measured anywhere on trn1 is 1607 ms idle and 1775-2268 ms under open-loop arrivals.
+Its ITL is 267-270 ms against the colocated 87.6 ms, because the decode box runs 96 rows per group.
+Device gate for that arm (`tools/check_mixed.py` against the colocated reference on the fixed tree,
+chk-colo-fix on kiln-pd-l1 / slo4.log): **equal 15 / 16**, token agreement 0.9639, teacher-forced
+|dlogprob| over decode calls n = 972 mean 0.00228 p99 0.0582 max 0.2980 with signed mean -0.00020, over
+prefill chunks n = 16 mean 0.01168 signed -0.00430.
+
+## trn2 standing (feat/trn2-fast c08c5ba, 2026-10-06 03:20 UTC)
+
+trn2.48xlarge (EC2 Capacity Block cr-00ff977628a81fb28, ap-south-2b, kiln-t2-cb), SDK 2.32, LNC=2, GLM-5.3-Flash real weights,
+two tp=32 engines (`--dp 2`), DP attention 4, farm graphs (q/t2f-*), 0 device compiles. $ at trn2 spot $15.343/h (us-east-2c, the
+like-for-like basis with p5en spot; the block itself cost $37.20/h). Commands, logs and gates: docs/neuron-notes.md "trn2 on
+engine-v0 70ddc1b".
+
+**G1 (8192 in / 256 out), whole box, the trn2 defaults of c08c5ba** (`KILN_MOE_PREFILL_SKIP=20` on top; q/t2f-best1F, log
+s3 logs/kiln-t2-cb/20261006T*-t2-U-best1F):
+
+| conc | out tok/s | engine-v0 70ddc1b (same box) | TTFT p50 | ITL p50 | prefill call | $/1M out (trn2 spot) | p5en vLLM spot $/1M out |
+|---|---|---|---|---|---|---|---|
+| 16 | 133.9 | 118.5 | 8.3 s | 88 ms | 0.870 s | 31.83 | 25.7-27.1 |
+| 32 | 180.9 | 158.9 | 8.6 s | 142 ms | 0.883 s | 23.56 | 9.49-9.99 |
+| 64 | 208.9 | 177.3 | 8.7 s | 267 ms | 0.885 s | 20.40 | 5.48-5.77 |
+| 128 | 229.5 | 192.0 | 8.9 s | 506 ms | 0.888 s | 18.57 | 3.4-3.6 |
+| 256 | 243.9 | 198.4 | 9.1 s | 966 ms | 0.899 s | 17.47 | - |
+
+(+13 to +23% over engine-v0 on the same box; best1 before the fused DSA default: 131.3 / 176.0 / 202.4 / 221.6 / 235.1.) Not won
+anywhere: trn2's best level costs 4.6x trn1's G64 default per token ($17.47 at conc 256 against $3.82 at conc 64, "Where it
+stands"), because prefill is 66-87% of the device time and trn2 prefills at about trn1's rate per box.
+
+**Prefill parity** (prefill tok/s per box = 2 engines x rows per call / prefill call): **8.8k** at 4096-row calls, **9.9k** at
+8192-row calls (`--prefill-tokens 8192 --prefill-buckets 2048 KILN_PIECEWISE_PREFILL_MOE_GROUP=4`, +9-12% per engine); trn1.32xlarge
+8.7k one-piece, 10.2k with EPLB. Parity of BF16 efficiency with trn1 would be ~35k (3.5x the compute). Where the 4096-row call goes
+(replayed with captured inputs): MoE blocks 52%, token mixers 38%, 101 GB of spill per rank, tensor engine 13.5% of peak.
+
+**Decode box with real KV** (the PD decode side; tools/time_decode.py --real-kv, 8K contexts, one engine, ST + v9 on D2K2,
+feat/trn2-fast-ds2 ef289f8):
+
+| rows per DP group (per engine) | ms per step | out tok/s per engine | $/1M out at trn2 spot | MBU |
+|---|---|---|---|---|
+| 16 (64) | 78.52 | 815 | 2.61 | 20% |
+| 32 (128) | 104.95 | 1,220 | 1.75 | 19% |
+| 64 (256) | 147.23 | 1,739 | 1.23 | 17% |
+| 96 (384) | 217.50 | 1,766 | **1.21** | 14% |
+
+96 rows per group is the 8K-context ceiling (22.4 GB of tensors per rank; 25.7 GB at 128 does not fit). The whole box is 3,531
+out tok/s at $1.21 per 1M out; trn1's decode box is $0.89 (the decode agent, ST + v9, 28 rows per group at real 8K KV), so at 8K
+trn1 is the cheaper box on both sides of PD. trn2's case is context lengths trn1 holds less of.
+
+**trn1 decode box with real KV and context-parallel DSA** (the decode agent, feat/decode-scale-f997 e34272d = engine-v0
+3df0b63 + this branch; ST + v10 + `KILN_DSA_CP=1` over each group's 8 ranks, 256-token pages, page bucket 64;
+tools/time_decode.py --real-kv, 8K contexts, decode-only, trn1.32xlarge spot $2.15/h; `tools/dc_cpA.sh`, logs s3
+logs/kiln-dc-32/tdA-*.log; every number two passes on one tree):
+
+| rows per DP group (per step) | config | ms per step | out tok/s | $/1M out |
+|---|---|---|---|---|
+| 64 (256) | CP base | 237.4 | 1,078 | 0.554 |
+| 64 (256) | + `KILN_DSA_CP_ALL_LOCAL=1 KILN_DSA_CP_PAGE_KEYS=1` | 215.6 | 1,187 | 0.503 |
+| 96 (384) | CP base | 336.6 | 1,141 | 0.523 |
+| 96 (384) | + `KILN_DSA_CP_ALL_LOCAL=1 KILN_DSA_CP_PAGE_KEYS=1` | **302.6** | **1,269** | **0.470** |
+
+The decode side of PD under $0.5 per 1M out at 8K (decode-only: input is priced separately). The two flags skip the
+local selection when a rank's pools fit keep and read the pool keys as page rows (exact; docs/neuron-notes.md "One DSA
+layer under CP, op by op").
+
+**Open trn2 bugs** (repro configs in docs/neuron-notes.md): expert parallelism hangs on the first execution of an EP decode graph
+at LNC=2, not deterministically ("TOPSP ... missing collectives status"; bestE0, bestEL and pE with decode bucket 4 hung, pE passed
+once), so trn2 keeps TP experts; the MoE prefill kernel's LNC split fails the wikitext check (out-of-bound indirect copy, software
+DGE too); sp_gather has no LNC=2 form (program 0 alone: NCC_ILLC059; both programs: wrong rows on 32 of 32 ranks, max |err|
+7.48), so trn2 keeps the XLA zero-padded gather; the KDA / DSA decode row splits are exact in the simulator but not bit-identical
+on the device (inside the decode-path gate).
+
+## Earlier standing (engine-v0 ebe237e, final, 2026-10-05 03:30 UTC)
 
 GLM-5.3-Flash (real weights), 8192 in / 256 out, 128 requests per level, trn1.32xlarge spot $2.15/h, tp=32,
 DP attention 4, prefill 4096 per step, 12 MoE layers per graph, every default of engine-v0 ebe237e (expert
@@ -74,6 +280,32 @@ The combination of mixed batches with the decode kernels was not measured. Again
 per request (8% below), the decode-kernel level $0.00111 (18% below); DeepInfra's discounted $0.00068 is
 1.6-1.8x below Kiln. On-demand is not won (trn1 on-demand is 10x its spot price), and latency is far behind
 the GPU (ITL 149-452 ms against 20-32 ms).
+
+## Utilization baseline (engine-v0 ebe237e, 2026-10-05): MFU 7.7% in prefill, MBU 14.7% in decode
+
+Every later lever reports against these. GLM-5.3-Flash real weights, the G64 config above (q/final-ebe237e graphs),
+trn1.32xlarge kiln-ut-32, SDK 2.32, neuron-explorer 2.32; rank 0 of one real prefill call (4 chunks x 1024 rows, real
+routing) and one real decode call (16 live rows per group), each NEFF replayed on 32 workers with every rank's own
+captured inputs (`KILN_CAPTURE_INPUTS`, `tools/util_report.py replay`, second execution profiled). Peaks per
+NeuronCore-v2 from AWS's Trainium architecture page (190 TFLOPS bf16 / cFP8 and 820 GiB/s per 2-core device): 95 TFLOPS,
+440 GB/s. Method, per-layer tables and traps: docs/neuron-notes.md "Accelerator utilization of the serving graphs".
+
+| call | device ms | tensor / vector / scalar / gpsimd busy | HBM moved, rate | tensor engine | collectives | model metric |
+|---|---|---|---|---|---|---|
+| prefill, 4096 tokens | 592 (serving fit; replay 615) | 29.7 / 34.2 / 27.3 / 2.2% | 33.6 GB (18.5 spill), 55 GB/s = 12.4% | 18.1 TFLOP/s = 19% | 183.5 ms; every engine idle with one in flight ~28% | **MFU 7.7%** (33.83 GFLOP per token x 4096 / (0.592 s x 32 x 95 TFLOPS)) |
+| decode, 64 rows | 178 (runtime trace; replay 189) | 27.1 / 47.9 / 16.3 / 10.6% | 18.8 GB (6.9 spill), 100 GB/s = 22.6% | 5.05 TFLOP/s = 5.3% | 19 ms; all idle 16.5 ms | **MBU 14.7%** (11.52 GB per rank must move / 0.178 s / 440 GB/s) |
+
+Where the conc 16 / 32 / 64 wall goes (fin2 runs' `device_split`; 32,768 output tokens per level): prefill 228.7 / 151.6 /
+151.6 s (61 / 52 / 57%), decode 139.7 / 136.1 / 113.7 s, per output token 11.45 / 8.91 / 8.14 ms. Prefill is the same 256
+full calls at every level (token slots 100%) and cannot batch further; decode costs ~50 ms + ~1.6 ms per row per call;
+padded decode rows cost 0.8 / 1.4 / 4.7% of the wall; host gaps ~0 (rank 0 blocked on the device in 648 of 648 steps,
+device 99.6% busy in the traced window). Even free decode would cap conc 64 at 216 out tok/s.
+
+Measured against it on the same box (kiln-ut-32, conc 64 unless stated; iteration log below): `--decode-buckets 8,16`
+126.7 (+3.3%, config only; 4,8,12,16 no better); mixed batches + KDA / DSA decode kernels + SP decode streams together 141.4
+(+15.2%), with buckets 8,16 as well 142.9 (+16.5%, $4.18 / 1M spot); conc 16 EP with the MoE agent's decode v2 +12.8% over TP
+at identical shapes. Two-batch overlap is closed on neuronx-cc 2.27 (it schedules no independent compute inside a collective);
+the prefill call's largest single loss is EP load imbalance, ~117 ms of 592 (EPLB, the techniques agent).
 
 ## Earlier standing (engine-v0 9853406, 2026-10-04 23:00 UTC)
 
@@ -346,6 +578,23 @@ Measured with `bench/serve_sweep.py` (8192 in / 256 out unless stated).
 | 2026-10-04 | **feat/trn2-max 7138a25** (e2c6fad + the KDA and DSA kernels split over both physical cores of an LNC=2 core, `KILN_LNC_SPLIT` default) | trn2.48xlarge spot (kiln-trn2-b) | the same config and box, q/t2max-FUd, ASSERT_CACHE_HIT (log 20261004T230236Z-sweep-FUd); wikitext and 4 sentences per-token identical to engine-v0, greedy 64 / 64 prompts identical | conc 64 / 128: **175.5 / 189.9** out tok/s (+2.2 / +2.4%); TTFT p50 10.2 / 10.6 s; ITL p50 319 / 609 ms | **spot $23.88 / 22.07 per M out**; per request $0.00611 / 0.00565 |
 | 2026-10-05 | **feat/decode-step 7db28da** (engine-v0 2968ed3 + KDA and DSA decode kernels `KILN_KDA_DECODE_KERNEL=nki KILN_DSA_DECODE_KERNEL=nki`, SP decode streams `KILN_DECODE_SP=1`) | trn1.32xlarge | **decode-only step** (tools/time_decode.py, EP on, null-page KV, q/decode-2968ed3 DCT-BASE / DCT-DK / DCT-DKS2, kiln-g2-trn1 logs td-DCT-*.log) | 32 rows per group: 279.3 -> 225.4 (kernels) -> 183.3 ms (+ SP decode); 64 rows per group: 456.5 -> 270.2 -> 233.7 ms | decode-only spot $1.30 -> $0.86 / M out at 128 rows per step, $1.07 -> **$0.55** at 256 (list price $0.50) |
 | 2026-10-05 | feat/decode-step a64d7f8 (7db28da + engine-v0 06ce6d5) | trn1.32xlarge | **serving A/B**, EP on, 128 requests, q/decode-2968ed3: G64-EPT base / + decode kernels / + SP decode streams back to back on kiln-dk-32; F0-EPT base / + decode kernels on kiln-g1-trn1 (logs ab-<config>.log) | conc 64: 114.9 -> 122.2 -> **128.0** out tok/s (ITL p50 487 -> 460 -> 442 ms); conc 32: 106.0 -> 108.0 | spot $5.20 -> $4.89 -> **$4.67** / M out at conc 64 (p5en spot $5.48-5.77); $5.63 -> $5.53 at conc 32. Decode-path NLL (check_mixed teacher-forced) +0.0003 / +0.0002 nats per token on LONG_TEXT / wikitext, inside the run-to-run floor; prefill graphs unchanged |
+| 2026-10-05 | **feat/moe-kernel-tune 4c3d078** (engine-v0 e449b98 + kernels/moe_ep.py: decode v2 `KILN_MOE_EP_SMALL_V=2`, one pass per local expert with pairs) | trn1.32xlarge spot (kiln-mk-32) | **serving A/B**, EP on, the q/final-ebe237e G64 / F0 commands verbatim, V1 graphs q/final-ebe237e, V2 q/moek-trn1, ASSERT_CACHE_HIT, back to back (logs s3 logs/kiln-mk-32/*-sv-*) | conc 32: 110.1 -> **117.1** (+6.4%), conc 64: 122.8 -> **129.5** (+5.5%); decode call 0.125 -> 0.108 / 0.178 -> 0.158 s; twin v3 (bit-identical) 116.0 / 129.8; conc 16 at 4 rows per group (utilization agent, kiln-ut-32): TP 87.5, EP v2 98.0 | spot $/1M out at conc 32 / 64: $5.42 -> $5.10 / $4.86 -> $4.61 |
+| 2026-10-05 | feat/utilization (kiln/ = engine-v0 ebe237e; host-only instrumentation) | trn1.32xlarge spot (kiln-ut-32) | **utilization baseline**: G64 with `KILN_TIMELINE` + `KILN_RT_INSPECT` (log ut-g64-tl), device-profile replays of one real prefill and one real decode call with every rank's captured inputs (section "Utilization baseline" above) | conc 64: 122.7 out tok/s (fin2 122.9); prefill MFU 7.7%, decode MBU 14.7%; host blocked on the device in 648 / 648 steps | spot $4.87 / M out |
+| 2026-10-05 | engine-v0 e449b98, `--decode-buckets 8,16` (config only) | trn1.32xlarge spot (kiln-ut-32) | G64 with a second decode bucket, farm q/ut-trn1 G64-DB8, ASSERT_CACHE_HIT, same box as the row above (log ut-g64-db8) | conc 64: 122.7 -> **126.7** (+3.3%); 128 of 640 decode calls in the 8-row bucket; ITL p50 452 -> 444 ms; `4,8,12,16` (G64-DB4, loads): 125.8, no better; greedy check 31 / 32 equal, decode-path NLL +0.00016 | spot $4.87 -> **$4.71** / M out |
+| 2026-10-05 | engine-v0 e449b98 TP / `KILN_MOE_EP=1` / + feat/moe-kernel-tune 2f28ff8 `KILN_MOE_EP_SMALL_V=2` | trn1.32xlarge spot (kiln-ut-32) | conc 16, 4 decode rows per group: final G16 (TP, --max-num-seqs 16, KV 0.65) vs EP v1 and EP v2 at --max-num-seqs 32 / KV 1.5 (q/ut-g16ep G16E, q/moek-trn1 G16E-V2; logs ut-g16, ut-g16e, ut-g16e-v2) | conc 16: TP 87.5, EP v1 88.4 (+1.0%: prefill call 0.893 -> 0.592 s, decode call 0.065 -> 0.101 s), **EP v2 98.0 (+12.0%**, decode call 0.084 s, ITL p50 149 -> 140 ms, TTFT p50 8.65 -> 6.10 s); TP at the EP arms' exact shapes (q/ut-trn1 G16T32, log ut-g16t32) 86.9, so at identical shapes EP v1 +1.7%, **EP v2 +12.8%**; greedy check: v2 bit-identical to v1, EP vs TP decode-path NLL -0.00023 | spot $6.83 / $6.76 / **$6.09** / M out |
+| 2026-10-05 | engine-v0 e449b98, mixed batches + KDA / DSA decode kernels + SP decode streams (all opt-in, together for the first time) | trn1.32xlarge spot (kiln-ut-32) | G64 + `KILN_MIXED_BATCH=1 KILN_KDA_DECODE_KERNEL=nki KILN_DSA_DECODE_KERNEL=nki KILN_DECODE_SP=1 --state-checkpoints 4`, farm q/ut-trn1 G64-MX-CK4-DKS, ASSERT_CACHE_HIT (log ut-g64-mxdks) | conc 64: 122.7 -> **141.4** (+15.2%; each alone on other boxes: mixed 131.8, decode kernels + SP decode 137.1); ITL p50 452 -> 396 ms, TTFT p50 6.9 -> 6.3 s; with `--decode-buckets 8,16` too (q/ut-trn1 G64-MX-CK4-DKS-DB8, log ut-g64-mxdks-db8): **142.9** (+16.5%) | spot $4.87 -> $4.22 -> **$4.18** / M out |
+| 2026-10-05 | feat/attn-kernel-tune 54ec5df (engine-v0 e449b98 + the static DSA prefill attention kernel, then the fused DSA selection-and-attention prefill kernel `KILN_DSA_FUSED=1`) | trn1.32xlarge spot (kiln-ak-32) | **serving A/B**, the q/final-ebe237e G64 / F0 commands, farm q/attnk-448b9f6 (static) and q/attnk-54ec5df (fused), ASSERT_CACHE_HIT, back to back (logs ab-G64-*, ab-F0-*); wikitext DP 4: base -0.547, static -0.548, fused -0.548 | conc 64: 122.9 -> 127.6 (static) -> **132.0** (fused, +7.4%); conc 32: 112.5 -> 116.5 -> **120.0** (+6.7%); prefill call 0.592 -> 0.553 -> 0.519 s | spot $4.86 -> $4.52 / M out at conc 64, $5.31 -> $4.98 at conc 32 |
+| 2026-10-05 | feat/attn-kernel-cand 12c05c1 (the fused kernel and the decode kernels + SP decode streams as trn1 defaults) | trn1.32xlarge spot (kiln-ak-32 / kiln-ak-33) | decode-kernel promotion: G16 / F0 with the decode kernels (q/final-ebe237e), and with the fused kernel too (q/attnk-54ec5df); the candidate tree's plain commands with no variable set (logs ab-G16-*, ab-F0-*, ab-G64-DKS-FU, ab-G64-CAND, ab-G16-CAND) | conc 16: 87.6 -> 88.1 (DK) -> 92.2 (candidate); conc 32: 112.4 -> 114.9 (DK) -> 119.0 (DKS) -> 127.2 (with the fused kernel); conc 64: 132.0 (fused) -> **148.5** (+ DKS), the candidate tree's plain command 148.6 | spot $4.02 / M out at conc 64 (candidate), $4.70 at conc 32 (fused + DKS), $6.48 at conc 16 |
+| 2026-10-05 | **engine-v0 f70c14b** (fused DSA prefill kernel, decode kernels + SP decode, MoE decode v2 and EP from 4 decode rows per group, all trn1 defaults) | trn1.32xlarge spot (kiln-ak-32) | **final defaults**: the q/final-ebe237e G16 / F0 / G64 commands with no variable set, farm q/final-f70c14b, ASSERT_CACHE_HIT (logs ab-fin3-G16, -F0, -G64) | conc 16 / 32 / 64: **105.4 / 133.9 / 156.2** out tok/s (ebe237e: 87.3 / 112.3 / 122.9); TTFT p50 5.4 / 5.6 / 5.8 s; ITL p50 131 / 213 / 363 ms; prefill call 0.519-0.521 s, decode call 76 / 88 / 118 ms; wikitext -0.548, greedy LONG_TEXT 28 / 32 equal (decode-path -0.0004 +/- 0.0003 nats per token) | **spot $5.67 / $4.46 / $3.82 per M out** (p5en spot $25.7-27.1 / $9.49-9.99 / $5.48-5.77) |
+| 2026-10-05 | engine-v0 25a45c9 (f70c14b + EPLB decode pairs on the primaries under v2) | trn1.32xlarge spot (kiln-ak-32) | **+ EPLB, opt-in**: one redundant slot per rank (`KILN_EP_REDUNDANT=1`, `KILN_EPLB_INIT` = the techniques agent's eplb-init-random.pt, `--eplb-rebalance`, two levels), KV 1.5, farm q/final-25a45c9 (logs ab-fin3-G64-EPLB, -F0-EPLB) | conc 32: 143.2 -> 143.3 after the online rebalance; conc 64: 166.4 -> **167.2** (+7.0% over the default); prefill call 0.46 s | spot $4.17 / **$3.57** per M out |
+| 2026-10-05 | f70c14b / 25a45c9 | trn1.32xlarge spot (kiln-ak-32) | mixed batches (`KILN_MIXED_BATCH=1 --state-checkpoints 4 --decode-buckets 8,16`) on G64, alone and with EPLB, and on F0 (logs ab-fin3-G64-MX, -G64-MX-EPLB, -F0-MX-r2; the first F0 attempt, ab-fin3-F0-MX, failed at load in the collectives' bootstrap) | conc 64: 152.1 (-2.6% against the default), with EPLB 163.4 / 163.3 (EPLB alone 167.2); conc 32: 128.8 (-3.8%): mixed batches no longer pay | spot $3.93 / $3.66 / $4.64 per M out |
+| 2026-10-05 | **engine-v0 70ddc1b** (trn2 defaults: SP prefill, KDA + DSA LNC split; EP, SP_GROUP, fused DSA, decode kernels off) | trn2.48xlarge Capacity Block (kiln-t2-cb, ap-south-2b, $37.20/h; spot $15.343/h used for $) | **whole box baseline**: 2 x tp=32, DP attention 4, prefill 4096 / 1024, P=6, decode 4/8/16/32, KV 2.75 fp8, max-num-seqs 128 per engine, farm q/t2f-base, ASSERT_CACHE_HIT (log s3 logs/kiln-t2-cb/20261005T155613Z-t2-base-U) | conc 16 / 32 / 64 / 128 / 256: **118.5 / 158.9 / 177.3 / 192.0 / 198.4**; TTFT p50 9.5-11.1 s; ITL p50 99 / 161 / 316 / 602 / 1163 ms; prefill call 1.00-1.05 s, decode call 32-171 ms | spot $35.97 / 26.82 / 24.04 / **22.20** / 21.48 per M out (block price: $87.2 ... 52.1) |
+| 2026-10-05 | 70ddc1b + feat/trn2-fast (single-engine A/Bs, cores 0-31 / 32-63 at once) | trn2.48xlarge (kiln-t2-cb) | one engine, conc 32 / 64 / 128 (= whole box 64 / 128 / 256): base 88.6 / 96.0 / 99.2; fused DSA prefill kernel (q/t2f-pC) 88.8 / 96.3 / 99.5 (neutral); KDA + DSA decode kernels + SP decode (q/t2f-pB) 89.6 / 97.5 / 103.3 (decode call 73 / 107 / 171 -> 71 / 95 / 133 ms); SP_GROUP + MoE prefill skip 20 (q/t2f-pD) conc 32 94.8 (+7.0%, prefill call 1.017 -> 0.922 s); all trn1 defaults with engine-v0's grid-2 EP hung (logs t2-e1-*, t2-e2-pC, t2-e3-pB, t2-e4-pD) | x 2 for the box; numerics gates pending |
+| 2026-10-05 | 70ddc1b + feat/trn2-fast bf9a88c | trn2.48xlarge (kiln-t2-cb) | **decode-only step** (tools/time_decode.py, one engine, DP attention 4, null-page KV, the decode agent's shapes, logs t2-td-*): ms per step at 16 / 32 / 64 rows per group: engine-v0 trn2 default 143.6 / 219.7 / 1438.7; + decode kernels + SP decode 110.7 / 154.8 / 264.2; + moe_dedupe LNC split 93.7 / 121.7 / 204.0; + KDA / DSA decode row splits **87.7 / 110.7 / 180.7** | decode-only $2.92 / 1.84 / **1.50** per M out at trn2 spot (2 engines: ~2,830 out tok/s per box at 256 rows each) |
+| 2026-10-05 | **feat/trn2-fast 118c6ea** (engine-v0 8229c3d merged; a922fe9's trn2 defaults: KDA / DSA decode kernels, SP decode, moe_dedupe + KDA / DSA decode LNC splits, SP_GROUP; plus `KILN_MOE_PREFILL_SKIP=20`, "best1") | trn2.48xlarge Capacity Block (kiln-t2-cb) | **whole box**, the baseline's command (2 x tp=32, DP attention 4, prefill 4096 / 1024, P=6, decode 4/8/16/32, KV 2.75 fp8, max-num-seqs 128 per engine), farm q/t2f-best1, ASSERT_CACHE_HIT (log s3 logs/kiln-t2-cb/20261005T222609Z-t2-U-best1); numerics: decode path check_mixed 28/32 equal, signed dlogprob +0.00020; wikitext -0.544 vs engine-v0's -0.554 | conc 16 / 32 / 64 / 128 / 256: **131.3 / 176.0 / 202.4 / 221.6 / 235.1** (+10.8 / +10.8 / +14.2 / +15.4 / +18.5% over 70ddc1b on the same box); TTFT p50 8.6-9.4 s; ITL p50 89 / 146 / 276 / 525 / 1004 ms; prefill call 0.908-0.937 s, decode call 29-97 ms; prefill 66-87% of device time | spot $32.46 / 24.22 / 21.06 / **19.23** / 18.13 per M out (block price $78.7 ... 43.95) |
+| 2026-10-05 | feat/trn2-fast 118c6ea, best1 + 8192-row prefill calls | trn2.48xlarge Capacity Block (kiln-t2-cb) | one engine (cores 0-31), best1 with `--prefill-tokens 8192 --prefill-buckets 2048 KILN_PIECEWISE_PREFILL_MOE_GROUP=4`, farm q/t2f-best1-p4@pf8k, ASSERT_CACHE_HIT (log s3 logs/kiln-t2-cb/20261005T225412Z-t2-e7-best1pf8k) | conc 32 / 64 / 128 per engine: **110.7 / 122.9 / 131.6** (best1 at the same load per engine 101.2 / 110.8 / 117.6: +9.4 / +10.9 / +11.9%); TTFT p50 8.7-9.0 s; ITL p50 252 / 479 / 916 ms; prefill call 1.637-1.660 s per 8192 rows = 9.9k prefill tok/s per box (best1 8.8k; trn1 one-piece 8.7k, with EPLB 10.2k) | x 2 for the box: ~$16.2 per M out at conc 256 at trn2 spot |
+| 2026-10-06 | feat/trn2-fast-ds2 ef289f8 (feat/trn2-fast 8ba166d + feat/decode-scale 83036ba; scratch, for the measurement) | trn2.48xlarge Capacity Block (kiln-t2-cb) | **decode box with real KV** (PD decode side): tools/time_decode.py --real-kv, one engine, DP attention 4, 8K contexts, KV sized per bucket set (256 seqs / 5.2 GB, 384 seqs / 7.8 GB), farm queues q/t2f-TD*@r / @rb (logs s3 logs/kiln-t2-cb/20261006T*-t2-tdr-*) | ms per step at 16 / 32 / 64 / 96 rows per group: D2K2 96.82 / 111.55 / 179.47 / 245.74; + ST 81.85 / 107.52 / 172.64 / 245.96; + ST + v9 (`KILN_MOE_DEDUPE_MAX_TOKENS=256`) **78.52 / 104.95 / 147.23 / 217.50** = 815 / 1,220 / 1,739 / 1,766 out tok/s per engine; 96 rows per group is the 8K ceiling (tensors 22.4 GB per rank; 25.7 at 128) | ST + v9: $2.61 / 1.75 / 1.23 / **1.21** per M out at half-box spot; whole box 3,531 out tok/s at 96 rows; trn1's decode box $0.89 (decode agent) |
+| 2026-10-06 | feat/trn2-fast 1eeed36 (the fused DSA prefill kernel with its LNC split as trn2 defaults) | trn2.48xlarge Capacity Block (kiln-t2-cb) | **whole box**, the best1 command and environment with `KILN_DSA_FUSED=1 KILN_DSA_PREFILL_KERNEL=nki KILN_LNC_SPLIT=...,dsa_fused`, farm q/t2f-best1F (log s3 logs/kiln-t2-cb/20261006T*-t2-U-best1F); gates: wikitext -0.5498 vs -0.5441, check_mixed 28/32 equal | conc 16 / 32 / 64 / 128 / 256: **133.9 / 180.9 / 208.9 / 229.5 / 243.9** (best1 131.3 / 176.0 / 202.4 / 221.6 / 235.1: +2.0 to +3.7%); prefill call 0.870-0.899 s | spot $31.83 / 23.56 / 20.40 / **18.57** / 17.47 per M out |
 
 ## What the first sweep says (2026-10-04)
 
@@ -385,6 +634,13 @@ attention at higher concurrency, and trn2.
 - Decode kernels (feat/decode-step, opt-in): add `KILN_KDA_DECODE_KERNEL=nki KILN_DSA_DECODE_KERNEL=nki KILN_DECODE_SP=1` to
   the conc-64 command (EP on by default); the farm holds the graphs as q/decode-2968ed3 `configs/G64-EPT-DKS2.config.json`
   (exact command; keys set-equal on the merged tree a64d7f8). At conc 32 the kernels without SP decode: `F0-EPT-DK2`.
+- Utilization (feat/utilization): any serving command plus `KILN_TIMELINE=<file>` (host timeline, then `python
+  tools/util_report.py timeline <file>`) and `KILN_RT_INSPECT=<dir>` (rank 0's runtime trace; raise
+  `NEURON_RT_INSPECT_SYS_TRACE_MAX_EVENTS_PER_NC` for a whole level) costs nothing measurable. Device profiles of the real
+  graphs on real inputs: the same command with `--requests 64 KILN_CAPTURE_INPUTS=<nvme dir> KILN_CAPTURE_AT=prefill:20,decode:400`
+  (~430 GB for 32 ranks; the counts include the warmup's calls), then `python tools/util_report.py replay <dir> --call
+  prefill:20 --out <prof> --keep-ntff [--profile-all]`, `bins <prof>`, `report <prof> --kind prefill --shape-dir <shape dir>
+  --call-s <the serving fit>`. docs/neuron-notes.md "Accelerator utilization of the serving graphs" has the traps.
 - Graphs: never compile on a device box. On the device run with `KILN_COMPILE_FARM=<queue uri>` (waits for
   farm graphs) or `NEURON_LIBTORCH_ASSERT_CACHE_HIT=1` (fails on any miss). Accept a change only with the
   real-weight 4-sentence ppl (~-2.073) AND the wikitext-2 slice (3071 tokens, within 0.01 of ~-0.551): the
