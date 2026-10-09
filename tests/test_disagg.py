@@ -191,6 +191,104 @@ def test_frames_roundtrip_through_the_receiver(tmp_path):
         rcv.close()
 
 
+@pytest.mark.parametrize("how", ["close", "reset"])
+def test_a_part_closed_mid_frame_leaves_no_file(tmp_path, how):
+    """A part frame is received straight into its file (disagg._recv_file: sized, mapped, filled by recv_into); a peer
+    that closes (recv returns 0) or resets (recv_into raises) inside the frame leaves neither a handoff nor a
+    half-written file behind."""
+    import socket
+    import struct
+
+    from kiln.engine import disagg
+
+    got = []
+    rcv = disagg.Receiver("127.0.0.1:0", got.append, 1 << 20, store_dir=str(tmp_path / "s"))
+    try:
+        table, bufs = disagg.pack_arrays([("x", torch.arange(1000, dtype=torch.uint8))])
+        host, port = rcv.address().rsplit(":", 1)
+        sock = socket.create_connection((host, int(port)))
+        h = json.dumps({"kind": "part", "xfer": "t9", "part": "s0", "arrays": table}).encode()
+        sock.sendall(disagg._HDR.pack(disagg.MAGIC, len(h), 1000) + h + bytes(bufs[0])[:100])
+        if how == "reset":
+            time.sleep(0.2)  # the receiver is inside recv_into when the RST lands
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.close()
+        # Wait for the receiver to finish the connection, not for an empty directory: its reader closes its side
+        # (Receiver._read's finally) only after _recv_file has returned or raised, i.e. after the unlink, while the
+        # directory is ALSO empty before the reader has opened the part file. Waiting on the directory let the close
+        # case pass that window and then see the file appear (3 of 40 in-process repeats in the Python 3.13 image).
+        def finished():
+            return bool(rcv._conns) and all(c.fileno() == -1 for c in rcv._conns)
+        for _ in range(250):
+            if finished():
+                break
+            time.sleep(0.02)
+        assert finished(), "the receiver did not finish the connection within 5 s"
+        assert not got and not os.listdir(rcv.dir), os.listdir(rcv.dir)
+    finally:
+        rcv.close()
+
+
+@pytest.mark.parametrize("how", ["close", "reset", "close-in-memory", "nixl-before-hello"])
+def test_a_frame_cut_mid_way_gives_its_bytes_back(tmp_path, how):
+    """The bytes Receiver._room reserves for a frame come back, exactly once, when the frame never completes: a part
+    whose peer closes (EOF) or resets inside it, on disk or in memory, and a NIXL meta refused after its bytes were
+    reserved (no hello frame from its engine). So repeated broken handoffs do not shrink the receive buffer: after five
+    of them a handoff of the whole buffer still goes through without waiting, and its release() brings the held bytes
+    back to zero, not below. (Before the fix each broken frame kept its bytes held for good.)"""
+    import socket
+    import struct
+
+    from kiln.engine import disagg
+
+    budget = 4000
+    got = []
+    rcv = disagg.Receiver("127.0.0.1:0", got.append, budget, store_dir=str(tmp_path / "s"),
+                          in_memory=how == "close-in-memory")
+    snd = disagg.Sender()
+    try:
+        host, port = rcv.address().rsplit(":", 1)
+        table, bufs = disagg.pack_arrays([("x", torch.arange(1000, dtype=torch.uint8))])
+        for i in range(5):
+            sock = socket.create_connection((host, int(port)))
+            if how == "nixl-before-hello":
+                meta = json.dumps({"xfer": f"cut{i}", "parts": [], "transport": "nixl",
+                                   "nixl": {"bytes": 1000, "engine": "e0", "reply": "127.0.0.1:1"}}).encode()
+                h = json.dumps({"kind": "meta", "xfer": f"cut{i}"}).encode()
+                sock.sendall(disagg._HDR.pack(disagg.MAGIC, len(h), len(meta)) + h + meta)
+            else:
+                h = json.dumps({"kind": "part", "xfer": f"cut{i}", "part": "s0", "arrays": table}).encode()
+                sock.sendall(disagg._HDR.pack(disagg.MAGIC, len(h), 1000) + h + bytes(bufs[0])[:100])
+            time.sleep(0.2)  # the reader has reserved the frame's bytes and waits inside it
+            if how == "reset":
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            sock.close()
+            for _ in range(250):  # the reader closes its side last, after giving the bytes back
+                if len(rcv._conns) == i + 1 and all(c.fileno() == -1 for c in rcv._conns):
+                    break
+                time.sleep(0.02)
+            assert len(rcv._conns) == i + 1 and all(c.fileno() == -1 for c in rcv._conns)
+            assert rcv.stats.held_bytes == 0, (i, rcv.stats.held_bytes)
+        assert not got
+        table, bufs = disagg.pack_arrays([("v", torch.zeros(budget // 4))])  # exactly the whole buffer
+        snd.enqueue(rcv.address(), {"kind": "part", "xfer": "whole", "part": "s0", "arrays": table}, bufs)
+        snd.enqueue(rcv.address(), {"kind": "meta", "xfer": "whole"},
+                    [json.dumps({"xfer": "whole", "parts": ["s0"]}).encode()])
+        snd.flush()
+        for _ in range(300):
+            if got:
+                break
+            time.sleep(0.01)
+        assert [m["xfer"] for m in got] == ["whole"] and rcv.stats.buffer_full_events == 0
+        assert rcv.stats.held_bytes == budget
+        rcv.release("whole")
+        rcv.drain()
+        assert rcv.stats.held_bytes == 0
+    finally:
+        snd.close()
+        rcv.close()
+
+
 def test_in_memory_receiver(tmp_path):
     """Receiver(in_memory=True): parts stay in memory (no file), read_parts reads them, release frees their bytes."""
     from kiln.engine import disagg
@@ -590,6 +688,53 @@ def test_glm5_next_into_a_context_parallel_decode_engine(tmp_path, monkeypatch):
         assert q.get(timeout=120)[0] == "ok"
         proc.join(timeout=120)
         compare(got, want, "glm5_next non-CP prefill -> CP decode")
+        D.pd_receiver.drain()
+        assert D.pd_receiver.stats.held_bytes == 0
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+        proc.join(timeout=30)
+        if D is not None:
+            D.close()
+
+
+def test_glm5_next_into_context_parallel_row_groups(tmp_path, monkeypatch):
+    """A non-CP prefill engine (tp=4, page size 4) into a decode engine whose CP degree is below its attention TP
+    (KILN_DSA_CP=1 KILN_DSA_CP_DEGREE=2, tp=4 at DP attention 1: two row groups of 2 consecutive ranks, page size 8, 4
+    local slots per page): each decode rank picks the positions of pools m * 2 + (its attention rank mod 2). Selecting
+    by the attention rank itself left ranks 2 and 3 with no positions (IndexError in _pd_slots; the 8K pipeline into the
+    R8LK decode, CP 8 at attention TP 32). Same tokens as one non-CP engine, logprobs within LOGPROB_TOL."""
+    pytest.importorskip("transformers.models.glm5_next.modeling_glm5_next")
+    dsa_long = pytest.importorskip("kiln.models.dsa_long")
+    if not hasattr(dsa_long, "cp_degree_env"):
+        pytest.skip("no context-parallel row groups in this tree")
+    import multiprocessing as mp
+
+    from kiln.models import mla
+    from tests.test_glm5_next import build
+
+    path = str(tmp_path)
+    build(path, seed=1, index_topk=16, max_position_embeddings=4096)
+    monkeypatch.setenv("KILN_DSA_POOL_CACHE", "separate")
+    monkeypatch.setattr(mla, "POOL_CACHE", "separate")
+    ps = prompts(13, (37, 70, 9, 21))
+    sps = params(len(ps))
+    want = single(path, ps, sps, tp=4, page_size=4)
+    ctx = mp.get_context("spawn")
+    q, addr = ctx.Queue(), ctx.Queue()
+    proc = ctx.Process(target=_prefill_process_later, args=(path, dict(tp=4, page_size=4), ps, sps, addr, q))
+    proc.start()
+    D = None
+    try:
+        monkeypatch.setenv("KILN_DSA_CP", "1")
+        monkeypatch.setenv("KILN_DSA_CP_DEGREE", "2")
+        D = engine(path, pd_role="decode", pd_listen="127.0.0.1:0", tp=4, page_size=8)
+        assert D.model.cp == 2 and D.model.cp_rows == 2 and D.runner.lps == 4
+        addr.put(D.pd_address)
+        got = drive(None, D, ps, sps, prefill_proc=proc)
+        assert q.get(timeout=120)[0] == "ok"
+        proc.join(timeout=120)
+        compare(got, want, "glm5_next non-CP prefill -> CP row-group decode")
         D.pd_receiver.drain()
         assert D.pd_receiver.stats.held_bytes == 0
     finally:

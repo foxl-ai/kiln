@@ -274,6 +274,30 @@ def cp_enabled() -> bool:
     return os.environ.get("KILN_DSA_CP", "0") == "1"
 
 
+# KILN_DSA_CP_DEGREE=<a> (opt-in, with KILN_DSA_CP=1 at DP attention 1): the DSA caches are context-parallel over a
+# ranks, not over the whole attention group of A = attn_tp ranks. The group then splits into A / a ROW GROUPS of a
+# consecutive ranks (engine/tp.py attention_group(world, a)), each holding a full context-parallel copy of every
+# sequence's DSA cache (each rank 1 / a of it), and a prefill chunk's T rows are split over the row groups: row group g
+# selects and attends rows g T / R .. (g + 1) T / R with every head (attention_cp_rows), so per rank the selection, the
+# merge and the slot attention are those of a T / R-row chunk at CP a, while the chunk itself has T rows. A decode
+# batch runs attention_cp unchanged inside each row group (CP collectives over the a ranks, each group attending its
+# a x (heads per rank) heads). Unset (0) or a >= A: the context-parallel degree is the attention TP, as before.
+def cp_degree_env() -> int:
+    return int(os.environ.get("KILN_DSA_CP_DEGREE", "0") or 0)
+
+
+def cp_degree(attn_tp: int) -> int:
+    """The context-parallel degree for an attention TP of attn_tp when KILN_DSA_CP=1 (cp_degree_env, else attn_tp)."""
+    a = cp_degree_env()
+    if a <= 0 or a >= attn_tp:
+        return attn_tp
+    if a < 2:
+        raise ValueError(f"KILN_DSA_CP_DEGREE={a}: a context-parallel degree is at least 2 (0 or unset: the attention TP)")
+    if attn_tp % a or a & (a - 1):
+        raise ValueError(f"KILN_DSA_CP_DEGREE={a} must be a power of two dividing the attention TP {attn_tp}")
+    return a
+
+
 def cp_local_slots(positions: torch.Tensor, table: torch.Tensor, page_size: int, kp: int, A: int,
                    rank: torch.Tensor) -> torch.Tensor:
     """[T] int64: the local cache slot of each written token on this rank (rank [1] int64, its attention rank), or

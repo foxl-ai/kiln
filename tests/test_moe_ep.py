@@ -200,8 +200,8 @@ def test_small2_emulation_mixes_the_two_arithmetics():
 
 
 def test_ep_default_is_glm5_next_on_trn1(monkeypatch):
-    """KILN_MOE_EP unset (auto): on for the glm5_next family (GLM-5.3-Flash) on trn1 / trn1n and on a host without
-    a Neuron device, off for other models and on trn2 / trn3 / inf2 (not measured there); 1 / 0 force it; the
+    """KILN_MOE_EP unset (auto): on for the glm5_next family (GLM-5.3-Flash) on trn1 / trn1n / trn2 and on a host
+    without a Neuron device, off for other models and on trn3 / inf2 (not measured there); 1 / 0 force it; the
     model turns the automatic default off where tp does not divide the experts."""
     import types
 
@@ -211,7 +211,7 @@ def test_ep_default_is_glm5_next_on_trn1(monkeypatch):
     other = types.SimpleNamespace(hybrid=types.SimpleNamespace(family="qwen4_exp"))
     plain = types.SimpleNamespace(hybrid=None)
     monkeypatch.delenv("KILN_MOE_EP", raising=False)
-    for target, want in (("trn1", True), ("trn1n", True), ("trn2", False), ("trn3", False), ("inf2", False)):
+    for target, want in (("trn1", True), ("trn1n", True), ("trn2", True), ("trn3", False), ("inf2", False)):
         monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", target)
         assert decoder.moe_ep_enabled(glm) is want, target
         assert not decoder.moe_ep_enabled(other) and not decoder.moe_ep_enabled(plain)

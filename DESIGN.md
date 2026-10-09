@@ -263,7 +263,7 @@ tokens: about 15 GB per rank), and N groups divide it by N.
 | Speculative decoding | SGLang EAGLE-3 / MTP | draft graph + tree verify, radix-compatible | P3 |
 | Structured output | SGLang xgrammar | on-device token masks | P3 |
 | Cache-aware routing | SGLang router | prefix-affinity router across replicas | P4 |
-| PD disaggregation | SGLang / vLLM | KV transfer over libnrt send/recv | P4 |
+| PD disaggregation | SGLang / vLLM | KV handoff over the host and TCP (engine/disagg.py); device to device over EFA with NIXL, opt-in (engine/nixl_kv.py) | P4 |
 | NRT-direct executor | (ZML, nkipy) | HLO emit + nrta async queues | P4 |
 | Tile-level kernel authoring | TileLang | tile helpers + autotune + reference tests | P1 onward |
 

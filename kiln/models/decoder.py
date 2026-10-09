@@ -31,7 +31,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..config import AttnSpec, LinearSpec, ModelConfig
-from ..engine.sampler import sample, score_rows, topk_large, verify_sample
+from ..engine.sampler import NUM_TOP_LOGPROBS, logsumexp_large, sample, score_rows, topk_large, verify_sample
 from . import linear_attn
 from .quant import FP8, dequant, dequant_mxfp4, dequant_t
 
@@ -200,8 +200,14 @@ def moe_ep_enabled(cfg=None) -> bool:
     row with the routing weights of their pairs. Read when a model is built, so a test can set it per engine.
 
     KILN_MOE_EP=1 / 0 forces it on / off. Unset or "auto": on where it was measured, i.e. for GLM-5.3-Flash's
-    family (glm5_next) on trn1 / trn1n and on a host without a Neuron device (the CPU paths, where EP equals TP:
-    tests/test_moe_ep.py), off for every other model and platform until measured there. The measurement: kiln-mimo-trn1
+    family (glm5_next) on trn1 / trn1n / trn2 and on a host without a Neuron device (the CPU paths, where EP equals TP:
+    tests/test_moe_ep.py), off for every other model and platform until measured there. trn2 since 2026-10-06, after
+    the LNC=2 scatter fix (kernels/moe_ep.py _dummy_lanes): kiln-t2-cb2 (trn2.48xlarge, SDK 2.32, real weights, tp=32,
+    DP attention 4, one engine per half of the box, both at once), EP with the loader's tile-scale fit against the trn2
+    defaults (TP experts) at conc 32 / 64 / 128: 141.2 / 158.2 / 170.4 against 102.7 / 113.1 / 120.1 out tok/s (+37.5 /
+    +39.9 / +41.9%), prefill call 0.588-0.603 against 0.902-0.914 s, decode call 56 / 74 / 99 against 59 / 77 / 96 ms; wikitext
+    -0.5495 against -0.5498 (|dlogprob| mean 0.057, greedy agreement 97.4%); docs/neuron-notes.md "Expert parallelism on
+    trn2 after the fix". The measurement: kiln-mimo-trn1
     (trn1.32xlarge, SDK 2.32, real weights, tp=32), the G64-4096-KV1.5-S20-P12-K serve_sweep at conc 64 on engine-v0
     b4f400f, 2026-10-04: TP 94.9 -> EP 106.4 out tok/s, TTFT p50 10.1 -> 8.4 s, ITL p50 604.5 -> 528.7 ms (logs s3
     logs/kiln-mimo-trn1/20261004T185347Z-serve_sweep.log, 20261004T190618Z-ep-b4f4-serve_sweep.log); real-weight ppl
@@ -234,7 +240,7 @@ def moe_ep_enabled(cfg=None) -> bool:
 
 
 EP_AUTO_MODEL_FAMILIES = ("glm5_next",)
-EP_AUTO_PLATFORMS = ("trn1", "trn1n")
+EP_AUTO_PLATFORMS = ("trn1", "trn1n", "trn2")
 EP_AUTO_MIN_DECODE_ROWS = 4  # decode rows per DP-attention group with kiln_moe_ep_small2 (moe_ep_enabled)
 EP_AUTO_MIN_DECODE_ROWS_V1 = 8  # ... with kiln_moe_ep_small (KILN_MOE_EP_SMALL_V=1)
 
@@ -245,6 +251,16 @@ def ep_auto_min_decode_rows() -> int:
     from ..kernels import moe_ep
 
     return EP_AUTO_MIN_DECODE_ROWS_V1 if moe_ep.SMALL_V == 1 else EP_AUTO_MIN_DECODE_ROWS
+
+
+# KILN_TOPK_CLAMP=1 (opt-in): the sigmoid router's top-k indices clamped into [0, E) before the routing weights are gathered.
+# On trn2 (SDK 2.32, LNC=2) torch.topk over a row holding NaN returns 0xFFFFFFFF for every index (tools/probe_topk_nan.py:
+# NaN rows -> [4294967295] x 8; -inf rows, all-tied rows and zero logits give in-range indices), and the XLA gather at them
+# faults ("scatter/gather (indirect memory copy via vector DGE) out-of-bound access", nrta 1006): the trn2 long-prompt engine's
+# bucket warmup, whose all-zero inputs give NaN rows, died on it (docs/neuron-notes.md "trn2 top-k of a NaN row"). Clamping
+# leaves every finite row's indices as they were; a NaN row's routing is garbage either way. Off by default: it changes the
+# router's graph, so turning it on re-keys every MoE graph.
+TOPK_CLAMP = os.environ.get("KILN_TOPK_CLAMP", "0") == "1"
 
 
 # KILN_DENSE_FP8 (default "1"): a checkpoint's FP8 weights outside the routed experts (attention projections,
@@ -306,6 +322,15 @@ def sp_group_enabled() -> bool:
 
     t = platform.target()
     return t is None or platform.family_of(t) in SP_GROUP_FAMILIES
+
+
+# KILN_PLP_VP=1 (opt-in): prompt logprobs scored on each rank's vocabulary shard (DecoderForCausalLM._score_rows) when
+# the lm_head is vocab-parallel, instead of gathering every row's logits over the whole vocabulary first. The gathered
+# form makes the 4096-row prompt-logprob post graph of GLM-5.3-Flash at tp 32 [4096, 154,880] fp32 plus its temporaries:
+# a 4.76 GiB scratchpad (tools/hbm_estimate.py, against 0.75 for the prefill pieces), which does not load next to the
+# long-context engines' KV on trn1 ("Allocation Failure", 2026-10-06). The same rank, target logprob (its log-sum-exp
+# is combined from the shards' own, so it may differ from the gathered form in the last fp32 bits) and top-N.
+PLP_VP = os.environ.get("KILN_PLP_VP", "0") == "1"
 
 
 def prefill_sp_enabled() -> bool:
@@ -384,8 +409,10 @@ class DecoderLayer(nn.Module):
     def __init__(self, cfg: ModelConfig, spec: AttnSpec, dtype: torch.dtype, tp: int, tp_rank: int, moe: bool,
                  index: int = 0, keep_fp8: bool = False, packed_mxfp4: bool = False, prefix: str | None = None,
                  moe_kernel: str = "xla", attn_tp: int | None = None, attn_rank: int | None = None,
-                 plain: bool = False, ep: bool = False, ep_extra: list[int] | None = None):
-        """tp / tp_rank shard the MLP (dense or experts); ep: the routed experts are expert-parallel instead
+                 plain: bool = False, ep: bool = False, ep_extra: list[int] | None = None,
+                 qkv_in: int | None = None):
+        """qkv_in: the q / k / v projections' input width when it is not the hidden size (an EAGLE-3 draft
+        layer's cat(embeds, hidden), models/eagle3.py). tp / tp_rank shard the MLP (dense or experts); ep: the routed experts are expert-parallel instead
         (moe_ep_enabled: this rank holds experts tp_rank E / tp .. whole); ep_extra: with ep, the experts the
         redundant slots of EVERY rank hold, rank-major (models/eplb.py: s = len / tp slots per rank, this rank's
         after its own E / tp; None or empty: none); attn_tp / attn_rank (default: the same)
@@ -453,7 +480,7 @@ class DecoderLayer(nn.Module):
             q, k, v = self.nh * Dk, self.nkv * Dk, self.nkv * Dv
             self.split = (q, k, v)
             qkv_module = "self_attn.qkv_proj" if cfg.fused_qkv_weights else "self_attn.q_proj"
-            lin("qkv", qkv_module, q + k + v, H)  # q_proj, k_proj, v_proj fused on the output dim
+            lin("qkv", qkv_module, q + k + v, qkv_in or H)  # q_proj, k_proj, v_proj fused on the output dim
             self.qkv_bias = p(q + k + v) if cfg.qkv_bias else None
             self.q_norm = p(Dk) if cfg.qk_norm else None
             self.k_norm = p(Dk) if cfg.qk_norm else None
@@ -591,6 +618,15 @@ class DecoderLayer(nn.Module):
         if cfg.hybrid is not None and not plain:  # hyper-connection models: their streams' parameters (models/hybrid.py)
             _hybrid.init_layer(self, cfg, spec, index, tp, p)
 
+    def pack_dense_mlp(self) -> None:
+        """kernels/nkilib_dense.py's layout beside the dense MLP's own (filled, on the host): gate and up [H, I] and
+        down [I, H], what nkilib's MLP kernel takes. The fused gate_up [2I, H] and down [H, I] stay for every call
+        the kernel does not take (decode-sized ones), so those graphs and their keys are unchanged."""
+        I = self.gate_up.shape[0] // 2
+        self.mlp_gate_t = nn.Parameter(self.gate_up.data[:I].t().contiguous(), requires_grad=False)
+        self.mlp_up_t = nn.Parameter(self.gate_up.data[I:].t().contiguous(), requires_grad=False)
+        self.mlp_down_t = nn.Parameter(self.down.data.t().contiguous(), requires_grad=False)
+
     def pack_experts(self) -> None:
         """Replace w_gu, w_gu_scale, w_down, w_down_scale (filled, on the host) by w_blob, the
         layout of kernels/moe_decode.py or (pack_tiles) kernels/moe_dedupe.py; the XLA paths read it
@@ -668,8 +704,9 @@ class DecoderForCausalLM(nn.Module):
                  tp_rank: int = 0, tp_size: int = 1, tp_group=None, keep_fp8: bool = False,
                  vocab_parallel: bool = False, packed_mxfp4: bool = False, mtp: bool = False,
                  moe_kernel: str = "xla", attn_tp: int | None = None, attn_group=None, dp_attention: int = 1,
-                 max_num_seqs: int | None = None, pd_role: str | None = None):
-        """attn_tp: the attention TP (None: attention_tp's default); attn_group: this rank's
+                 max_num_seqs: int | None = None, pd_role: str | None = None, eagle3=None):
+        """eagle3: a models/eagle3.py DraftConfig, with mtp: the draft head is that EAGLE-3 checkpoint's instead of
+        the model's own MTP layer. attn_tp: the attention TP (None: attention_tp's default); attn_group: this rank's
         attention group when 1 < attn_tp < tp_size (engine/tp.py attention_group). dp_attention: the
         number of DP-attention groups (attn_tp is then tp_size / dp_attention, and no attention
         group is needed: the mixers reduce over the world, see above). max_num_seqs: the engine's
@@ -771,7 +808,26 @@ class DecoderForCausalLM(nn.Module):
         # more KV cache (kv_layers()).
         self.mtp = None
         self.mtp_index_share = False
-        if mtp:
+        self.eagle = eagle3 if mtp else None
+        if self.eagle is not None:
+            # EAGLE-3 (models/eagle3.py): one Llama layer over cat(embeds, hidden) [2H], fc over the target's
+            # auxiliary hidden states, the draft's final norm and lm_head over its own vocabulary (replicated on every
+            # rank: 32000 x H is small, and a replicated head needs no collective), d2t to the target's ids, and the
+            # draft's own embedding when its checkpoint has one (vocabulary-parallel like the target's).
+            d, H = self.eagle, cfg.hidden_size
+            dspec = layer_specs(d.layer)[0]
+            self.mtp = DecoderLayer(d.layer, dspec, dtype, tp_size, tp_rank, moe=False, keep_fp8=False,
+                                    prefix=d.prefix.rstrip("."), attn_tp=self.attn_tp, attn_rank=self.attn_rank,
+                                    qkv_in=2 * H)
+            self.mtp.hidden_norm = nn.Parameter(torch.empty(H, dtype=dtype), requires_grad=False)
+            self.eagle_fc = nn.Parameter(torch.empty(H, len(d.aux_layers) * d.target_hidden_size, dtype=dtype),
+                                         requires_grad=False)
+            self.mtp_norm = nn.Parameter(torch.empty(H, dtype=dtype), requires_grad=False)
+            self.eagle_head = nn.Parameter(torch.empty(d.draft_vocab_size, H, dtype=dtype), requires_grad=False)
+            self.register_buffer("eagle_d2t", torch.zeros(d.draft_vocab_size, dtype=torch.int64), persistent=False)
+            self.eagle_embed = (nn.Parameter(torch.empty(self.vocab_rows, H, dtype=dtype), requires_grad=False)
+                                if d.has_embed else None)
+        elif mtp:
             if not cfg.mtp_layers:
                 raise ValueError("the checkpoint has no MTP layers (num_nextn_predict_layers)")
             H = cfg.hidden_size
@@ -789,16 +845,19 @@ class DecoderForCausalLM(nn.Module):
         )
         if cfg.hybrid is not None:
             _hybrid.init_model(self)
-        # One RoPE table per distinct (rotary dims, theta, rotating frequencies).
+        # One RoPE table per distinct (rotary dims, theta, rotating frequencies, scaling). An EAGLE-3 draft layer keeps
+        # its own checkpoint's scaling, as vLLM builds the draft's rotary from the draft config
+        # (RedHatAI/Llama-3.1-8B-Instruct-speculator.eagle3: rope_scaling null under a llama3-scaled target).
         tables: dict[tuple, str] = {}
         for layer in self.kv_layers():
-            key = (layer.spec.rope_dim, layer.spec.rope_theta, layer.spec.rope_freqs)
+            rs = self.eagle.layer.rope_scaling if self.eagle is not None and layer is self.mtp else cfg.rope_scaling
+            key = (layer.spec.rope_dim, layer.spec.rope_theta, layer.spec.rope_freqs, rs)
             if not key[0]:  # no RoPE (Inkling)
                 continue
             if key not in tables:
                 name = str(len(tables))
                 tables[key] = name
-                cos, sin = self._rope_table(key[0], key[1], max_positions, key[2])
+                cos, sin = self._rope_table(key[0], key[1], max_positions, key[2], key[3])
                 self.register_buffer(f"rope_cos{name}", cos.to(dtype), persistent=False)
                 self.register_buffer(f"rope_sin{name}", sin.to(dtype), persistent=False)
             layer.rope = tables[key]
@@ -826,6 +885,17 @@ class DecoderForCausalLM(nn.Module):
         self.cp = self.attn_tp if (_dsa_long.cp_enabled() and self.long_dsa and self.attn_tp > 1) else 1
         if self.cp > 1 and getattr(self, "mtp", None) is not None:
             raise NotImplementedError("context-parallel DSA with an MTP layer")
+        # KILN_DSA_CP_DEGREE (models/dsa_long.py cp_degree_env): context parallelism over cp < attn_tp ranks, the
+        # attention group split into cp_rows row groups of cp consecutive ranks (models/mla.py attention_cp_rows).
+        # cp_group: the row group's process group (engine/engine.py build_shard sets it; None: the attention group).
+        self.cp_rows = 1
+        self.cp_group = None
+        if self.cp > 1:
+            self.cp = _dsa_long.cp_degree(self.attn_tp)
+            self.cp_rows = self.attn_tp // self.cp
+            if self.cp_rows > 1 and self.attn_tp != tp_size:
+                raise NotImplementedError(f"KILN_DSA_CP_DEGREE={self.cp} below the attention TP {self.attn_tp} needs "
+                                          f"DP attention 1 and attention TP = TP (have tp={tp_size})")
         # Back-compat for single-spec models (tools and tests read these).
         first = next(iter(self.kv_layers()), None)
         self.nh, self.nkv, self.kv_offset = (first.nh, first.nkv, first.kv_offset) if first is not None else (0, 0, 0)
@@ -901,12 +971,32 @@ class DecoderForCausalLM(nn.Module):
         if getattr(self, "long_dsa", False) and self.attn_tp > 1:
             # Long-context DSA prefill (models/mla.py _long_prefill_select): this rank's block of a chunk's queries
             # within its attention group, as an index [1] and an fp32 one-hot [attn_tp] row (fp32: the gathered
-            # pool indices go up to 262,144, which bf16 cannot hold).
-            g2 = torch.zeros(self.attn_tp, dtype=torch.float32, device="cpu")
-            g2[self.attn_rank] = 1
-            self.register_buffer("long_grp_index", torch.tensor([self.attn_rank], dtype=torch.int64,
+            # pool indices go up to 262,144, which bf16 cannot hold). With row groups (cp_rows > 1,
+            # KILN_DSA_CP_DEGREE): the rank within its row group of cp ranks, and the row group as cp_row_index [1]
+            # / cp_row_onehot [cp_rows].
+            rows = getattr(self, "cp_rows", 1)
+            A = self.cp if rows > 1 else self.attn_tp
+            g2 = torch.zeros(A, dtype=torch.float32, device="cpu")
+            g2[self.attn_rank % A] = 1
+            self.register_buffer("long_grp_index", torch.tensor([self.attn_rank % A], dtype=torch.int64,
                                                                 device="cpu").to(device), persistent=False)
             self.register_buffer("long_grp_onehot", g2.to(device), persistent=False)
+            if rows > 1 and _mla.CP_FLAGSTAT:  # the long-context selection's local-list statistics (opt-in)
+                for l in self.kv_layers():
+                    if _mla.long_capable(l.spec):
+                        l.register_buffer("cp_flagstat", torch.zeros(2 + 2 * len(_mla.CP_FLAG_KS), dtype=torch.float32,
+                                                                     device="cpu").to(device), persistent=False)
+            if rows > 1 and _mla.CP_LOCAL_K > 0:  # KILN_DSA_CP_LOCAL_K's counts: [rows, failed, past CP_LOCAL_F]
+                for l in self.kv_layers():
+                    if _mla.long_capable(l.spec):
+                        l.register_buffer("cp_localk", torch.zeros(3, dtype=torch.float32, device="cpu").to(device),
+                                          persistent=False)
+            if rows > 1:
+                g3 = torch.zeros(rows, dtype=torch.float32, device="cpu")
+                g3[self.attn_rank // A] = 1
+                self.register_buffer("cp_row_index", torch.tensor([self.attn_rank // A], dtype=torch.int64,
+                                                                  device="cpu").to(device), persistent=False)
+                self.register_buffer("cp_row_onehot", g3.to(device), persistent=False)
         if self.dp == 1:
             return
         # Built on the host and copied: eager ops on the neuron device failed here ("Expected
@@ -959,10 +1049,11 @@ class DecoderForCausalLM(nn.Module):
 
     def rope_tables(self, n: int) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """RoPE buffer suffix -> (cos, sin) fp32 tables over n positions."""
-        return {name: self._rope_table(key[0], key[1], n, key[2]) for name, key in self._rope_specs.items()}
+        return {name: self._rope_table(key[0], key[1], n, key[2], key[3]) for name, key in self._rope_specs.items()}
 
-    def _rope_table(self, dim: int, theta: float, n: int, freqs: int | None = None):
-        rs = dict(self.cfg.rope_scaling or ())
+    def _rope_table(self, dim: int, theta: float, n: int, freqs: int | None = None, scaling="cfg"):
+        """scaling: ModelConfig.rope_scaling items; "cfg" for the model's own."""
+        rs = dict((self.cfg.rope_scaling if scaling == "cfg" else scaling) or ())
         scale = 1.0
         if freqs is not None:  # only the first `freqs` pairs rotate, at a 2 * freqs-dim RoPE's rates (K2-Horizon)
             inv_freq = 1.0 / (theta ** (torch.arange(0, 2 * freqs, 2, dtype=torch.int64).float() / (2 * freqs)))
@@ -1206,13 +1297,17 @@ class DecoderForCausalLM(nn.Module):
 
         return funcol.all_gather_tensor(x.contiguous(), 0, self.tp_group)
 
-    def _embed(self, ids: torch.Tensor) -> torch.Tensor:
+    def _embed(self, ids: torch.Tensor, weight: torch.Tensor | None = None) -> torch.Tensor:
+        """weight: another embedding of the target's vocabulary layout (an EAGLE-3 draft's own, eagle_embed). The
+        weight is read where the embedding is taken, AFTER vocab_start_t: dynamo lifts graph inputs in the order the
+        trace touches them, and reading self.embed first swapped two inputs of every graph holding the embedding (two
+        GLM-5.3-Flash G64 graphs per rank re-keyed, tools/compile_farm.py capture against bd3416a, 2026-10-07)."""
         if not self.vocab_parallel:
-            e = F.embedding(ids, self.embed)
+            e = F.embedding(ids, self.embed if weight is None else weight)
         else:
             local = ids - self.vocab_start_t
             mine = (local >= 0) & (local < self.vocab_rows)
-            e = F.embedding(local.clamp(0, self.vocab_rows - 1), self.embed)
+            e = F.embedding(local.clamp(0, self.vocab_rows - 1), self.embed if weight is None else weight)
             e = self._all_reduce(torch.where(mine.unsqueeze(-1), e, torch.zeros_like(e)))
         return rms_norm(e, self.embed_norm, self.cfg.rms_norm_eps) if self.embed_norm is not None else e
 
@@ -1254,6 +1349,40 @@ class DecoderForCausalLM(nn.Module):
         mine = (torch.arange(self.tp_size, device=h.device) * Vr == self.vocab_start_t).to(local.dtype)
         full = (local.unsqueeze(1) * mine.view(1, -1, 1)).reshape(T, self.tp_size * Vr)
         return self._all_reduce(full)[:, : self.cfg.vocab_size].float()
+
+    def _score_rows(self, hn: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """sampler.score_rows(self._head(hn), targets): [R, 2 + 2N] (rank, logprob, top-N ids, top-N logprobs). With
+        KILN_PLP_VP and a vocab-parallel head, from each rank's shard of the logits: the target's logit is its
+        owner's (one value plus zeros over the world: exact), its rank the shards' counts of larger logits summed, the
+        log-sum-exp combined from the shards' (logsumexp_large of each), the top N the best of the shards' top N."""
+        if not (PLP_VP and self.vocab_parallel and self.tp_size > 1):
+            return score_rows(self._head(hn), targets)
+        w = self.embed if self.lm_head is None else self.lm_head
+        h = hn / self.cfg.logits_divisor if self.cfg.logits_divisor != 1.0 else hn
+        R, Vr, tp, N = h.shape[0], self.vocab_rows, self.tp_size, NUM_TOP_LOGPROBS
+        local = F.linear(h, w).float()  # [R, Vr]: _head's values (bf16 matmul, then fp32)
+        # Ids in fp32 (exact below 2^24): a cast of an int64 id sum to fp32 failed to lower ("shift-left with different
+        # element types: s64[] and s32[]", the capture, 2026-10-06), so the shard's first id is a float from the one-hot.
+        mine = (torch.arange(tp, device=h.device) * Vr == self.vocab_start_t).to(torch.float32)  # [tp] one-hot
+        start = (mine * torch.arange(tp, device=h.device, dtype=torch.float32)).sum() * float(Vr)
+        col = torch.arange(Vr, device=h.device, dtype=torch.float32).view(1, Vr) + start
+        real = col < torch.full_like(col, float(self.cfg.vocab_size))  # the last shard's padding columns are not ids
+        local = torch.where(real, local, torch.full_like(local, -1e30))
+        rel = targets.view(R, 1).to(torch.float32) - start
+        own = (rel >= torch.zeros_like(rel)) & (rel < torch.full_like(rel, float(Vr)))
+        at = rel.clamp(0.0, float(Vr - 1)).to(torch.int64)
+        tl = torch.where(own, torch.gather(local, 1, at), torch.zeros_like(rel))
+        tgt = self._all_reduce(tl)  # [R, 1]
+        rank = self._all_reduce((local > tgt).to(torch.float32).sum(1, keepdim=True)) + 1.0
+        lse_all = self._all_reduce(logsumexp_large(local) * mine.view(1, tp))  # [R, tp]
+        lse = torch.logsumexp(lse_all, dim=-1, keepdim=True)
+        vals, idx = topk_large(local, N)
+        gid = idx.float() + start
+        cv = self._all_reduce((vals.unsqueeze(1) * mine.view(1, tp, 1)).reshape(R, tp * N))
+        ci = self._all_reduce((gid.unsqueeze(1) * mine.view(1, tp, 1)).reshape(R, tp * N))
+        tv, tj = torch.topk(cv, N, dim=-1)
+        ti = torch.gather(ci, 1, tj)
+        return torch.cat([rank, tgt - lse, ti, tv - lse], dim=1)
 
     def _qkv(self, layer: DecoderLayer, x: torch.Tensor, positions: torch.Tensor, ctx=None):
         """ctx: (positions, slot_mapping, table) of a paged forward, for layers with short
@@ -1326,6 +1455,10 @@ class DecoderForCausalLM(nn.Module):
                     unit_scale: torch.Tensor | None = None) -> torch.Tensor:
         """unit_scale [T, intermediate]: per-token weights of the intermediate units (Inkling's
         router-weighted shared experts)."""
+        gt = getattr(layer, "mlp_gate_t", None) if gate_up == "gate_up" and unit_scale is None else None
+        if gt is not None and x.dim() == 2 and _nkilib_dense.can_use_mlp(x.shape[0], x.shape[1], gt.shape[1]):
+            # A prefill-sized call through nkilib's MLP kernel (KILN_DENSE_MLP_KERNEL=nkilib, DecoderLayer.pack_dense_mlp)
+            return _nkilib_dense.mlp(x, gt, layer.mlp_up_t, layer.mlp_down_t)
         gu = F.linear(x, self._w(layer, gate_up))
         half = gu.shape[-1] // 2
         a = F.silu(gu[..., :half]) * gu[..., half:]
@@ -1426,6 +1559,8 @@ class DecoderForCausalLM(nn.Module):
             if cfg.n_group > 1:  # DeepSeek-V3 node-limited routing
                 choice = _mla.group_limited(choice, cfg.n_group, cfg.topk_group)
             _, topi = torch.topk(choice, k, dim=-1)
+            if TOPK_CLAMP:  # trn2: a NaN row's indices are 0xFFFFFFFF, and the gather below then faults
+                topi = topi.clamp(0, choice.shape[-1] - 1)
             topv = torch.gather(scores, 1, topi)
             if cfg.norm_topk_prob and k > 1:
                 topv = topv / (topv.sum(dim=-1, keepdim=True) + 1e-20)
@@ -1616,6 +1751,17 @@ class DecoderForCausalLM(nn.Module):
         q, k, v = self._qkv(layer, x, positions, ctx)
         self._store(layer.k_cache, slot_mapping, k)
         self._store(layer.v_cache, slot_mapping, v)
+        T = x.shape[0]
+        if (table.dim() == 1 and _segmented_attn.ENABLED and x.device.type != "cpu"
+                and _segmented_attn.eligible(layer, T, self.page_size, layer.k_cache.dtype, self.fp8_max is not None)):
+            # KILN_ATTN_PREFILL=segmented: the chunk attends the real context in segments (kernels/segmented_attn.py)
+            sc = sp.scale if sp.scale is not None else sp.head_dim ** -0.5
+            o = _segmented_attn.attend(q.reshape(T, layer.nh, sp.head_dim), layer.k_cache, layer.v_cache, table,
+                                       positions[:1], self.page_size, sc)
+            o = o.reshape(T, layer.nh * sp.v_head_dim)
+            if layer.o_gate is not None:
+                o = o * torch.sigmoid(F.linear(x, self._w(layer, "o_gate")))
+            return F.linear(o, self._w(layer, "o"), layer.o_bias)
         kc = self._load(layer.k_cache, table)  # [(B,) L, nkv, Dk]
         vc = self._load(layer.v_cache, table)
         rel = self._rel_logits(layer, x, positions, kc.shape[-3]) if layer.rel_proj is not None else (None, None)
@@ -1696,11 +1842,30 @@ class DecoderForCausalLM(nn.Module):
                 out[self.window] = (self._bias(vis).view(*shape, -1), swa_table)
         return out
 
-    def _run_layers(self, h, positions, slot_mapping, attn, state_slot=None, mixed=None):
-        for layer in self.layers:
+    def _run_layers(self, h, positions, slot_mapping, attn, state_slot=None, mixed=None, aux=None):
+        """aux: a list that receives the residual stream once n layers ran, for each n in the EAGLE-3 draft's
+        aux_layers (models/eagle3.py; vLLM EagleModelMixin._maybe_add_hidden_state(aux, idx + 1, ...))."""
+        want = set(self.eagle.aux_layers) if aux is not None else ()
+        if 0 in want:
+            aux.append(h)
+        for n, layer in enumerate(self.layers, 1):
             bias, table = attn[getattr(layer.spec, "window", None)]
             h = self._layer(layer, h, positions, slot_mapping, table, bias, state_slot, mixed)
+            if n in want:
+                aux.append(h)
         return h
+
+    def eagle_combine(self, *aux):
+        """vLLM llama_eagle3.py combine_hidden_states: fc(cat(aux)) [T, H], the hidden state an EAGLE-3 draft's first
+        step reads (no norm_before_fc / fc_norm: the checkpoints read have neither)."""
+        return F.linear(torch.cat(aux, dim=-1), self.eagle_fc)
+
+    def _draft_out(self, out, h, aux):
+        """A forward's output: the drafting head's hidden states beside it (MTP: the last hidden state; EAGLE-3: the
+        combined auxiliary ones)."""
+        if self.mtp is None:
+            return out
+        return (out, self.eagle_combine(*aux)) if self.eagle is not None else (out, h)
 
     # -- piecewise execution: one compiled graph per KIND of layer ---------------------
     #
@@ -1792,9 +1957,10 @@ class DecoderForCausalLM(nn.Module):
         rows of a model with a Per-Layer Embedding (models/qwen4_exp.py)."""
         h, attn = self.prep_decode(input_ids, positions, block_table, context_lens, board, read_slot,
                                    swa_table, swa_first, ngram_ids)
-        h = self._run_layers(h, positions, slot_mapping, attn, state_slot)
+        aux = [] if self.eagle is not None else None
+        h = self._run_layers(h, positions, slot_mapping, attn, state_slot, aux=aux)
         out = self.post_decode(h, temperature, top_p, top_k, min_p, noise, board, write_slot, bitmask, penalties)
-        return (out, h) if self.mtp is not None else out  # MTP drafts from the final hidden states
+        return self._draft_out(out, h, aux)  # MTP / EAGLE-3 draft from the hidden states
 
     # -- prefill: one sequence x C tokens ---------------------------------------------
 
@@ -1823,7 +1989,9 @@ class DecoderForCausalLM(nn.Module):
         out = sample(self._head(hn.index_select(0, last_index)), temperature, top_p, top_k, min_p, noise,
                      bitmask, penalties)
         board.index_put_((write_slot,), out[:, 0])
-        if plp_targets is not None:
+        if plp_targets is not None and PLP_VP:
+            out = torch.cat([out, self._score_rows(hn, plp_targets)])
+        elif plp_targets is not None:
             out = torch.cat([out, score_rows(self._head(hn), plp_targets)])
         return out
 
@@ -1836,10 +2004,11 @@ class DecoderForCausalLM(nn.Module):
         after the sampled row (see sampler.score_rows). state_slot [1]: the sequence's row in
         the recurrent-state pool (linear-attention models)."""
         h, attn = self.prep_prefill(input_ids, positions, block_table, swa_table, swa_first, ngram_ids)
-        h = self._run_layers(h, positions, slot_mapping, attn, state_slot)
+        aux = [] if self.eagle is not None else None
+        h = self._run_layers(h, positions, slot_mapping, attn, state_slot, aux=aux)
         out = self.post_prefill(h, last_index, temperature, top_p, top_k, min_p, noise, board, write_slot,
                                  bitmask, penalties, plp_targets)
-        return (out, h) if self.mtp is not None else out
+        return self._draft_out(out, h, aux)
 
     # -- mixed: one sequence's prefill chunk plus D decoding sequences -----------------
     #
@@ -1895,7 +2064,9 @@ class DecoderForCausalLM(nn.Module):
         out = sample(self._head(hn.index_select(0, last_index)), temperature, top_p, top_k, min_p, noise,
                      bitmask, penalties)
         board.index_put_((write_slot,), out[:, 0])
-        if plp_targets is not None:
+        if plp_targets is not None and PLP_VP:
+            out = torch.cat([out, self._score_rows(hn, plp_targets)])
+        elif plp_targets is not None:
             out = torch.cat([out, score_rows(self._head(hn), plp_targets)])
         return out
 
@@ -1953,9 +2124,10 @@ class DecoderForCausalLM(nn.Module):
         continues from the state after its last accepted position (models/linear_attn.verify_scan).
         ngram_ids [B * Q, *]: a Per-Layer Embedding's host-computed rows (models/qwen4_exp.py)."""
         h, attn = self.prep_verify(input_ids, positions, block_table, swa_table, swa_first, ngram_ids)
-        h = self._run_layers(h, positions.reshape(-1), slot_mapping.reshape(-1), attn, state_slot)
+        aux = [] if self.eagle is not None else None
+        h = self._run_layers(h, positions.reshape(-1), slot_mapping.reshape(-1), attn, state_slot, aux=aux)
         out = self.post_extend(h, temperature, top_p, top_k, min_p, noise, u_accept, draft)
-        return (out, h) if self.mtp is not None else out
+        return self._draft_out(out, h, aux)
 
     # -- multi-token prediction drafts --------------------------------------------------
 
@@ -1979,6 +2151,9 @@ class DecoderForCausalLM(nn.Module):
         (prefill_sp), and hidx indexes the chunk's rows in full."""
         cfg = self.cfg
         B, Q = input_ids.shape
+        if self.eagle is not None:
+            return self._eagle_pass(input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index,
+                                    swa_table, swa_first, target, sp_onehot)
         e, attn = self.prep_extend(input_ids, positions, block_table, swa_table, swa_first)
         # hsrc holds UNNORMALISED hidden states (the target's last layer output, or the previous
         # MTP pass's) and src_norm is their final norm (model.norm or mtp_norm): returning normed
@@ -2006,6 +2181,43 @@ class DecoderForCausalLM(nn.Module):
         hm = rms_norm(xl, self.mtp_norm, cfg.rms_norm_eps)
         _, top = topk_large(self._head(hm), 1)
         return top[:, :1].float(), xl, share
+
+    def _eagle_pass(self, input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, swa_table=None,
+                    swa_first=None, target=False, sp_onehot=None):
+        """_mtp_pass for an EAGLE-3 draft (models/eagle3.py: vLLM v0.24.0 llama_eagle3.py LlamaDecoderLayer.forward
+        with layer_idx 0, LlamaModel.forward, Eagle3LlamaForCausalLM.compute_logits). hsrc: the target call's
+        combined auxiliary states (eagle_combine) on the first pass (target), the previous pass's prenorm output on a
+        later one. Returns ([B, 1] fp32 drafts in the target's vocabulary, the prenorm hidden at last_index, None)."""
+        cfg, d, layer = self.cfg, self.eagle, self.mtp
+        B, Q = input_ids.shape
+        e, attn = self.prep_extend(input_ids, positions, block_table, swa_table, swa_first)
+        if self.eagle_embed is not None:
+            e = self._embed(input_ids.reshape(B * Q), self.eagle_embed)
+        if sp_onehot is not None:  # every rank's rows of a sequence-parallel prefill chunk's combined states
+            h = self._sp_gather(hsrc, sp_onehot).index_select(0, hidx.reshape(-1))
+        else:
+            h = hsrc.index_select(0, hidx.reshape(-1))
+        eps = d.layer.rms_norm_eps
+        if d.norm_before_residual:
+            hn = rms_norm(h, layer.hidden_norm, eps)
+            residual = hn
+        else:
+            residual = h
+            hn = rms_norm(h, layer.hidden_norm, eps)
+        x = torch.cat([rms_norm(e, layer.in_norm, eps), hn], dim=-1)  # [B * Q, 2H]
+        bias, table = attn[layer.spec.window]
+        p, sl = positions.reshape(-1), slot_mapping.reshape(-1)
+        h1 = residual + self._attn_all_reduce(self._gqa(layer, x, p, sl, table, bias))
+        y = self._mlp(layer, h1)  # post_attention_layernorm, MLP, residual: the prenorm output
+        rows = torch.arange(B, device=input_ids.device) * Q + last_index
+        yl = y.index_select(0, rows)
+        logits = F.linear(rms_norm(yl, self.mtp_norm, eps), self.eagle_head).float()  # [B, Vd], replicated
+        # argmax, not topk_large: topk_large's index arithmetic (j % chunk) next to the d2t gather failed neuronx-cc
+        # 2.27 with NCC_ILSM901 "LegalizeSundaMacro assertion error: Cannot split" on the remainder (trn1.2xlarge,
+        # Qwen3-8B TP=2, B=1, Q=1 and 4, 2026-10-07); the offsets are gathered as fp32 (exact: |d2t| < 2^24).
+        top = logits.argmax(dim=-1, keepdim=True)  # [B, 1]
+        draft = top.float() + self.eagle_d2t.float().gather(0, top.view(-1)).view(-1, 1)
+        return draft, yl, None
 
     def forward_mtp_k(self, input_ids, positions, block_table, slot_mapping, hsrc, hidx, last_index, src_norm,
                       pos_rest=None, slot_rest=None, swa_table=None, swa_first=None, swa_rest=None,
@@ -2088,4 +2300,6 @@ from . import hybrid as _hybrid  # noqa: E402
 from . import mla as _mla  # noqa: E402
 from . import eplb as _eplb  # noqa: E402
 from . import mtp as _mtp  # noqa: E402
+from ..kernels import nkilib_dense as _nkilib_dense  # noqa: E402
 from . import dsa_long as _dsa_long  # noqa: E402
+from ..kernels import segmented_attn as _segmented_attn  # noqa: E402

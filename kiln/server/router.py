@@ -7,7 +7,7 @@ an approximate prefix tree of the request text it sent there, and routes a reque
    min), to the least-loaded worker: load wins over locality.
 2. Else to the worker whose tree matches the longest prefix, if that match covers at least
    `cache_threshold` of the request; its radix cache very likely still holds the KV.
-3. Else to the worker with the smallest tree (the most room for new prefixes).
+3. Else to the least-loaded worker, the smallest tree (the most room for new prefixes) breaking ties.
 
 The tree is text-level, like SGLang's router, so it needs no tokenizer; it is pruned to
 `max_tree_chars` per worker by evicting least-recently-used leaves.
@@ -132,7 +132,12 @@ class Router:
                 w = best
             else:
                 self.routed["smallest"] += 1
-                w = min(range(len(self.trees)), key=lambda i: (self.trees[i].size, self.load[i]))
+                # Load first, then the smaller tree. Tree size alone degenerates once the trees reach max_tree_chars:
+                # the worker that receives a request is pruned back below the other one's size, so it wins the next
+                # request too, and only the balance rule (an imbalance over balance_abs) ever sends one elsewhere.
+                # Measured on kiln-t2-cb2 (trn2.48xlarge, two GLM-5.3-Flash engines, unrelated 8192-token real-text
+                # prompts, 2026-10-08): at conc 32 one engine served 63 of 64 requests and the other was 19% busy.
+                w = min(range(len(self.trees)), key=lambda i: (self.load[i], self.trees[i].size))
         self.trees[w].insert(text)
         return w
 
@@ -146,7 +151,14 @@ def _request_text(path: str, body: dict) -> str:
 
 def build_router_app(router: Router) -> FastAPI:
     app = FastAPI(title="kiln-router")
-    client = httpx.AsyncClient(timeout=None)
+    # A streaming request holds its connection to the worker until the last token, so the pool's connection cap is a cap
+    # on requests in flight at every worker together. httpx's default (Limits(max_connections=100), shared by all hosts)
+    # held a whole-box run at 100 in flight at conc 128..256: the rest waited inside client.send() here, which the client
+    # measured as TTFT (kiln-t2-cb2, trn2.48xlarge, 2026-10-07: two engines behind this router served 401.9 out tok/s at
+    # conc 128 and 316.9 at conc 256; one engine alone served 252.9 at conc 64 in-process). No cap, as the PD router
+    # (pd_router.py build_pd_app), with its keep-alive expiry: idle connections close here before an engine closes them.
+    client = httpx.AsyncClient(timeout=None, limits=httpx.Limits(
+        max_connections=None, max_keepalive_connections=512, keepalive_expiry=30.0))
 
     @app.get("/health")
     async def health():

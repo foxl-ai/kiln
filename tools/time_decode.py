@@ -58,6 +58,10 @@ def main() -> None:
                     help="every row its own pages (distinct ids through each group's pool, filled once with random "
                          "values, fp8 clamped) at a context of the sweep's --input-len plus a spread of its "
                          "--output-len, and its own state row; refuses a bucket whose rows do not fit the pool")
+    ap.add_argument("--dump", default=None,
+                    help="with --real-kv: save every step's sampled rows (token, logprob, top-N ids and logprobs; the "
+                         "first launch first) of each bucket to <dump>-B<bucket>.npy, so two configurations run on the "
+                         "same seed can be compared token for token (tools/compare_decode_dumps.py)")
     ap.add_argument("sweep", nargs=argparse.REMAINDER)
     a = ap.parse_args()
     sweep = a.sweep[1:] if a.sweep[:1] == ["--"] else a.sweep
@@ -187,8 +191,9 @@ def _decode_bucket_real(a, r, B, P, N, rng, vocab, mr, NULL_PAGE, BOARD, sweep_a
     print(f"B={B}: real KV, contexts {int(ctx.min())}..{int(ctx.max())} tokens, {int((ctx // ps + 1).sum())} pages "
           f"over {N} groups", flush=True)
     t0 = time.perf_counter()
-    r._exec("decode", ("decode", B, P), host)
+    first = r._exec("decode", ("decode", B, P), host)
     print(f"B={B}: first step (graph load or compile) {time.perf_counter() - t0:.1f}s", flush=True)
+    dumps = [first.cpu().numpy()] if a.dump else None
     wall = []
     for pieces in ([False, True] if a.pieces else [mr.PROFILE]):
         mr.PROFILE = pieces
@@ -200,9 +205,14 @@ def _decode_bucket_real(a, r, B, P, N, rng, vocab, mr, NULL_PAGE, BOARD, sweep_a
                 mr.EXEC_TIMES.clear()
             host[0] = rng.integers(min(1000, vocab // 2), vocab, N * B).astype(np.int64)
             t = time.perf_counter()
-            r._exec("decode", ("decode", B, P), host).cpu()
+            out = r._exec("decode", ("decode", B, P), host).cpu()
             if i >= a.skip and not (a.pieces and pieces):
                 wall.append(time.perf_counter() - t)
+            if dumps is not None and not pieces:
+                dumps.append(out.numpy())
+    if dumps is not None:
+        np.save(f"{a.dump}-B{B}.npy", np.stack(dumps))
+        print(f"B={B}: {len(dumps)} steps' outputs saved to {a.dump}-B{B}.npy", flush=True)
     report(mr, f"B={B} ")
     wall.sort()
     print(f"B={B} rows/group, {N * B} rows/step (real KV): wall p50 {wall[len(wall) // 2] * 1e3:.3f} ms min "

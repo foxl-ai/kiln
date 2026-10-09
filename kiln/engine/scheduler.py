@@ -165,6 +165,10 @@ class Scheduler:
         # it is "decoding" until the commit that ends it). prefilled (a decode engine): requests handed off
         # by a prefill engine, waiting for pages; admitted ahead of every decode of the step.
         self.prefill_only = False
+        # A prefill engine under KILN_PD_TRANSPORT=nixl (engine/nixl_kv.py): a finished handoff request keeps its tail
+        # pages and its radix lock (req.pd_pin) until the decode engine has read them (pd_unpin).
+        self.pd_pin = False
+        self.pd_pinned = 0  # requests whose state row such a pin keeps: they hold a seat (max_num_seqs) until released
         self.prefilled: deque[Request] = deque()
         # A decode engine holds the pages and state rows of requests that ended in the last commit until the step in
         # flight then is read back (PagePool.hold): `cooling` counts those requests' slots, which admission may not
@@ -414,7 +418,7 @@ class Scheduler:
         owed = sum(self._still_needs(r) for r in self.running) if reserve else 0
         deferred = []  # waiting for a running request to checkpoint the prefix they share
         lookahead = self._lookahead()
-        while self.waiting and budget > 0 and len(self.running) < self.cfg.max_num_seqs:
+        while self.waiting and budget > 0 and len(self.running) + self.pd_pinned < self.cfg.max_num_seqs:
             req = self.waiting[0]
             if lookahead and self._prefix_in_progress(req):
                 deferred.append(self.waiting.popleft())
@@ -797,14 +801,25 @@ class Scheduler:
             self.radix.session_register(req.session_id, req.session_gen, req.node)
         n_full = req.num_computed // self.cfg.page_size if self.cfg.prefix_cache else 0
         tail = req.pages[n_full:]
-        if tail:
-            self.pool.free(tail)
-        if req.node is not None:
-            self.radix.unlock(req.node)
+        if self.pd_pin and req.handoff is not None and status is Status.FINISHED:
+            req.pd_pin = (self, tail, req.node)  # engine._pd_handoff keeps it until the release, or frees it at once
+        else:
+            if tail:
+                self.pool.free(tail)
+            if req.node is not None:
+                self.radix.unlock(req.node)
         req.pages = []
         req.node = None
         req.status = status
         self.running.remove(req)
+
+    def pd_unpin(self, pin) -> None:
+        """Free what _release kept for a nixl handoff (pd_pin): its tail pages and its radix lock."""
+        _, tail, node = pin
+        if tail:
+            self.pool.free(tail)
+        if node is not None:
+            self.radix.unlock(node)
 
     def _preempt(self, req: Request) -> None:
         if req.pd_meta is not None:

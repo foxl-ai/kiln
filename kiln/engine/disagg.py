@@ -52,6 +52,11 @@ pd_buffer_gb of payload: a part that does not fit waits on its connection (the s
 blocks, and so does its queue), counted in buffer_full_events / buffer_full_seconds and logged once per
 episode, never dropped and never retried silently. The router keeps that from happening by
 dispatching at most as many requests to a decode engine as it has room for (server/router.py).
+
+KILN_PD_TRANSPORT=nixl (engine/nixl_kv.py, opt-in) keeps this framing for the meta and replaces the parts: the
+sender opens every connection with a "hello" frame (its ranks' NIXL exports), a handoff is its meta alone, and each
+decode rank reads its rows from the prefill ranks' device memory itself. The receiver still counts the handoff's bytes
+against pd_buffer_gb from the meta's arrival to its release, so backpressure works as above.
 """
 
 from __future__ import annotations
@@ -211,6 +216,36 @@ def _recv_exact(sock: socket.socket, n: int, into=None) -> bytearray | None:
     return buf
 
 
+def _recv_file(sock: socket.socket, n: int, path: str) -> bool:
+    """n bytes off the socket straight into the file at path (sized first, then mapped): the kernel copies them once,
+    into the file's pages. Reading them into a bytearray and writing that out copied every byte twice more, and at 1M a
+    pipeline's handoff is ~44 GB through one decode box (the host path's ~17 s, kiln-pd4-dec e2e4-r8). False when the
+    peer closes inside the frame; then, and when the socket raises (a reset peer), the file is removed, as the old
+    read-then-write path never created one."""
+    import mmap
+
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
+    got = 0
+    try:
+        if n:
+            os.ftruncate(fd, n)
+            with mmap.mmap(fd, n) as mm:
+                view = memoryview(mm)
+                try:
+                    while got < n:
+                        k = sock.recv_into(view[got:], n - got)
+                        if k == 0:
+                            break
+                        got += k
+                finally:
+                    view.release()  # before the map closes, also when recv_into raised (its traceback holds view)
+    finally:
+        os.close(fd)
+        if got != n:
+            os.unlink(path)
+    return got == n
+
+
 def recv_header(sock: socket.socket) -> tuple[dict, int] | None:
     raw = _recv_exact(sock, _HDR.size)
     if raw is None:
@@ -260,8 +295,11 @@ class Sender:
     bound. A send error is kept and raised by the next enqueue() / flush(): a handoff is never dropped
     silently."""
 
-    def __init__(self, max_bytes: int = 8 << 30):
+    def __init__(self, max_bytes: int = 8 << 30, hello=None):
+        """hello: a callable returning (header, buffers) of a frame to write first on every new connection (the NIXL
+        transport's exports, which a receiver that restarted needs again)."""
         self.max_bytes = max_bytes
+        self.hello = hello
         self.stats = SendStats()
         self._q: queue.Queue = queue.Queue()
         self._cv = threading.Condition()
@@ -322,6 +360,8 @@ class Sender:
                     s.setsockopt(socket.SOL_SOCKET, opt, 16 << 20)
                 except OSError:
                     pass
+            if self.hello is not None:
+                send_frame(s, *self.hello())
             self._socks[dest] = s
         return s
 
@@ -385,6 +425,9 @@ class RecvStats:
     buffer_full_events: int = 0  # parts that waited for room in the receive buffer
     buffer_full_seconds: float = 0.0
     refused: int = 0  # handoffs with a layout signature other than this engine's
+    nixl: int = 0  # handoffs whose rows the decode ranks read themselves (KILN_PD_TRANSPORT=nixl)
+    nixl_bytes: int = 0  # the bytes those handoffs declared (held from arrival to release)
+    hellos: int = 0
     transfer_seconds: list = field(default_factory=list)  # first frame -> complete, per handoff (last 4096)
 
 
@@ -394,6 +437,51 @@ class _Pending:
     meta: dict | None = None
     parts: dict = field(default_factory=dict)  # name -> (file, array table, bytes)
     done: bool = False
+    nixl_bytes: int = 0  # a NIXL handoff's declared bytes, held against the budget until release
+    stages: dict = field(default_factory=dict)  # a pipeline's handoff: stage -> its meta (combine_stages)
+
+
+def stage_part(stage: int, name: str) -> str:
+    """The name a pipeline stage's part travels under (engine/pp.py: every stage hands off its own layers)."""
+    return f"p{stage}.{name}"
+
+
+def combine_stages(metas: dict[int, dict]) -> dict:
+    """One handoff from the metas of a pipeline's stages (each stage hands off the caches and state rows of its own
+    layers [lo, hi), meta["pp"]): the last stage's meta (its first token, logprobs, sampler state, params) with every
+    stage's parts, the stages' layer ranges and, over NIXL, every stage's read plan (nixl["pp"], in stage order).
+    The ranges must tile 0 .. the last stage's end with no gap and no overlap, and every stage must name the same split;
+    otherwise the result carries an error (the decode engine refuses it, and releases every stage)."""
+    order = sorted(metas)
+    S = int(metas[order[0]]["pp"]["stages"])
+    last = metas[S - 1]
+    out = dict(last)
+    ranges = [list(metas[t]["pp"]["layers"]) for t in order]
+    splits = {tuple(map(tuple, metas[t]["pp"].get("ranges") or [])) for t in order}
+    parts = []
+    for t in order:
+        parts += list(metas[t].get("parts") or [])
+    out["parts"] = parts
+    out["pp"] = {"stages": S, "ranges": ranges}
+    errs = [metas[t]["error"] for t in order if metas[t].get("error")]
+    if order != list(range(S)):
+        errs.append(f"stages {order} of a {S}-stage pipeline")
+    elif ranges[0][0] != 0 or any(a[1] != b[0] for a, b in zip(ranges, ranges[1:])) or \
+            any(a[0] >= a[1] for a in ranges):
+        errs.append(f"stage layer ranges {ranges} do not tile the model's layers")
+    elif len(splits) != 1:
+        errs.append(f"the stages name different splits {sorted(splits)}")
+    trans = {metas[t].get("transport", "host") for t in order if metas[t].get("done") is None}
+    if len(trans) > 1:
+        errs.append(f"the stages handed off over different transports {sorted(trans)}")
+    if errs:
+        out["error"] = "pipeline handoff: " + "; ".join(errs)
+    if out.get("done") is None and trans == {"nixl"}:
+        nx = [metas[t]["nixl"] for t in order]
+        out["nixl"] = {"pp": nx, "bytes": sum(int(x["bytes"]) for x in nx),
+                       "deadline": min(float(x["deadline"]) for x in nx)}
+    out["handoff_time"] = min(float(metas[t].get("handoff_time", 0) or 0) for t in order) or last.get("handoff_time")
+    return out
 
 
 class Receiver:
@@ -422,6 +510,8 @@ class Receiver:
         self.host = host
         self._closed = False
         self._conns: list[socket.socket] = []
+        self.hellos: dict[str, str] = {}  # prefill engine id -> the file holding its ranks' NIXL exports
+        self.nixl_reply: dict[str, str] = {}  # xfer -> the prefill engine's release listener (nixl handoffs)
         self._thread = threading.Thread(target=self._accept, name="kiln-pd-accept", daemon=True)
         self._thread.start()
 
@@ -474,7 +564,17 @@ class Receiver:
                       file=sys.stderr, flush=True)
                 self._full_since = None
 
+    def _unreserve(self, n: int) -> None:
+        """Give back bytes _room reserved for a frame that never completed (its peer closed or reset inside it, or it was
+        refused after the reservation): no pending handoff owns them, so no release() would."""
+        with self._cv:
+            self.stats.held_bytes -= n
+            self._cv.notify_all()
+
     def _read(self, c: socket.socket) -> None:
+        # Bytes _room reserved for the frame in hand that no pending handoff owns yet. They pass to the handoff at the
+        # _add call (whose release() then gives them back) and are otherwise given back once, when this reader ends.
+        reserved = 0
         try:
             while True:
                 got = recv_header(c)
@@ -487,20 +587,47 @@ class Receiver:
                     if raw is None:
                         raise ConnectionError("connection closed inside a meta frame")
                     meta = json.loads(bytes(raw)) if n else h["meta"]
-                    self._add(xfer, meta=meta)
+                    nb = 0
+                    if meta.get("transport") == "nixl" and meta.get("done") is None:
+                        nb = int(meta["nixl"]["bytes"])
+                        self._room(nb, f"{xfer}/nixl")
+                        reserved = nb
+                        eng = meta["nixl"]["engine"]
+                        if eng not in self.hellos:
+                            raise ConnectionError(f"a nixl handoff from engine {eng} before its hello frame")
+                        meta["nixl"]["exports"] = self.hellos[eng]
+                        with self._cv:
+                            if meta.get("pp"):  # one release listener per stage (combine_stages)
+                                self.nixl_reply.setdefault(xfer, []).append(meta["nixl"]["reply"])
+                            else:
+                                self.nixl_reply[xfer] = meta["nixl"]["reply"]
+                    reserved = 0
+                    self._add(xfer, meta=meta, nixl_bytes=nb)
+                elif h["kind"] == "hello":
+                    raw = _recv_exact(c, n)
+                    if raw is None:
+                        raise ConnectionError("connection closed inside a hello frame")
+                    hello = json.loads(bytes(raw))
+                    path = os.path.join(self.dir, f"nixl-{hello['engine']}.json")
+                    with open(path + ".tmp", "wb") as f:
+                        f.write(raw)
+                    os.replace(path + ".tmp", path)
+                    with self._cv:
+                        self.hellos[hello["engine"]] = path
+                        self.stats.hellos += 1
                 elif h["kind"] == "part":
                     name = h["part"]
                     self._room(n, f"{xfer}/{name}")
+                    reserved = n
                     path = os.path.join(self.dir, f"{xfer}.{name}")
-                    buf = _recv_exact(c, n) if n else bytearray()
-                    if buf is None:
-                        raise ConnectionError("connection closed inside a part frame")
                     if self.in_memory:
+                        buf = _recv_exact(c, n) if n else bytearray()
+                        if buf is None:
+                            raise ConnectionError("connection closed inside a part frame")
                         path = buf
-                    else:
-                        with open(path, "wb") as f:
-                            f.write(buf)
-                    del buf
+                    elif not _recv_file(c, n, path):
+                        raise ConnectionError("connection closed inside a part frame")
+                    reserved = 0
                     self._add(xfer, part=(name, path, h["arrays"], n))
                 else:
                     raise ConnectionError(f"unknown handoff frame kind {h['kind']!r}")
@@ -508,23 +635,35 @@ class Receiver:
             if not self._closed:
                 print(f"kiln pd: handoff connection failed: {e!r}", file=sys.stderr, flush=True)
         finally:
+            if reserved:
+                self._unreserve(reserved)
             try:
                 c.close()
             except OSError:
                 pass
 
-    def _add(self, xfer: str, meta: dict | None = None, part=None) -> None:
+    def _add(self, xfer: str, meta: dict | None = None, part=None, nixl_bytes: int = 0) -> None:
         with self._cv:
             p = self._pending.get(xfer)
             if p is None:
                 p = self._pending[xfer] = _Pending(time.perf_counter())
-            if meta is not None:
-                p.meta = meta
+            # What the handoff now owns (its release() gives it back), recorded before anything below can raise.
+            if nixl_bytes:  # every stage's declared bytes, all held until the one release
+                p.nixl_bytes += nixl_bytes
+                self.stats.nixl_bytes += nixl_bytes
             if part is not None:
                 name, path, arrays, n = part
                 p.parts[name] = (path, arrays, n)
                 self.stats.parts += 1
                 self.stats.bytes += n
+            if meta is not None and meta.get("pp"):  # a pipeline stage's share: complete once every stage's is here
+                p.stages[int(meta["pp"]["stage"])] = meta
+                if len(p.stages) == int(meta["pp"]["stages"]):
+                    p.meta = combine_stages(p.stages)
+                    self.stats.nixl += p.meta.get("nixl") is not None
+            elif meta is not None:
+                p.meta = meta
+                self.stats.nixl += bool(nixl_bytes)
             if p.done or p.meta is None or not set(p.meta.get("parts", ())) <= set(p.parts):
                 return
             p.done = True
@@ -535,10 +674,11 @@ class Receiver:
             self.stats.complete += 1
             self.stats.transfer_seconds.append(meta["recv_seconds"])
             del self.stats.transfer_seconds[:-4096]
-            if self.signature is not None and meta.get("signature") not in (None, self.signature) \
-                    and meta.get("done") is None:
+            sigs = {m.get("signature") for m in p.stages.values()} if p.stages else {meta.get("signature")}
+            bad = sorted(str(x) for x in sigs if x not in (None, self.signature))
+            if self.signature is not None and bad and meta.get("done") is None:
                 self.stats.refused += 1
-                meta["error"] = (f"handoff layout {meta.get('signature')} differs from this engine's {self.signature}: "
+                meta["error"] = (f"handoff layout {', '.join(bad)} differs from this engine's {self.signature}: "
                                  "the prefill and decode engines must run the same model, attention TP, page size, "
                                  "KV dtype and cache shapes")
         self.on_complete(meta)
@@ -563,7 +703,7 @@ class Receiver:
             p = self._dead.get()
             if p is None:
                 return
-            n_all = 0
+            n_all = p.nixl_bytes
             for path, _, n in p.parts.values():
                 if isinstance(path, str):
                     try:
@@ -575,6 +715,11 @@ class Receiver:
                 self.stats.held_bytes -= n_all
                 self._reaping -= 1
                 self._cv.notify_all()
+
+    def pop_reply(self, xfer: str) -> str | list[str] | None:
+        """The release address of a NIXL handoff (None for a host-path one; a pipeline's: one per stage), once."""
+        with self._cv:
+            return self.nixl_reply.pop(xfer, None)
 
     def drain(self, timeout: float = 30.0) -> None:
         """Wait until every released handoff's files are deleted (tests)."""
@@ -644,10 +789,13 @@ def read_parts(meta: dict, names: list[str]) -> dict[str, dict[str, torch.Tensor
         info = meta["parts"][name]
         if "buf" in info:  # an in-memory receiver's part (Receiver in_memory)
             buf = info["buf"]
+        elif os.path.getsize(info["file"]) == 0:
+            buf = bytearray()
         else:
-            buf = bytearray(os.path.getsize(info["file"]))
-            with open(info["file"], "rb") as f:
-                f.readinto(buf)
+            # Mapped, not read: a consumer that takes some rows (a CP decode rank, ModelRunner._pd_assemble) touches only
+            # their pages. Copy-on-write, because torch.frombuffer wants a writable buffer; nothing writes it. The
+            # mapping outlives the file's deletion at release (Receiver._reap) for as long as a tensor holds it.
+            buf = np.memmap(info["file"], dtype=np.uint8, mode="c")
         arrays, off = {}, 0
         for a_name, dt, shape, n in info["arrays"]:
             arrays[a_name] = from_bytes(buf, off, _dtype(dt), shape)

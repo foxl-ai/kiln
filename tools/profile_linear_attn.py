@@ -94,13 +94,13 @@ def main() -> None:
     from kiln.engine.state_pool import StatePool
     from kiln.models import linear_attn
 
-    if args.device == "neuron":
-        import libtorch_neuronx_lite  # noqa: F401
+    if args.device == "neuron":  # the engine's runtime env, LNC and compiler arguments (trn1 and trn2), as profile_layer
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import profile_layer as pl
 
-        from kiln.engine.model_runner import canonical_neuron_backend
-
-        dev = torch.device("neuron:0")
-        compile_ = lambda f: torch.compile(f, backend=canonical_neuron_backend(), fullgraph=True, dynamic=False)  # noqa: E731
+        pl.setup_device()
+        dev = pl.DEV
+        compile_ = lambda f: torch.compile(f, **pl.OPTS)  # noqa: E731
     else:
         dev, compile_ = torch.device("cpu"), (lambda f: f)
     host = build(args, torch.device("cpu"), torch.float32)
@@ -155,6 +155,9 @@ def main() -> None:
     err = ((a - b).norm(dim=-1) / a.norm(dim=-1).clamp_min(1e-6))
     print(f"relative error per token vs fp32 host: max {err.max():.4f} mean {err.mean():.4f} "
           f"(prefill rows {n1 + n2}, decode rows 4)")
+    top = torch.topk(err, min(6, err.numel()))
+    print("  worst rows (index: error; prefill rows first, then decode):",
+          ", ".join(f"{int(i)}: {float(e):.3f}" for e, i in zip(top.values, top.indices)))
     # Steady state on the device.
     d = dev
     xs = torch.randn(B, H).to(torch.bfloat16).to(d)

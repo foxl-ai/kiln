@@ -12,10 +12,15 @@ Cases (each at every --rows given, else its serving rows):
   dsa_select    kernels/dsa_topk.py select: B rows x 2112 pool scores, keep 512, kp 1 (the decode-slot selection)
   dsa_slots     kernels/dsa_slots.py: n rows x KILN_PROF_HEADS (8) heads over 640 slots, fp8 latent cache
   dsa_long      kernels/dsa_long_select.py: C queries x KILN_PROF_POOLS (32768) pools, 32 heads, keep 512
+  dsa_long_pipe kernels/dsa_long_pipe.py: the same over C queries (whole tiles of 128, at least 2) in one pipelined call
   dsa_index     kernels/dsa_index.py: B decode rows, each its own 1M-token context (32768 pages, 262,144 pools), 32
                 indexer heads of 128 (the long-context decode scores)
   dsa_prefill   kernels/dsa_prefill.py at C queries over 8448 keys (tools/probe_dsa_prefill.py's case, the chunk at the
                 bucket's end)
+  dsa_fused     kernels/dsa_fused.py: C queries x 8448 keys, 32 x 128 indexer, keep 512, 8 heads, the chunk at
+                KILN_PROF_OFFSET (default the bucket's end; tools/probe_dsa_fused.py's case)
+  dsa_fused_c   kernels/dsa_fused_c.py (the causal form, KILN_DSA_FUSED_CAUSAL_LADDER as set) on the same case
+  dsa_split_att kernels/dsa_split.py's attention-only kernel on that case's pool selection (emulated on the host)
   dsa_core      the XLA attention core of a pooled DSA prefill chunk (models/mla.py _core, expand): C queries x
                 8448 keys with an additive mask, 8 heads, latent 512, dn = dv = 256
 
@@ -46,8 +51,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 OUT = "/opt/kiln/prof/ak"
 NEG_INF = -1e30
 SERVING = {"kda_prefill": [1024], "kda_decode": [4, 16, 64], "dsa_decode": [4, 16, 64], "dsa_score": [1024],
-           "dsa_select": [16, 64], "dsa_core": [1024], "dsa_prefill": [1024], "dsa_long": [128], "dsa_slots": [128],
-           "dsa_index": [1, 4], "gemv": [1, 16]}
+           "dsa_select": [16, 64], "dsa_core": [1024], "dsa_prefill": [1024], "dsa_long": [128], "dsa_long_pipe": [1024], "dsa_slots": [128],
+           "dsa_index": [1, 4], "gemv": [1, 16], "cp_classes": [1024], "cp_classes_x": [1024],
+           "dsa_long_pipe_x": [1024], "dsa_fused": [1024], "dsa_fused_c": [1024], "dsa_split_att": [1024]}
 
 
 def _raw(t: torch.Tensor) -> np.ndarray:
@@ -106,6 +112,51 @@ def build(case: str, n: int):
             return dk.score_select(q, w, pk, cand, 512, 128 ** -0.5, 4, True).sum()
 
         return f, dict(q=q, w=w, pk=pk, cand=cand)
+    if case == "dsa_long_pipe":  # kernels/dsa_long_pipe.py: n queries (>= 256) in one pipelined call
+        from kiln.kernels import dsa_long_pipe as dp
+
+        P = int(os.environ.get("KILN_PROF_POOLS", 32768))
+        q = torch.randn(n, 32, 128, generator=g).to(torch.bfloat16)
+        pk = torch.randn(P, 128, generator=g).to(torch.bfloat16)
+        w = torch.randn(n, 32, generator=g) * 32 ** -0.5
+        npool = torch.full((n,), P)
+
+        def f(q, w, pk, npool):
+            return dp.select(q, w, pk, npool, 512, 128 ** -0.5)[0].sum()
+
+        return f, dict(q=q, w=w, pk=pk, npool=npool)
+    if case == "dsa_long_pipe_x":  # kernels/dsa_long_pipe_x.py: the chunk skip (KILN_PROF_TOP: the chunk's end as a
+        # fraction of the bucket, every query within n pools below it) and / or KILN_PROF_PE=1 the tensor-engine head sum
+        from kiln.kernels import dsa_long_pipe_x as dpx
+
+        P = int(os.environ.get("KILN_PROF_POOLS", 32768))
+        top = int(round(float(os.environ.get("KILN_PROF_TOP", 1.0)) * P))
+        skip = os.environ.get("KILN_PROF_SKIP", "1") == "1"
+        pe = os.environ.get("KILN_PROF_PE", "0") == "1"
+        q = torch.randn(n, 32, 128, generator=g).to(torch.bfloat16)
+        pk = torch.randn(P, 128, generator=g).to(torch.bfloat16)
+        w = torch.randn(n, 32, generator=g) * 32 ** -0.5
+        npool = (top - n + torch.arange(n)).clamp(0, P)
+
+        def f(q, w, pk, npool):
+            return dpx.select(q, w, pk, npool, 512, 128 ** -0.5, skip=skip, pe=pe)[0].sum()
+
+        return f, dict(q=q, w=w, pk=pk, npool=npool)
+    if case in ("cp_classes", "cp_classes_x"):  # models/mla.py _cp_attend_classes(_x): tools/probe_cp_slots_x.py's inputs
+        import probe_cp_slots_x as pcx
+
+        from kiln.models import mla
+
+        fits = float(os.environ.get("KILN_PROF_FITS", 0.7))
+        names = ("q_all", "kc", "rows_sel", "rows_tail", "mine", "tail_own", "npool", "positions")
+        ins = dict(zip(names, pcx.make_inputs(n, int(os.environ.get("KILN_PROF_HEADS", 64)), fits, g)))
+        fn = mla._cp_attend_classes_x if case == "cp_classes_x" else mla._cp_attend_classes
+
+        def f(q_all, kc, rows_sel, rows_tail, mine, tail_own, npool, positions):
+            o, ls = fn(q_all, kc, rows_sel, rows_tail, mine, tail_own, npool, positions, 192 ** -0.5, 4, 128, 640)
+            return o.clamp(min=-1.0).sum() + ls.clamp(min=-1.0).sum()
+
+        return f, ins
     if case == "dsa_long":  # kernels/dsa_long_select.py: n queries x KILN_PROF_POOLS pools (default 32768), keep 512
         from kiln.kernels import dsa_long_select as dl
 
@@ -187,6 +238,35 @@ def build(case: str, n: int):
             return torch.einsum("bhql,blhv->bqhv", p, v).float().sum()
 
         return f, dict(qn=qn, kc=kc, w_uk=w_uk, w_uv=w_uv, bias=bias)
+    if case == "dsa_split_att":
+        from probe_dsa_fused import D, KEEP
+        from probe_dsa_fused import case as fcase
+
+        from kiln.kernels import dsa_split as dsp
+
+        off = int(os.environ.get("KILN_PROF_OFFSET", 8448 - n))
+        qI, w, pk, pos, q_lat, kc = fcase(n, 8448, off, n + off)
+        sel = dsp.emulate_select(qI.float(), w, pk.float(), pos, KEEP, D ** -0.5)
+
+        def f(sel, pos, q_lat, kc):
+            return dsp.attend(sel, pos, q_lat, kc, 256 ** -0.5).sum()
+
+        return f, dict(sel=sel, pos=pos, q_lat=q_lat, kc=kc)
+    if case in ("dsa_fused", "dsa_fused_c"):
+        from probe_dsa_fused import D, KEEP
+        from probe_dsa_fused import case as fcase
+
+        from kiln.kernels import dsa_fused as df
+        from kiln.kernels import dsa_fused_c as dfc
+
+        off = int(os.environ.get("KILN_PROF_OFFSET", 8448 - n))
+        qI, w, pk, pos, q_lat, kc = fcase(n, 8448, off, n + off)
+        fn = df.attend if case == "dsa_fused" else dfc.attend
+
+        def f(qI, w, pk, pos, q_lat, kc):
+            return fn(qI, w, pk, pos, q_lat, kc, KEEP, D ** -0.5, 256 ** -0.5).sum()
+
+        return f, dict(qI=qI, w=w, pk=pk, pos=pos, q_lat=q_lat, kc=kc)
     if case == "dsa_prefill":
         from probe_dsa_prefill import case as pcase
 
@@ -324,7 +404,8 @@ def main() -> None:
             outs.append(out)
     if outs:  # this process holds the NeuronCores (an exec keeps the device open): a fresh one captures after it exits
         sys.stdout.flush()
-        env = {k: v for k, v in os.environ.items() if not k.startswith("NEURON_RT_")}
+        # NEURON_RT_VISIBLE_CORES stays: on a shared box the capture must use this process's core, not core 0
+        env = {k: v for k, v in os.environ.items() if not k.startswith("NEURON_RT_") or k == "NEURON_RT_VISIBLE_CORES"}
         cmd = " ".join([sys.executable, os.path.abspath(__file__), "--capture", *outs])
         subprocess.Popen(["bash", "-c", f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 1; done; sleep 3; {cmd}"],
                          env=env, start_new_session=True)

@@ -14,16 +14,34 @@ Each worker is a Kiln server started with a role (bench/pd_serve.py --pd-role pr
    buffer) before anything is sent anywhere, and gives it back when its stream ends. Without a free credit it
    WAITS here, in arrival order, and is never dropped; the wait is measured (kiln:pd_router_queue_seconds).
 3. The decode engine gets the request with kiln_pd {xfer}: it registers the transfer and returns the client's
-   stream once the handoff arrives. Then the least-loaded prefill engine gets it with kiln_pd {xfer, dest =
-   the decode engine's receiver}: it prefills, samples the first token and sends the request's state to dest.
-   The client reads the decode engine's stream through the router, unchanged (the first token included).
-   A prefill failure ends the stream with an error event.
+   stream once the handoff arrives. At the same time (not after the decode engine answers) the least-loaded
+   prefill engine gets it with kiln_pd {xfer, dest = the decode engine's receiver}: it prefills, samples the first
+   token and sends the request's state to dest. The decode engine accepts a request only between two of its steps,
+   so waiting for its answer first put up to one decode step in front of every prefill (slo4: 0.267 s steps on the
+   decode box, ~0.26 s of a 1.60 s 8K TTFT in a closed loop); a handoff that arrives before its request is kept
+   until the request comes (api.EngineLoop.arrived). The client reads the decode engine's stream through the
+   router, unchanged (the first token included). A prefill failure ends the stream with an error event; a decode
+   engine that refuses the request cancels its prefill call (a handoff that was already sent then waits out
+   KILN_PD_AWAIT_TIMEOUT_S on the decode engine, which no request makes the router refuse in practice: both
+   engines parse the same body).
+   Prompt token ids: when the router tokenizes a /v1/completions string prompt itself (threshold routing with
+   --tokenizer), it forwards those ids as the prompt, so neither engine tokenizes it again (~11 ms per 8K-token
+   prompt each). Only when its tokenizer is the served model (the decode engine's /v1/models id equals --tokenizer;
+   otherwise it says so at start and forwards the string), and never for chat (the engines apply the template).
 4. Prefill queue-depth cap (opt-in, --prefill-depth N): at most N requests in flight on each prefill engine; the rest
    wait HERE, in arrival order, and each goes to the first engine with a free slot when it frees (late binding), so a
    burst does not pile onto the engines that happened to be least loaded when it arrived. Latency prefill engines
    (--latency-prefill-urls: DP attention 1, one request per call over every rank) are capped at --latency-depth
    (default 1) and preferred whenever one has a free slot; a request then waits for a latency engine only when
    every throughput engine is capped and full too. Without a cap (the default) nothing waits here for prefill.
+
+5. Prefill units (--prefill-units): a layer pipeline of S stage engines (engine/pp.py, every stage started with
+   --pp-follow: stage 0 by bench/pd_serve.py --pd-role prefill, the others by tools/pp_follow.py --pd-role prefill
+   --health-port) is ONE prefill engine to the router: a request is posted to its stage 0 only, which carries it to
+   the others in its plan frames, and every stage hands its own layers' share to the decode engine the request names
+   (engine/disagg.py combines them there). The router checks that the stages answer in order, follow stage 0, tile the
+   model's layers and share one handoff layout. A unit is preferred like a latency engine and capped at --unit-depth
+   requests in flight (default 1: one long prompt through the pipeline at a time).
 
 Start-up role check: every worker's /health names its role; the router refuses to start without at least one
 prefill and one decode engine, or when their handoff layouts differ.
@@ -56,6 +74,23 @@ class Worker:
         self.depth = depth  # prefill engines: requests in flight at most (0: no cap)
 
 
+def check_unit(urls: list[str], healths: list[dict]) -> None:
+    """Refuse a prefill unit whose stages cannot form one pipeline (main, --prefill-units)."""
+    pps = [h.get("pp") or {} for h in healths]
+    if any(h.get("role") != "prefill" for h in healths):
+        raise SystemExit(f"prefill unit {urls}: every stage must be a prefill engine, roles {[h.get('role') for h in healths]}")
+    if [p.get("stage") for p in pps] != list(range(len(urls))) or any(p.get("stages") != len(urls) for p in pps):
+        raise SystemExit(f"prefill unit {urls}: stages answer as {[(p.get('stage'), p.get('stages')) for p in pps]}, "
+                         f"need 0 .. {len(urls) - 1} of {len(urls)} in this order")
+    if not all(p.get("follow") for p in pps):
+        raise SystemExit(f"prefill unit {urls}: every stage must run with --pp-follow (stage 0 alone takes requests)")
+    ranges = [p.get("layers") for p in pps]
+    if ranges[0][0] not in (0, None) or any(a[1] != b[0] for a, b in zip(ranges, ranges[1:])):
+        raise SystemExit(f"prefill unit {urls}: the stages' layers {ranges} do not tile the model")
+    if len({h.get("layout") for h in healths}) != 1:
+        raise SystemExit(f"prefill unit {urls}: the stages' handoff layouts differ")
+
+
 def check_workers(prefill: list[dict], decode: list[dict]) -> None:
     """Refuse a deployment that cannot work (the router's start-up role check)."""
     roles = [h.get("role") for h in prefill + decode]
@@ -83,7 +118,9 @@ class PDRouter:
         self.waiting = 0
         self.pwait: collections.deque = collections.deque()  # futures of requests waiting for a prefill slot, FIFO
         self.prefill_queue_s = Histogram(LATENCY_BUCKETS + (81.92, 163.84))
-        self.counts = {"disaggregated": 0, "bypass": 0, "prefill_errors": 0, "handed_off": 0, "done_at_prefill": 0}
+        self.counts = {"disaggregated": 0, "bypass": 0, "prefill_errors": 0, "handed_off": 0, "done_at_prefill": 0,
+                       "forwarded_ids": 0}
+        self.forward_ids = False  # forward the ids count_tokens made (main: only when the tokenizer is the served model)
         self.queue_s = Histogram()
         self.e2e_ttft = Histogram(LATENCY_BUCKETS + (81.92, 163.84))
         self.prefill_s = Histogram(LATENCY_BUCKETS + (81.92, 163.84))
@@ -102,7 +139,11 @@ class PDRouter:
             return len(body["input_ids"])
         if self.tok is None or not isinstance(p, str):
             return None
-        return len(self.tok(p)["input_ids"])
+        ids = self.tok(p)["input_ids"]
+        if self.forward_ids and isinstance(body.get("prompt"), str):
+            body["prompt"] = list(ids)  # what both engines would make of the string (api.completions: tok(prompt))
+            self.counts["forwarded_ids"] += 1
+        return len(ids)
 
     def bypass(self, path: str, body: dict) -> bool:
         if self.threshold <= 0:
@@ -207,12 +248,13 @@ class PDRouter:
         return "\n".join(lines) + "\n"
 
 
-def build_pd_app(r: PDRouter) -> FastAPI:
+def build_pd_app(r: PDRouter, client: httpx.AsyncClient | None = None) -> FastAPI:
+    """client: the router's connection to the engines (tests pass one over another transport)."""
     app = FastAPI(title="kiln-pd-router")
     # Idle connections are dropped here (30 s) before the engines would close them (bench/pd_serve.py keeps them 600 s):
     # a request written onto a connection the server is closing fails with ReadError.
-    client = httpx.AsyncClient(timeout=None, limits=httpx.Limits(max_connections=None, max_keepalive_connections=512,
-                                                                 keepalive_expiry=30.0))
+    client = client or httpx.AsyncClient(timeout=None, limits=httpx.Limits(
+        max_connections=None, max_keepalive_connections=512, keepalive_expiry=30.0))
 
     @app.get("/health")
     async def health():
@@ -293,21 +335,22 @@ def build_pd_app(r: PDRouter) -> FastAPI:
             raise
         try:
             if stream:
-                try:
-                    resp = await client.send(client.build_request("POST", d.url + path, json=dbody), stream=True)
-                except BaseException:
-                    r.give_prefill(p)
-                    await release()
-                    raise
-                if resp.status_code != 200:  # refused before it registered: nothing waits for the handoff
-                    content = await resp.aread()
-                    await resp.aclose()
-                    r.give_prefill(p)
-                    await release()
-                    return Response(content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
+                # The prefill call starts now, not once the decode engine has answered (module docstring, 3.).
                 pre = asyncio.create_task(run_prefill(path, body, xfer, d, t0, p))
                 # A done callback, not a finally in run_prefill: it runs even for a task cancelled before it started.
                 pre.add_done_callback(lambda _t, p=p: r.give_prefill(p))
+                try:
+                    resp = await client.send(client.build_request("POST", d.url + path, json=dbody), stream=True)
+                except BaseException:
+                    pre.cancel()
+                    await release()
+                    raise
+                if resp.status_code != 200:  # refused before it registered: its prefill call is not needed
+                    content = await resp.aread()
+                    await resp.aclose()
+                    pre.cancel()
+                    await release()
+                    return Response(content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 
                 async def relay():
                     first = True
@@ -377,6 +420,8 @@ def main() -> None:
     ap.add_argument("--threshold", type=int, default=4096,
                     help="prompts of fewer tokens go straight to a decode engine (0: disaggregate all)")
     ap.add_argument("--tokenizer", default=None, help="HF id or path, to count prompt tokens for --threshold")
+    ap.add_argument("--no-forward-ids", action="store_true",
+                    help="send a completions string prompt on as text even when the router tokenized it")
     ap.add_argument("--decode-credits", type=int, default=None,
                     help="disaggregated requests in flight per decode engine (default its max_num_seqs x 1.25)")
     ap.add_argument("--latency-prefill-urls", default="",
@@ -385,6 +430,9 @@ def main() -> None:
                     help="requests in flight at most per throughput prefill engine, the rest wait at the router in "
                          "arrival order (0: no cap)")
     ap.add_argument("--latency-depth", type=int, default=1, help="the same per latency prefill engine (0: no cap)")
+    ap.add_argument("--prefill-units", default="",
+                    help="layer pipelines as prefill engines: stage urls in order, comma-separated, units separated by ';'")
+    ap.add_argument("--unit-depth", type=int, default=1, help="requests in flight at most per prefill unit (0: no cap)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--wait", type=float, default=7200.0, help="seconds to wait for every worker's /health")
@@ -408,8 +456,13 @@ def main() -> None:
 
     pu, du = [u for u in a.prefill_urls.split(",") if u], a.decode_urls.split(",")
     lu = [u for u in a.latency_prefill_urls.split(",") if u]
+    units = [[u for u in g.split(",") if u] for g in a.prefill_units.split(";") if g.strip()]
     ph, lh, dh = healths(pu), healths(lu), healths(du)
-    check_workers(ph + lh, dh)
+    uh = [healths(g) for g in units]
+    for g, hs in zip(units, uh):
+        check_unit(g, hs)
+        print(f"kiln pd router: prefill unit {g}: layers {[h['pp']['layers'] for h in hs]}", flush=True)
+    check_workers(ph + lh + [hs[0] for hs in uh], dh)
     for u, h in list(zip(pu, ph)) + list(zip(lu, lh)) + list(zip(du, dh)):
         print(f"kiln pd router: {u} role {h['role']} layout {h.get('layout')}{' (latency)' if u in lu else ''}",
               flush=True)
@@ -419,8 +472,18 @@ def main() -> None:
 
         tok = AutoTokenizer.from_pretrained(a.tokenizer)
     prefill = [Worker(u, h, "throughput", a.prefill_depth) for u, h in zip(pu, ph)] + \
-        [Worker(u, h, "latency", a.latency_depth) for u, h in zip(lu, lh)]
+        [Worker(u, h, "latency", a.latency_depth) for u, h in zip(lu, lh)] + \
+        [Worker(g[0], hs[0], "latency", a.unit_depth) for g, hs in zip(units, uh)]  # a unit: posts go to stage 0
     r = PDRouter(prefill, [Worker(u, h) for u, h in zip(du, dh)], a.threshold, tok, a.decode_credits)
+    if tok is not None:
+        try:
+            served = httpx.get(du[0].rstrip("/") + "/v1/models", timeout=30).json()["data"][0]["id"]
+        except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
+            served = f"unknown ({e!r})"
+        r.forward_ids = not a.no_forward_ids and served == a.tokenizer
+        print(f"kiln pd router: prompt token ids forwarded to the engines: {'on' if r.forward_ids else 'off'} "
+              f"(tokenizer {a.tokenizer}, served model {served}{', --no-forward-ids' if a.no_forward_ids else ''})",
+              flush=True)
     import uvicorn
 
     uvicorn.run(build_pd_app(r), host=a.host, port=a.port, log_level="warning")

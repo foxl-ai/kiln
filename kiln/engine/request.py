@@ -116,6 +116,7 @@ class Request:
     handoff_params: SamplingParams | None = None
     handoff_pages: list[int] | None = None
     handoff_meta: dict | None = None  # the meta sent to the decode side (engine._pd_handoff)
+    pd_pin: tuple | None = None  # prefill engine under KILN_PD_TRANSPORT=nixl: (scheduler, tail pages, radix node) kept
     pd_meta: dict | None = None
     pd_injected: bool = False
 

@@ -498,8 +498,8 @@ def cmd_report(a) -> None:
             tot["idle_other_ms"] += b["idle_other_ms"]
         print(f"{tag[:40]:40s} {T * 1e3:8.2f} " + " ".join(
             f"{s[e + '_engine_active_time'] / T:7.1%}" for e in ENGINES) +
-            f" {hbm / T / 1e9:9.0f} {hbm / T / HBM_PEAK:6.1%} {s['hardware_flops'] / T / 1e12:8.2f} "
-            f"{s['hardware_flops'] / T / TE_PEAK:6.1%} {s.get('cc_op_time', 0) * 1e3:6.2f} "
+            f" {hbm / T / 1e9:9.0f} {hbm / T / HBM_PEAK:6.1%} {s.get('hardware_flops', 0) / T / 1e12:8.2f} "
+            f"{s.get('hardware_flops', 0) / T / TE_PEAK:6.1%} {s.get('cc_op_time', 0) * 1e3:6.2f} "
             + (f"{b['idle_cc_ms']:7.2f} {b['idle_other_ms']:6.2f}" if b else f"{'-':>7s} {'-':>6s}"))
     T = tot["total_time"]
     hbm = tot["hbm_read_bytes"] + tot["hbm_write_bytes"]

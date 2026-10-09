@@ -4,7 +4,10 @@ import atexit
 import collections
 import functools
 import itertools
+import json
 import os
+import shutil
+import tempfile
 import time
 import weakref
 from dataclasses import dataclass
@@ -14,6 +17,7 @@ import torch
 from .. import profiling
 from ..config import EngineConfig, ModelConfig
 from ..models.loader import load_model, resolve_model_path
+from . import pp as _pp
 from . import watchdog
 from .kv_pool import PagePool
 from .model_runner import ModelRunner
@@ -94,7 +98,7 @@ def _cp_degree(mcfg: ModelConfig, attn_tp: int) -> int:
 
     specs = [s for s in (mcfg.attn_layers or ()) if not isinstance(s, LinearSpec)]
     ok = dsa_long.cp_enabled() and attn_tp > 1 and specs and all(mla.long_capable(s) for s in specs)
-    return attn_tp if ok else 1
+    return dsa_long.cp_degree(attn_tp) if ok else 1
 
 
 def pool_pages(cfg: EngineConfig, mcfg: ModelConfig) -> int:
@@ -133,6 +137,11 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
         # (libnrt clamps larger values to 63, with a warning).
         os.environ.setdefault("NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS", "63" if cfg.piecewise else "32")
         os.environ.setdefault("NEURON_RT_IO_RING_CACHE_SIZE", "32")
+        # KILN_PD_TRANSPORT=nixl (engine/nixl_kv.py): a device tensor's data_ptr() is its HBM address only with this set
+        # before the first device allocation (libtorch_neuronx_lite's NeuronAllocator::allocate reads it once), which
+        # NIXL needs to register the caches. vllm-neuron sets it for the same reason (neuron_worker.py).
+        if cfg.pd_role is not None and os.environ.get("KILN_PD_TRANSPORT") == "nixl":
+            os.environ.setdefault("NEURON_RT_MAP_HBM", "1")
         # NOT NEURON_RT_DISABLE_EXECUTION_BARRIER=1, the third knob vllm-neuron sets there (neuron_worker.py:715-718):
         # without the runtime's per-execution barrier a collective mismatch returns silently wrong numbers, and ranks
         # alternating world and attention-group collectives under host jitter deadlock (docs/neuron-notes.md
@@ -152,7 +161,7 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
     mtp = cfg.spec_method == "mtp"
     atp = resolve_attention_tp(mcfg, cfg)
     dp = cfg.dp_attention
-    group = attn_group = None
+    group = attn_group = cp_group = None
     if cfg.tp > 1:
         import torch.distributed as dist
 
@@ -163,14 +172,30 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
         # reduce over the world (models/decoder.py _attn_all_reduce), and only the sequence-parallel prefill
         # blocks' gather and reduce-scatter run inside it (models/hybrid.py KILN_SP_GROUP).
         attn_group = tp.attention_group(cfg.tp, atp)
+        # Context-parallel row groups (models/dsa_long.py cp_degree_env): the cp consecutive ranks of each row group,
+        # created after the attention groups on every rank (dist.new_group is collective).
+        cpd = _cp_degree(mcfg, atp)
+        if 1 < cpd < atp:
+            cp_group = tp.attention_group(cfg.tp, cpd)
     from .model_runner import fp8_e4m3_max
 
     mcfg = weight_config(cfg, mcfg)
     keep_fp8 = cfg.weight_dtype != "bf16" and (mcfg.quant_block is not None or mcfg.quant_expert_block is not None)
+    eagle = None
+    if mtp and cfg.spec_draft_model:  # an EAGLE-3 draft instead of the model's own MTP layer (models/eagle3.py)
+        from ..models import eagle3
+
+        eagle = eagle3.load_config(resolve_model_path(cfg.spec_draft_model), mcfg)
+    # A pipeline stage (engine/pp.py) loads only its own layers (models/loader.py load_model pp).
+    pp_load = ((cfg.pp_stage, cfg.pp_stages, tuple(cfg.pp_split) if cfg.pp_split else None)
+               if getattr(cfg, "pp_stages", 1) > 1 else None)
     model = load_model(path, mcfg, cfg.dtype, device, cfg.max_model_len, rank, cfg.tp, group,
                        keep_fp8=keep_fp8, fp8_max=fp8_e4m3_max(device), vocab_parallel=cfg.vocab_parallel,
                        packed_mxfp4=cfg.mxfp4_packed, mtp=mtp, moe_kernel=cfg.moe_kernel, attn_tp=atp,
-                       attn_group=attn_group, dp_attention=dp, max_num_seqs=cfg.max_num_seqs, pd_role=cfg.pd_role)
+                       attn_group=attn_group, dp_attention=dp, max_num_seqs=cfg.max_num_seqs, pd_role=cfg.pd_role,
+                       eagle3=eagle, pp=pp_load)
+    if cp_group is not None:
+        model.cp_group = cp_group
     runner = ModelRunner(model, mcfg, cfg, num_pages, device, kv_heads=model.nkv)
     # For an EPLB rebalance (models/eplb.py): this rank's redundant slots reloaded from the same checkpoint.
     from ..models.loader import _Checkpoint, prepare_ep_slots
@@ -183,7 +208,8 @@ def build_shard(cfg: EngineConfig, path: str, num_pages: int, rank: int = 0):
                                             None, keep_fp8=keep_fp8, fp8_max=fp8_e4m3_max(device),
                                             vocab_parallel=cfg.vocab_parallel, packed_mxfp4=cfg.mxfp4_packed,
                                             mtp=mtp, moe_kernel=cfg.moe_kernel, attn_tp=atp, dp_attention=dp,
-                                            max_num_seqs=cfg.max_num_seqs, pd_role=cfg.pd_role)
+                                            max_num_seqs=cfg.max_num_seqs, pd_role=cfg.pd_role, eagle3=eagle,
+                                            pp=pp_load)
     _trim_after_load(rank, device)
     return model, runner
 
@@ -213,6 +239,8 @@ def _trim_after_load(rank: int, device) -> None:
 class LLMEngine:
     def __init__(self, cfg: EngineConfig):
         self.cfg = cfg
+        self.t_start = time.perf_counter()  # kiln:startup_time_seconds counts from here to the end of warmup()
+        self.startup_seconds: float | None = None
         path = resolve_model_path(cfg.model_path)
         self.model_path = path
         self.mcfg = ModelConfig.from_pretrained(path)
@@ -237,6 +265,14 @@ class LLMEngine:
             from .. import compile_cache
 
             self.cache_pulled = compile_cache.pull(cfg.compile_cache_uri)
+        # Capture + parallel compile of the warmup's graphs (kiln/precompile.py), started before the ranks spawn and
+        # the weights load, awaited after: compile time overlaps the load and no warmup graph compiles serially.
+        self.precompile = None
+        self._precompile = None
+        if cfg.precompile_workers > 0 and cfg.device == "neuron":
+            from .. import precompile
+
+            self._precompile = precompile.Precompile(cfg, path, num_pages)
         self._workers = []
         self._tp_saved = None  # rank 0's process state before init_rank (tp.process_state), restored by close
         if cfg.tp > 1:
@@ -258,10 +294,28 @@ class LLMEngine:
             except BaseException:
                 self._stop_tp()
                 raise
+        t = time.perf_counter()
+        try:
+            self.model, self.runner = build_shard(cfg, path, num_pages, 0)
+            self.load_seconds = time.perf_counter() - t
+            if self._precompile is not None:
+                self.precompile = self._precompile.wait()
+        except BaseException:
+            if self._precompile is not None:
+                self._precompile.terminate()
+            self._stop_tp()
+            raise
         # The tokenizer (and so transformers) loads only AFTER tensor-parallel workers are
         # spawned: a process that imported transformers and then spawned a child traces
         # torch.topk differently from every other process (tools/probe_fx_normalisation.py),
-        # which gave rank 0 its own compile cache keys and doubled every compile.
+        # which gave rank 0 its own compile cache keys and doubled every compile. And only after
+        # build_shard, so rank 0 imports libtorch_neuronx_lite before transformers, the order every
+        # spawned rank and kiln/capture.py have. Measured 2026-10-07 on trn1.2xlarge (Qwen3-1.7B,
+        # TP=2, bench/ttft_compare.py): with the tokenizer loaded between init_rank and build_shard,
+        # rank 0 still recorded torch.topk(x, 64, dim=-1) and argmax(x, dim=-1, keepdim=True) in
+        # its three sampling post graphs, where rank 1 recorded the canonical form. So rank 0
+        # compiled 3 graphs of its own (18 cache entries against 15), and a precompiled cache
+        # (kiln/precompile.py) missed them.
         from transformers import AutoTokenizer
 
         try:
@@ -276,13 +330,6 @@ class LLMEngine:
         close = cfg.reasoning_end_str or ""
         close = close[close.rfind("</") :] if "</" in close else close
         self.think_close_ids = enc(close) if enc and close else []
-        t = time.perf_counter()
-        try:
-            self.model, self.runner = build_shard(cfg, path, num_pages, 0)
-        except BaseException:
-            self._stop_tp()
-            raise
-        self.load_seconds = time.perf_counter() - t
         self.device = self.runner.device
         if cfg.tp > 1:
             from . import tp
@@ -387,8 +434,24 @@ class LLMEngine:
         self._eplb_max = int(os.environ.get("KILN_EPLB_MAX_REBALANCES", "0"))
         self._eplb_calls = self._eplb_total = 0
         self._eplb_pending = None  # (start time, prefill calls) of a prepared rebalance not committed yet
+        # KILN_EPLB_TRACE=<file> (opt-in measurement, redundant-slot graphs only): every step with prefill calls appends the
+        # expert counts its calls recorded (ModelRunner.eplb_trace); a sync per such step.
+        self._eplb_trace_path = os.environ.get("KILN_EPLB_TRACE") if rec else None
+        self._eplb_trace_calls = 0
         self.eplb_log: list[tuple[int, int, float, float, int]] = []
         self._pd_setup()
+        self._pp_follow = getattr(cfg, "pp_stages", 1) > 1 and getattr(cfg, "pp_follow", False)
+        self._pp_events: list = []  # stage 0 of a following pipeline: requests added / aborted since its last plan frame
+        self._pp_ids: dict = {}
+        self._pp_step = 0
+        self._pp_expect = None  # a following stage: the plan stage 0 ran for the step about to run, and its header
+        self._pp_cur = None
+        if getattr(cfg, "pp_stages", 1) > 1:
+            # A pipeline stage (engine/pp.py) is a prefill engine: a request ends at its first sampled token, and under
+            # overlap a request whose last chunk is in flight is never scheduled again (scheduler.prefill_only).
+            self.scheduler.prefill_only = True
+            if self._pp_follow and cfg.dp_attention > 1:
+                raise NotImplementedError("following pipeline stages (pp_follow) at DP attention > 1")
 
     # -- prefill / decode disaggregation (engine/disagg.py) ---------------------------------------------
 
@@ -403,8 +466,12 @@ class LLMEngine:
         self.pd_counts = collections.Counter()  # handed_off, done_at_prefill, admitted, injected, refused
         self.pd_done = collections.deque(maxlen=4096)  # metas of handoffs that ended on the prefill side (pd_poll)
         self.pd_inject_seconds = 0.0
+        self.pd_handoff_seconds: list[float] = []  # decode: prefill handoff (wall clock) -> rank 0's rows in place
         self._pd_prefetch_on = os.environ.get("KILN_PD_PREFETCH", "1") == "1"
         self._pd_pf: list = []  # handoffs placed since the last launch, to prefetch on every rank of their group
+        self.pd_nixl = False  # KILN_PD_TRANSPORT=nixl (engine/nixl_kv.py)
+        self._pd_rel_snd = None  # decode: the sender of release frames to nixl prefill engines (pd_release)
+        self._pd_pins: dict = {}  # prefill, nixl: xfer -> (scheduler, pin, state rows, group, deadline)
         if self.pd_role is None:
             return
         if self.pd_role not in ("prefill", "decode"):
@@ -418,6 +485,10 @@ class LLMEngine:
               f"{self.attn_tp}, dp_attention {self.dp})", flush=True)
         for p in self.pools:
             p.ascending = True
+        from . import nixl_kv
+
+        if nixl_kv.enabled():
+            self._pd_nixl_setup()
         if self.pd_role == "prefill":
             self.scheduler.prefill_only = True
             return
@@ -443,6 +514,109 @@ class LLMEngine:
             print(f"kiln pd: decode engine receives handoffs at {self.pd_address} (buffer {cfg.pd_buffer_gb} GB in "
                   f"{self.pd_receiver.dir})", flush=True)
 
+    def _pd_nixl_setup(self) -> None:
+        """KILN_PD_TRANSPORT=nixl: every rank registers its caches and state pools with NIXL (ModelRunner.pd_nixl_init);
+        a prefill engine opens a listener for the decode engines' release frames, keeps a handed-off request's pages
+        and state row until its release (scheduler pd_pin) and opens every handoff connection with its exports."""
+        import queue
+        import uuid
+
+        from . import disagg, nixl_kv
+
+        if self.runner.state is not None and self.runner.state.aux:
+            raise NotImplementedError("KILN_PD_TRANSPORT=nixl with a model's aux state rows")
+        self.pd_nixl = True
+        self.pd_engine_id = uuid.uuid4().hex[:12]
+        d = os.path.join("/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir(),
+                         f"kiln-nixl-{os.getpid()}-{self.pd_engine_id}")
+        t = time.perf_counter()
+        self.runner.pd_nixl_init(d)
+        self.pd_nixl_exports = nixl_kv.read_exports(d, self.cfg.tp)
+        shutil.rmtree(d, ignore_errors=True)
+        nixl_kv.log(f"{self.pd_role} engine {self.pd_engine_id}: {self.cfg.tp} ranks registered "
+                    f"{len(self.pd_nixl_exports[0]['regions'])} regions each ({self.pd_nixl_exports[0]['mem']}, "
+                    f"{self.runner._nixl.backend}) in {time.perf_counter() - t:.2f} s")
+        if self.pd_role == "prefill":
+            self._pd_unpin_q: queue.Queue = queue.Queue()
+
+            def released(meta, q=self._pd_unpin_q):
+                if meta.get("done") == "released":
+                    q.put(meta["xfer"])
+                    if self.pd_wake is not None:
+                        self.pd_wake()
+
+            listen = os.environ.get("KILN_PD_NIXL_REPLY_LISTEN", "0.0.0.0:0")
+            self.pd_release_receiver = disagg.Receiver(listen, released, 1 << 20, in_memory=True)
+            self.pd_reply_address = self.pd_release_receiver.address(os.environ.get("KILN_PD_NIXL_REPLY_HOST")
+                                                                     or self.cfg.pd_advertise)
+            hello = json.dumps({"engine": self.pd_engine_id, "ranks": self.pd_nixl_exports}).encode()
+            self.runner._pd_snd = disagg.Sender(int(float(os.environ.get("KILN_PD_SEND_GB", "8")) * 2**30),
+                                                hello=lambda: ({"kind": "hello", "xfer": ""}, [hello]))
+            for sch in getattr(self.scheduler, "groups", [self.scheduler]):
+                sch.pd_pin = True
+            nixl_kv.log(f"prefill engine releases at {self.pd_reply_address}; hello {len(hello)} bytes")
+
+    def _pd_nixl_meta(self, r: Request, srow: int | None, A: int, cp: int, names: set[str] | None = None) -> dict:
+        """The nixl part of a handoff's meta: what a decode rank needs to read r's rows from this engine's ranks.
+        names: only these caches and state pools (a pipeline stage's own layers, ModelRunner.pd_stage_names)."""
+        from . import nixl_kv
+
+        g = r.dp_group if self.dp > 1 else 0
+        if self.dp > 1:
+            send = [e for e in self.pd_nixl_exports if e["dp_group"] == g]
+        else:
+            send = [e for e in self.pd_nixl_exports if e["sends"]]
+        send.sort(key=lambda e: e["a"])
+        if [e["a"] for e in send] != list(range(A)):
+            raise RuntimeError(f"group {g}'s ranks hold attention ranks {[e['a'] for e in send]}, not 0 .. {A - 1}")
+        # The bytes the host path would have moved (its parts), held against the decode side's receive buffer.
+        rows = r.num_prompt if cp == 1 else -(-r.num_prompt // self.cfg.page_size) * (self.cfg.page_size // cp) * A
+        regions = self.pd_nixl_exports[send[0]["tp_rank"]]["regions"]
+        nb = 0
+        for name, rep in self.runner.pd_caches():
+            if name in regions and (names is None or name in names):
+                nb += rows * regions[name][2] * (1 if rep and cp == 1 else (A if cp == 1 else 1))
+        if srow is not None:
+            nb += sum(v[2] for k, v in regions.items() if k.startswith("st") and (names is None or k in names)) * A
+        out = {"engine": self.pd_engine_id, "reply": self.pd_reply_address, "pages": list(r.handoff_pages),
+               "page_size": self.cfg.page_size, "n_tok": r.num_prompt, "srow": srow,
+               "ranks": [e["tp_rank"] for e in send], "cp": cp, "bytes": int(nb),
+               "deadline": time.time() + nixl_kv.hold_seconds()}
+        if names is not None:
+            out["names"] = sorted(names)
+        return out
+
+    def _pd_unpin(self, xfer: str, why: str = "") -> None:
+        pin = self._pd_pins.pop(xfer, None)
+        if pin is None:
+            return
+        sch, page_pin, rows, group, _ = pin
+        sch.pd_unpin(page_pin)
+        if rows is not None:
+            self.runner.state.free_rows(rows, group)
+            sch.pd_pinned -= 1
+        self.pd_counts["unpinned_" + (why or "released")] += 1
+
+    def _pd_unpin_ready(self) -> None:
+        """Prefill engine, nixl: free what released (and expired) handoffs held. On the engine thread only."""
+        import queue
+
+        while True:
+            try:
+                x = self._pd_unpin_q.get_nowait()
+            except queue.Empty:
+                break
+            self._pd_unpin(x)
+        if self._pd_pins:
+            now = time.time()
+            for x, pin in list(self._pd_pins.items()):
+                if now > pin[4]:
+                    from . import nixl_kv
+
+                    nixl_kv.log(f"handoff {x} was never released by its decode engine within KILN_PD_NIXL_HOLD_S; "
+                                "its pages and state row are freed now")
+                    self._pd_unpin(x, "expired")
+
     def mixed_unsupported_by_role(self) -> bool:
         return self.pd_role is not None and bool(self.runner.mixed_rows)
 
@@ -463,6 +637,10 @@ class LLMEngine:
             raise ValueError(f"a handoff from a context-parallel engine (CP {meta['cp']}, page size {meta.get('page_size')}) "
                              f"needs a decode engine with the same CP degree and page size, not CP "
                              f"{self.runner._pd_cp()[0]} / page size {self.cfg.page_size}")
+        if meta.get("pp") is not None:  # a pipeline's stages (disagg.combine_stages): together every layer, once
+            n_layers = len(self.runner.model.layers)
+            if meta["pp"]["ranges"][-1][1] != n_layers:
+                raise ValueError(f"a pipeline handoff over layers {meta['pp']['ranges']} for a {n_layers}-layer model")
         sa = self._pd_sender_a(meta)
         if sa and not disagg.regroup_ok(sa, self.attn_tp):
             raise ValueError(f"a handoff from attention TP {sa} cannot be split for this decode engine's attention TP "
@@ -480,7 +658,15 @@ class LLMEngine:
         req.pd_meta = meta
         self.runner.pd_set_rng(req.rid, meta.get("rng"))
         self.scheduler.add_prefilled(req)
-        if self._pd_prefetch_on:  # broadcast with the next step's launch (_pd_inject_plan), one message for all
+        if meta.get("transport") == "nixl":
+            from . import nixl_kv
+
+            if not self.pd_nixl:
+                raise ValueError("a handoff over KILN_PD_TRANSPORT=nixl into a decode engine without it")
+            if time.time() > float(meta["nixl"]["deadline"]) - 5.0:
+                raise ValueError(f"handoff {meta['xfer']} expired: its prefill engine frees its pages at the deadline "
+                                 f"(KILN_PD_NIXL_HOLD_S {nixl_kv.hold_seconds():g} s)")
+        elif self._pd_prefetch_on:  # broadcast with the next step's launch (_pd_inject_plan), one message for all
             self._pd_pf.append((meta["xfer"], meta["parts"], req.dp_group, req.num_prompt, int(meta.get("cp", 1)),
                                 self._pd_sender_a(meta)))
         self.pd_counts["admitted"] += 1
@@ -511,6 +697,15 @@ class LLMEngine:
     def pd_release(self, xfer: str) -> None:
         if self.pd_receiver is not None:
             self.pd_receiver.release(xfer)
+            reply = self.pd_receiver.pop_reply(xfer)
+            if reply is not None:  # a nixl handoff: its prefill engine (each pipeline stage) may now reuse what it held
+                from . import disagg
+
+                if self._pd_rel_snd is None:
+                    self._pd_rel_snd = disagg.Sender(64 << 20)
+                body = json.dumps({"xfer": xfer, "done": "released", "parts": []}).encode()
+                for to in reply if isinstance(reply, list) else [reply]:
+                    self._pd_rel_snd.enqueue(to, {"kind": "meta", "xfer": xfer}, [body])
 
     def _pd_inject_plan(self, plan) -> None:
         """Copy the parts of every handed-off request this step decodes for the first time onto the device,
@@ -525,14 +720,21 @@ class LLMEngine:
             if r.pd_meta is None or r.pd_injected:
                 continue
             srow = self.runner.state.row(r) if self.runner.state is not None else None
-            items.append((None if self._pd_prefetch_on else r.pd_meta["parts"], list(r.pages), r.num_prompt, srow,
-                          r.dp_group, not self.pd_hold, int(r.pd_meta.get("cp", 1)), r.pd_meta["xfer"],
-                          self._pd_sender_a(r.pd_meta)))
+            nx = r.pd_meta.get("nixl") if r.pd_meta.get("transport") == "nixl" else None
+            items.append((None if self._pd_prefetch_on or nx is not None else r.pd_meta["parts"], list(r.pages),
+                          r.num_prompt, srow, r.dp_group, not self.pd_hold, int(r.pd_meta.get("cp", 1)),
+                          r.pd_meta["xfer"], self._pd_sender_a(r.pd_meta), nx))
             r.pd_injected = True
             plan.pd_injected.append(r.pd_meta["xfer"])
             self.pd_counts["injected"] += 1
         if items:
             self.runner.pd_inject_many(items)
+            now = time.time()  # rank 0's rows are in place: the prefill engine's handoff to here, per request
+            for s in plan.decodes:
+                ht = s.req.pd_meta.get("handoff_time") if s.req.pd_meta is not None else None
+                if ht is not None and s.req.pd_meta["xfer"] in plan.pd_injected:
+                    self.pd_handoff_seconds.append(now - float(ht))
+            del self.pd_handoff_seconds[:-4096]
         self.pd_inject_seconds += time.perf_counter() - t
 
     def _pd_handoff(self, r: Request) -> None:
@@ -544,7 +746,14 @@ class LLMEngine:
         orig, (xfer, dest) = r.handoff_params, r.handoff
         out = r.output_ids
         reason = r.finish_reason
-        if reason == "length":  # the prefill engine's own limit of one token; the request's limits decide
+        # A pipeline stage (engine/pp.py) hands off the caches and state rows of its own layers; only the last stage's
+        # token, logprobs and sampler state are the request's (the earlier stages' samples are of a partial stream), so
+        # an earlier stage ends a request on its own limits only, never on its token (disagg.combine_stages).
+        stage = self.runner.pp_range is not None
+        own = not stage or self.cfg.pp_stage == self.cfg.pp_stages - 1
+        if not own:
+            reason = "length" if orig.max_new_tokens <= 1 or r.num_tokens >= self.cfg.max_model_len else None
+        elif reason == "length":  # the prefill engine's own limit of one token; the request's limits decide
             reason = None
             if len(out) >= orig.max_new_tokens or r.num_tokens >= self.cfg.max_model_len:
                 reason = "length"
@@ -553,26 +762,47 @@ class LLMEngine:
                 reason = "stop" if any(x in tail for x in orig.stop) else None
         n = orig.logprobs
         lps = [[lp, list(ti)[:n] if n is not None else [], list(tl)[:n] if n is not None else []]
-               for lp, ti, tl in r.logprobs] if n is not None else None
-        meta = {"xfer": xfer, "rid": r.rid, "prompt_ids": list(r.prompt_ids), "token": int(out[0]) if out else None,
+               for lp, ti, tl in r.logprobs] if n is not None and own else None
+        meta = {"xfer": xfer, "rid": r.rid, "prompt_ids": list(r.prompt_ids),
+                "token": int(out[0]) if out and own else None,
+                "handoff_time": time.time(),
                 "logprobs": lps, "params": disagg.params_to_json(orig), "priority": r.priority,
                 "num_cached_tokens": max(r.num_cached_tokens, 0), "signature": self.runner.pd_signature(),
                 "prefill_seconds": time.monotonic() - r.arrival_time,
                 "prompt_logprobs": {str(k): [v[0], v[1], list(v[2]), list(v[3])] for k, v in r.prompt_logprobs.items()}
-                if r.prompt_logprobs else None}
+                if r.prompt_logprobs and own else None}
+        prefix, names = "", None
+        if stage:
+            meta["pp"] = {"stage": self.cfg.pp_stage, "stages": self.cfg.pp_stages,
+                          "layers": list(self.runner.pp_range), "ranges": self.runner.pp_ranges}
+            prefix, names = disagg.stage_part(self.cfg.pp_stage, ""), self.runner.pd_stage_names()
         r.handoff_meta = meta
-        if reason is not None or not out:
+        if reason is not None or (not out and own):
             meta.update(done=reason or "abort", parts=[])
             r.finish_reason = meta["done"]
+            if r.pd_pin is not None:  # nothing will read its pages
+                r.pd_pin[0].pd_unpin(r.pd_pin)
+                r.pd_pin = None
             self.runner.pd_send_meta(dest, meta)
             self.pd_counts["done_at_prefill"] += 1
             return
         A, _ = self.runner.pd_attention()
         cp, _ = self.runner._pd_cp()
-        meta.update(parts=disagg.part_names(A), rng=self.runner.pd_rng_state(r.rid), cp=cp, page_size=self.cfg.page_size,
-                    attention_tp=A)
+        meta.update(parts=[prefix + x for x in disagg.part_names(A)], rng=self.runner.pd_rng_state(r.rid) if own else None,
+                    cp=cp, page_size=self.cfg.page_size, attention_tp=A)
         srow = self.runner.state.row(r) if self.runner.state is not None else None
-        self.runner.pd_extract(xfer, dest, r.handoff_pages, r.num_prompt, srow, r.dp_group, meta)
+        if self.pd_nixl:  # the decode ranks read the rows themselves; keep them until the release (_pd_unpin)
+            meta.update(parts=[], transport="nixl", nixl=self._pd_nixl_meta(r, srow, A, cp, names))
+            if r.pd_pin is None:
+                raise RuntimeError(f"handoff {xfer}: the scheduler kept nothing for it (Scheduler.pd_pin)")
+            rows = self.runner.state.detach(r) if self.runner.state is not None else None
+            if rows is not None:
+                r.pd_pin[0].pd_pinned += 1
+            self._pd_pins[xfer] = (r.pd_pin[0], r.pd_pin, rows, r.dp_group, meta["nixl"]["deadline"])
+            r.pd_pin = None
+            self.runner.pd_send_meta(dest, meta)
+        else:
+            self.runner.pd_extract(xfer, dest, r.handoff_pages, r.num_prompt, srow, r.dp_group, meta, names, prefix)
         r.finish_reason = "handoff"
         self.pd_counts["handed_off"] += 1
 
@@ -628,6 +858,8 @@ class LLMEngine:
                              "to also serve whole requests)")
         req = Request(rid or f"req-{next(self._ids)}", list(prompt_ids), params, priority=priority,
                       session_id=session_id)
+        if self._pp_follow and self.cfg.pp_stage == 0:
+            self._pp_event_add(req, own, handoff)
         if handoff is not None:
             req.handoff, req.handoff_params = handoff, own
         req.watermarked = self.watermark is not None and params.watermarking and params.temperature > 0
@@ -683,7 +915,12 @@ class LLMEngine:
         return self.scheduler.close_session(session_id)
 
     def abort(self, req: Request) -> None:
+        if self._pp_follow and self.cfg.pp_stage == 0:
+            self._pp_events.append({"abort": req.rid})
         self.scheduler.abort(req)
+        if req.pd_pin is not None:  # a prefill engine under nixl: no handoff will read these pages
+            req.pd_pin[0].pd_unpin(req.pd_pin)
+            req.pd_pin = None
         self.runner.forget(req)
         if req.pd_meta is not None and not req.pd_injected:
             self.pd_release(req.pd_meta["xfer"])
@@ -696,10 +933,23 @@ class LLMEngine:
     def close(self) -> None:
         """Stop tensor-parallel workers (rank 0 tells them to exit), destroy the process group and
         give this process back the state init_rank changed. Idempotent."""
-        _OPEN.discard(self)
         runner = getattr(self, "runner", None)
+        if self in _OPEN and runner is not None and os.environ.get("KILN_DSA_CP_LOCAL_K"):
+            # KILN_DSA_CP_LOCAL_K's exactness over the engine's whole run (rank 0's row group), for engines a gate tool
+            # does not drive (a server, a following pipeline stage): "past F" must be 0.
+            try:
+                from ..models import mla as _mla
+
+                line = _mla.local_k_report(None, _mla.local_k_counts(runner.model), "this engine's run")
+                if line:
+                    print(line, flush=True)
+            except Exception as e:  # noqa: BLE001 - a report, never a reason not to close
+                print(f"local-K report failed: {e!r}", flush=True)
+        _OPEN.discard(self)
         if runner is not None and getattr(runner, "watchdog", None) is not None:
             runner.watchdog.close()
+        if runner is not None and hasattr(runner, "eplb_stop"):
+            runner.eplb_stop()  # rank 0's rebalance loading thread (the other ranks stop theirs when serve ends)
         if runner is not None and getattr(runner, "_pd_snd", None) is not None:
             try:
                 runner._pd_snd.flush(60)
@@ -709,6 +959,26 @@ class LLMEngine:
         if getattr(self, "pd_receiver", None) is not None:
             self.pd_receiver.close()
             self.pd_receiver = None
+        if getattr(self, "_pd_rel_snd", None) is not None:
+            try:
+                self._pd_rel_snd.flush(30)
+            finally:
+                self._pd_rel_snd.close()
+                self._pd_rel_snd = None
+        if getattr(self, "pd_release_receiver", None) is not None:
+            self.pd_release_receiver.close()
+            self.pd_release_receiver = None
+        if runner is not None and getattr(runner, "pp_link", None) is not None and self._pp_follow \
+                and self.cfg.pp_stage == 0:
+            try:  # the end of the run, for the following stages
+                runner.pp_link.send_control({"close": True})
+            except OSError:
+                pass
+        if runner is not None and getattr(runner, "pp_link", None) is not None:
+            # A pipeline stage (engine/pp.py): rank 0's frames still queued on its sender thread (KILN_PP_ASYNC) go out
+            # before the process can exit; the other ranks close theirs when the None below ends ModelRunner.serve.
+            runner.pp_link.close()
+            runner.pp_link = None
         if self._workers and runner is not None and runner.tp_send is not None:
             runner.tp_send(None)
             runner.tp_send = None
@@ -740,14 +1010,21 @@ class LLMEngine:
 
     def warmup(self, reverse: bool = False) -> dict:
         role = self.cfg.pd_role  # a prefill engine never decodes; a decode engine prefills only on bypass
+        pp = getattr(self.cfg, "pp_stages", 1) > 1  # a pipeline stage (engine/pp.py) runs prefill only
         out = self.runner.warmup(1 + self.cfg.spec_k if self.cfg.spec_method else None, reverse=reverse,
-                                 decode=role != "prefill", prefill=role != "decode" or self.cfg.pd_bypass_prefill)
+                                 decode=role != "prefill" and not pp,
+                                 prefill=role != "decode" or self.cfg.pd_bypass_prefill)
+        # The warmup's prefill calls run outside step(): a pipeline stage's last deferred output (KILN_PP_OVERLAP) goes
+        # out here, or the next stage waits for it forever (8 x trn1.32xlarge, 2026-10-07: stages 1-7 hung after the
+        # bucket warmup, s3 logs/kiln-pp-s*/pp8-d2h-S*).
+        self.runner.pp_flush()
         self.runner.eplb_reset()  # warmup's dummy prefill calls were recorded too (models/eplb.py)
         out["cache_pulled"] = self.cache_pulled
         if self.cfg.compile_cache_uri and self.cfg.device == "neuron":
             from .. import compile_cache
 
             out["cache_pushed"] = compile_cache.push(self.cfg.compile_cache_uri)
+        self.startup_seconds = time.perf_counter() - self.t_start
         return out
 
     def _propose(self, req: Request) -> list[int]:
@@ -772,7 +1049,90 @@ class LLMEngine:
         return self.proposer.propose(req.token_ids, k)
 
     def has_work(self) -> bool:
+        if self._pd_pins or (self.pd_nixl and self.pd_role == "prefill"):
+            self._pd_unpin_ready()
         return self.scheduler.has_work() or self._inflight is not None
+
+    # -- following pipeline stages (engine/pp.py "Following stages") --------------------------------------------------
+
+    def _pp_event_add(self, req: Request, params: SamplingParams, handoff) -> None:
+        """Stage 0: a new request, for the next plan frame (its token ids as that frame's payload). params: the ones the
+        caller gave (a prefill engine's add_request narrows them again on every stage)."""
+        import dataclasses
+
+        if params.grammar is not None:
+            raise NotImplementedError("a following pipeline does not carry grammars")
+        self._pp_events.append({"add": req.rid, "params": dataclasses.asdict(params), "priority": req.priority,
+                                "session": req.session_id, "handoff": list(handoff) if handoff else None,
+                                "t": time.time()})
+        self._pp_ids[req.rid] = list(req.prompt_ids)
+
+    def _pp_plan_meta(self, plan) -> None:
+        """The header the step's first prefill call carries to the next stage: stage 0's own plan and events, or (a
+        following stage) the header it applied, passed on."""
+        if self.cfg.pp_stage == 0:
+            meta = {"step": self._pp_step, "events": self._pp_events, "ids": self._pp_ids,
+                    "plan": [[s.req.rid, s.start, s.num_tokens] for s in plan.prefills]}
+            self._pp_events, self._pp_ids = [], {}
+            self._pp_step += 1
+        else:
+            meta = {k: v for k, v in self._pp_cur.items() if k != "_applied"}
+        self.runner.pp_link.next_meta = meta
+
+    def _pp_check(self, plan) -> None:
+        """A following stage: the step's plan must be the one stage 0 ran, or the stages hold different KV."""
+        exp, self._pp_expect = self._pp_expect, None
+        if exp is None:
+            return
+        got = [[s.req.rid, s.start, s.num_tokens] for s in plan.prefills] if plan else []
+        if got != exp:
+            raise RuntimeError(f"pipeline stage {self.cfg.pp_stage}: scheduled {got[:4]}, stage 0 ran {exp[:4]} "
+                               f"(step {self._pp_cur.get('step') if self._pp_cur else None})")
+
+    def follow(self, timeout: float = 0.2) -> tuple[bool, list[Request]]:
+        """One step of a following stage (pp_follow, stages 1 .. S - 1): wait up to `timeout` for stage 0's next plan
+        frame, apply its events, run the step it describes. Returns (go on, requests finished). Without a frame, a step
+        still in flight is read back (nothing new is scheduled); a close frame ends the run, passed on downstream once
+        everything here has gone out."""
+        from .request import SamplingParams
+
+        link = self.runner.pp_link
+        hdr = link.peek(timeout)
+        if hdr is None:
+            if self._inflight is None:
+                return True, []
+            self.runner.pp_flush()
+            return True, self._drain()
+        if "ctl" in hdr:
+            ctl = link.pop_control()
+            done = []
+            while self._inflight is not None:
+                self.runner.pp_flush()
+                done += self._drain()
+            self.runner.pp_flush()
+            if self.cfg.pp_stage < self.cfg.pp_stages - 1:
+                link.send_control(ctl)
+            return not ctl.get("close"), done
+        meta = hdr.get("meta")
+        if meta is None:
+            raise RuntimeError(f"pipeline stage {self.cfg.pp_stage}: a frame without stage 0's plan (call "
+                               f"{hdr.get('call')}): is stage 0 running with pp_follow?")
+        if not meta.get("_applied"):
+            ids = meta.get("ids", {})
+            for ev in meta["events"]:
+                if "add" in ev:
+                    p = SamplingParams(**ev["params"])
+                    r = self.add_request(ids[ev["add"]], p, rid=ev["add"], priority=ev["priority"],
+                                         session_id=ev["session"],
+                                         handoff=tuple(ev["handoff"]) if ev["handoff"] else None)
+                    r.arrival_time = time.monotonic() - max(0.0, time.time() - ev["t"])  # stage 0's arrival
+                elif "abort" in ev:
+                    for r in list(self.scheduler.running) + list(self.scheduler.waiting):
+                        if r.rid == ev["abort"]:
+                            self.abort(r)
+            meta["_applied"] = True
+        self._pp_expect, self._pp_cur = meta["plan"], meta
+        return True, self.step()
 
     def step(self) -> list[Request]:
         """Run one scheduler step. Returns requests that finished in it.
@@ -792,15 +1152,24 @@ class LLMEngine:
                 self._pd_cool()
             self._pd_gate()
         if self.cfg.overlap and self._overlap_ok():
+            self.runner.pp_set_defer(True)  # a pipeline stage's outputs ride the next call (engine/pp.py)
             finished = self._step_overlap()
         else:
+            # A pipeline stage: an output an overlapped step deferred goes out BEFORE this step reads anything back (a
+            # read that waits on a later stage would otherwise wait for itself), and a synchronous step's go at once.
+            self.runner.pp_flush()
+            self.runner.pp_set_defer(False)
             finished = self._drain() + self._step_sync()
+            self.runner.pp_flush()
         self.last_step.seconds = time.perf_counter() - t
         if profiling.TIMELINE is not None:  # KILN_TIMELINE: what this step() call launched
             st = self.last_step
             profiling.record("step", t, t + st.seconds, st.num_decode, st.num_prefill_tokens, st.decode_calls,
                              st.prefill_calls)
         self._eplb_tick()  # after the step's own time (outside last_step.seconds)
+        if self._eplb_trace_path and self.last_step.prefill_calls:
+            self._eplb_trace_calls += self.last_step.prefill_calls
+            self.runner.eplb_trace(self._eplb_trace_path, self._eplb_trace_calls)
         return finished
 
     def _eplb_tick(self) -> None:
@@ -836,6 +1205,13 @@ class LLMEngine:
     def _overlap_ok(self) -> bool:
         if self.cfg.spec_method and not self.runner.spec_async:
             return False
+        if getattr(self.cfg, "pp_stages", 1) > 1:
+            # A pipeline stage (engine/pp.py) runs prefill only. Without scheduler.prefill_only an overlapped step
+            # launched the next decode before it knew the request ended (max_new_tokens 1): "runs prefill only" on every
+            # stage (trn1, 2026-10-06); a stage sets it now (__init__). Overlap stays opt-in (KILN_PP_OVERLAP=1), and it
+            # only pays with KILN_PP_ASYNC=1: otherwise a call's launch waits for its own layers in the stage link's host
+            # copy (pp.StageLink.send), so the next step cannot be launched under it.
+            return _pp.OVERLAP and self.scheduler.prefill_only
         if getattr(self.mcfg.hybrid, "ple", None) is not None:  # n-gram ids are hashed from host tokens
             return False
         live = list(self.scheduler.running) + list(self.scheduler.waiting)
@@ -844,6 +1220,7 @@ class LLMEngine:
     def _step_sync(self) -> list[Request]:
         t0 = time.perf_counter()
         plan = self.scheduler.schedule()
+        self._pp_check(plan)
         if not plan:
             return []
         t1 = time.perf_counter()
@@ -954,10 +1331,13 @@ class LLMEngine:
         try:
             plan = self.scheduler.schedule()
         except NeedSync:
+            self.runner.pp_flush()
             return self._drain()
+        self._pp_check(plan)
         if profiling.TIMELINE is not None:
             profiling.record("sched", t_sched, time.perf_counter())
-        if not plan:
+        if not plan:  # a pipeline stage's deferred output (engine/pp.py) has no next call to carry it: send it now
+            self.runner.pp_flush()
             return self._drain()
         launches = self._launch(plan)
         self.scheduler.advance(plan)
@@ -1002,10 +1382,12 @@ class LLMEngine:
                 self.runner.mtp_async()
                 continue
             launches.append((chunk, self.runner.verify(chunk, Q), "verify", self.runner.last_hidden, None))
+        if self._pp_follow and plan.prefills:
+            self._pp_plan_meta(plan)
         for s in plan.prefills:
             launches.append(([s], self.runner.prefill(s), "prefill", self.runner.last_hidden, None))
             if self.runner.spec_async:
-                self.runner.spec_after_prefill([s], self.runner.last_hidden, None)
+                self._spec_after_prefill([s], self.runner.last_hidden, None)
             else:
                 self._mtp_fill_early(launches[-1][0], None)
             self._save_states([s])
@@ -1068,7 +1450,7 @@ class LLMEngine:
                 if k_ == "verify_async":
                     self.runner.mtp_async()
                 if kind == "prefill" and self.runner.spec_async:
-                    self.runner.spec_after_prefill(chunk, self.runner.last_hidden, self.runner.last_layout)
+                    self._spec_after_prefill(chunk, self.runner.last_hidden, self.runner.last_layout)
                 elif kind == "prefill":
                     self._mtp_fill_early(chunk, self.runner.last_layout)
                 if kind != "verify":
@@ -1171,6 +1553,15 @@ class LLMEngine:
         if self.pd_role == "decode" and self.pd_hold:
             self._pd_cool()
         return [results[id(s)] for s in plan.seqs()]
+
+    def _spec_after_prefill(self, chunk, hkey, lay) -> None:
+        """ModelRunner.spec_after_prefill, with the pages of a final chunk's later draft passes (k > 1: MTP KV up to
+        end + k - 2) reserved first, as _mtp_rows reserves num_tokens + k before a synchronous draft."""
+        if self.cfg.spec_k > 1:
+            for s in chunk:
+                if s.sample:
+                    self.scheduler._reserve(s.req, s.end + self.cfg.spec_k)
+        self.runner.spec_after_prefill(chunk, hkey, lay)
 
     def _collect_blind(self, chunk, outs, lay, results) -> None:
         """A blind verify's read-back (engine/spec_async.py): spec_post's (tokens, acc) row per sequence gives the

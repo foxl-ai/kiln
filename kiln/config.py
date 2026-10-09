@@ -180,6 +180,12 @@ class ModelConfig:
             with open(gen_path) as f:
                 eos = json.load(f).get("eos_token_id", eos)
         eos_ids = tuple(eos) if isinstance(eos, list) else ((eos,) if eos is not None else ())
+        return cls.from_config_dict(c, eos_ids)
+
+    @classmethod
+    def from_config_dict(cls, c: dict, eos_ids: tuple[int, ...] = ()) -> "ModelConfig":
+        """from_pretrained on a config.json already read (an EAGLE-3 draft's embedded layer config,
+        models/eagle3.py)."""
         from .models import hybrid, mla
 
         arch = (c.get("architectures") or [None])[0]
@@ -528,6 +534,20 @@ def _pow2_ladder(lo: int, hi: int) -> tuple[int, ...]:
     return tuple(sorted(set(out)))
 
 
+def precompile_workers_env(value: str | None = None) -> int:
+    """KILN_PRECOMPILE_WORKERS (EngineConfig.precompile_workers): unset or 0 / off = off, an integer = that many
+    neuronx-cc processes at once, "auto" = half the host's vCPUs (neuronx-cc runs several threads per compile)."""
+    v = (value if value is not None else os.environ.get("KILN_PRECOMPILE_WORKERS", "0")).strip().lower()
+    if v in ("", "0", "off", "false"):
+        return 0
+    if v == "auto":
+        return max(1, (os.cpu_count() or 2) // 2)
+    n = int(v)
+    if n < 0:
+        raise ValueError(f"KILN_PRECOMPILE_WORKERS must be >= 0, auto or off, not {v!r}")
+    return n
+
+
 @dataclass
 class EngineConfig:
     model_path: str
@@ -598,6 +618,10 @@ class EngineConfig:
     # s3://... prefix shared by every instance on the same SDK: compiled graphs are pulled
     # before start-up and pushed after warmup (kiln/compile_cache.py).
     compile_cache_uri: str | None = None
+    # neuronx-cc processes that compile every graph of the warmup in parallel BEFORE it runs (kiln/precompile.py:
+    # capture on the meta device, then compile, overlapping the weight load); 0 keeps the serial compile-during-warmup.
+    # KILN_PRECOMPILE_WORKERS: an integer, "auto" (half the vCPUs) or 0 / off.
+    precompile_workers: int = field(default_factory=lambda: precompile_workers_env())
     tp: int = 1  # tensor-parallel ranks, one process and one NeuronCore each
     # Tensor parallelism of the token mixers (attention, MLA, Gated DeltaNet, KDA), a divisor of
     # tp: their heads split attention_tp ways, replicated over tp / attention_tp groups of
@@ -657,6 +681,13 @@ class EngineConfig:
     # "Collectives across chips"), and a decode call is otherwise prep + ceil(layers / piecewise_moe_group)
     # groups + post graphs.
     decode_whole: bool = field(default_factory=lambda: os.environ.get("KILN_DECODE_WHOLE", "0") == "1")
+    # KILN_PREFILL_WHOLE=1 (off by default): under piecewise, a prefill call is ONE graph instead of prep +
+    # ceil(layers / piecewise_prefill_moe_group) pieces + post (6 for GLM-5.3-Flash at 12), each of which pays the
+    # runtime's per-execution barrier and the ranks' graph-start skew. A pipeline stage's call is one graph too: the
+    # prep (for its attention inputs; the hidden stream comes from the link after stage 0), its own layers and, on the
+    # last stage, the post. The graph takes model_runner.PREFILL_BIG_LIMIT (or KILN_PREFILL_CC_ARGS); mixed calls keep
+    # their pieces.
+    prefill_whole: bool = field(default_factory=lambda: os.environ.get("KILN_PREFILL_WHOLE", "0") == "1")
     # Mixed batches (KILN_MIXED_BATCH=1, off by default): the decode tokens of running requests ride in the
     # prefill calls of the same step, as vLLM's chunked prefill does (vllm 0.24.0 vllm/v1/core/sched/
     # scheduler.py Scheduler.schedule: "There's no 'decoding phase' nor 'prefill phase' in the scheduler",
@@ -685,6 +716,9 @@ class EngineConfig:
     jump_forward: bool = False
     # Speculative decoding: None, "ngram" (vLLM ngram / SGLang NGRAM) or "suffix" (vLLM).
     spec_method: str | None = None
+    # An EAGLE-3 draft checkpoint (local directory) for spec_method "mtp": the draft head is that checkpoint's, fed
+    # the target's auxiliary hidden states (models/eagle3.py), instead of the model's own MTP layer. Opt-in.
+    spec_draft_model: str | None = None
     spec_k: int = 4
     # vLLM num_speculative_tokens_per_batch_size (v0.30.0 config/speculative.py): (lo, hi, k) ranges of
     # the running batch size, inclusive, each with the draft length used there (at most spec_k; 0 = no
@@ -731,6 +765,8 @@ class EngineConfig:
     pp_split: tuple | None = None
     pp_listen: str | None = None
     pp_next: str | None = None
+    # pp_follow: only stage 0 takes requests; the other stages follow its plan frames (engine/pp.py, LLMEngine.follow).
+    pp_follow: bool = False
     extra: dict = field(default_factory=dict)
 
     @property

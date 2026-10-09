@@ -271,7 +271,8 @@ def _capture_rank(rank: int, sweep_argv: list[str], shape_dir: str, target: str,
     t1 = time.time()
     if skip_prefill:  # decode graphs only (tools/time_decode.py)
         runner.prefill_buckets = []
-    w = runner.warmup(1 + cfg.spec_k if cfg.spec_method else None, plp=plp)
+    w = runner.warmup(1 + cfg.spec_k if cfg.spec_method else None, plp=plp,
+                      **({"decode": False} if getattr(cfg, "pp_stages", 1) > 1 else {}))  # a pipeline stage: prefill only
     rec = {"rank": rank, "build_seconds": round(t1 - t0, 1), "warmup_seconds": round(w["seconds"], 1),
            "graphs": w["graphs"], "num_pages": num_pages, "keys": capture.CAPTURED}
     with open(out, "w") as f:
@@ -333,6 +334,11 @@ def cmd_capture(a) -> None:
     from kiln.models import linear_attn
 
     env.setdefault("KILN_LINEAR_ATTN_KERNEL", linear_attn.LINEAR_ATTN_KERNEL)
+    # KILN_LA_CONV_KERNEL: xla until feat/trn2-kda-conv, since then nki on trn2 at LNC=2 without context-parallel DSA
+    # (kernels/short_conv.py), resolved for the capture's target (this host is not one).
+    from kiln.kernels import short_conv
+
+    env.setdefault("KILN_LA_CONV_KERNEL", short_conv._default_kernel(a.target))
     env = dict(sorted(env.items()))
     from kiln import capture
 

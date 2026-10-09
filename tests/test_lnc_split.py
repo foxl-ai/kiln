@@ -18,14 +18,14 @@ needs_nki = pytest.mark.skipif(importlib.util.find_spec("nki") is None, reason="
 
 def test_lnc_split_switch(monkeypatch):
     """KILN_LNC_SPLIT: the proven kernels by default (delta_rule, dsa_topk; at LNC=2 also moe_dedupe, kda_decode,
-    dsa_decode, dsa_fused), all with "all", none with 0, a named subset, and an unknown name refused."""
+    dsa_decode, dsa_fused, moe_ep), all with "all", none with 0, a named subset, and an unknown name refused."""
     from kiln import platform
 
     monkeypatch.delenv("KILN_LNC_SPLIT", raising=False)
     monkeypatch.setattr(platform, "_LNC", 1)  # trn1 / a host: the old default
     assert [platform.lnc_split(k) for k in platform.LNC_SPLIT_KERNELS] == [False, False, True, True, False, False, False, False]
     monkeypatch.setattr(platform, "_LNC", 2)  # trn2 at LNC=2: + the decode splits measured there
-    assert [platform.lnc_split(k) for k in platform.LNC_SPLIT_KERNELS] == [False, True, True, True, False, True, True, True]
+    assert [platform.lnc_split(k) for k in platform.LNC_SPLIT_KERNELS] == [False, True, True, True, True, True, True, True]
     monkeypatch.setenv("KILN_LNC_SPLIT", "all")
     assert all(platform.lnc_split(k) for k in platform.LNC_SPLIT_KERNELS)
     monkeypatch.setenv("KILN_LNC_SPLIT", "0")
@@ -180,7 +180,8 @@ def test_moe_ep_split_is_the_whole_kernel(monkeypatch):
     each program read-modify-writing only its own columns of out. The prefill kernel (first passes and overflow
     passes, both tile-scale forms) and the decode kernel v2 (small passes and a dequantize-first pass) give grid 1's
     output bit for bit, and grid 1 matches the host emulation. Unsplit at grid 2 (both programs run the whole kernel,
-    program 0 alone writes: grid 1 does not compile at LNC=2) gives grid 1's output too."""
+    program 0 alone writes: grid 1 does not compile at LNC=2) gives grid 1's output too. At grid 2 both kernels return
+    128 dummy rows past C (the empty lanes' scatter destinations, moe_ep._dummy_lanes), which nobody reads."""
     from kiln.kernels import moe_ep
     from tests.test_moe_ep import _experts
 
@@ -204,9 +205,9 @@ def test_moe_ep_split_is_the_whole_kernel(monkeypatch):
             args = moe_ep.kernel_inputs(x, topv, topi, blob, lmap, 1, 10.0)
             one = torch.as_tensor(_sim(moe_ep.kiln_moe_ep_kernel, 1, **args))
             two = torch.as_tensor(_sim(moe_ep.kiln_moe_ep_kernel, 2, **dict(args, spl=1)))
-            assert torch.equal(one, two), ("prefill", block, C, (one != two).sum().item())
+            assert two.shape[0] == C + 128 and torch.equal(one, two[:C]), ("prefill", block, C)
             both = torch.as_tensor(_sim(moe_ep.kiln_moe_ep_kernel, 2, **args))  # unsplit: program 0 alone writes
-            assert torch.equal(one, both), ("prefill unsplit grid 2", block, C, (one != both).sum().item())
+            assert torch.equal(one, both[:C]), ("prefill unsplit grid 2", block, C)
             want = moe_ep.emulate(x, topv, topi, lmap, *ws, act=1, lim=10.0, small=False).float()
             assert (one.float() - want).abs().max() <= 0.01 * want.abs().max()
         # decode v2: C = 128 rows, experts with few pairs (small passes) and one with many (a dequantize-first pass)
@@ -222,11 +223,92 @@ def test_moe_ep_split_is_the_whole_kernel(monkeypatch):
                   rev=moe_ep.REV_SMALL2, tsc=int(moe_ep.tile_scales(blob)))
         one = torch.as_tensor(_sim(moe_ep.kiln_moe_ep_small2, 1, **a2))
         two = torch.as_tensor(_sim(moe_ep.kiln_moe_ep_small2, 2, **dict(a2, spl=1)))
-        assert torch.equal(one, two), ("small2", block, (one != two).sum().item())
+        assert two.shape[0] == 256 and torch.equal(one, two[:128]), ("small2", block)
         both = torch.as_tensor(_sim(moe_ep.kiln_moe_ep_small2, 2, **a2))
-        assert torch.equal(one, both), ("small2 unsplit grid 2", block, (one != both).sum().item())
+        assert torch.equal(one, both[:128]), ("small2 unsplit grid 2", block)
         want = moe_ep.emulate(x, topv, topi, lmap, *ws, act=1, lim=10.0, small=2).float()
         assert (one.float() - want).abs().max() <= 0.01 * want.abs().max()
+
+
+@needs_nki
+def test_moe_ep_lnc2_scatter_indices_are_in_range_and_unique(monkeypatch):
+    """At LNC=2 every scatter read-modify-write of kernels/moe_ep.py (dma_compute into out at the lanes' tokens) gets
+    in-range, pairwise distinct row indices: an out-of-range index under oob_mode=skip there hangs trn2 (a later DMA
+    aborts, the execution times out; tools/probe_ep_race.py, docs/neuron-notes.md "The EP hang at LNC=2 is the
+    scatter's out-of-bound skip"), and NKI requires unique scatter indices (nki/isa/_advanced.py dma_compute). Before
+    the dummy rows every empty lane scattered to the out-of-range token C. Checked in the simulator on the indices the
+    kernel passes (the simulator itself skips out-of-range rows silently): the dequantize-first kernel split and unsplit,
+    with experts that leave lanes empty and one with overflow passes, and decode v2's small and dequantize-first passes.
+    At grid 1 (trn1) the kernels are unchanged and still scatter empty lanes to C, which the device skips."""
+    import numpy as np
+    import nki._backends.simulator as sim
+
+    from kiln.kernels import moe_ep
+    from tests.test_moe_ep import _experts
+
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    seen = []
+    orig = sim.dma_copy_indirect
+
+    def hook(**kw):
+        if kw.get("dst_index") is not None and kw.get("dst_rmw_op") is not None:  # a scatter RMW
+            seen.append((np.asarray(kw["dst_index"].get_data()).astype(np.int64).ravel(), int(kw["dst_indirect_max_index"])))
+        return orig(**kw)
+
+    monkeypatch.setattr(sim, "dma_copy_indirect", hook)
+    H, I, E, K, El, rank = 1024, 256, 12, 4, 3, 1
+    owner = torch.arange(E) // El
+    lmap = moe_ep.local_map(owner, rank)
+    g = torch.Generator().manual_seed(7)
+    ws = _experts(El, H, I, seed=3, block=False)
+    blob = moe_ep.pack(*ws, tiles=False)
+
+    def check(what, grid1):
+        bad = [(len(i), m, int(i.min()), int(i.max())) for i, m in seen if (i < 0).any() or (i >= m).any()
+               or len(np.unique(i)) != len(i)]
+        if grid1:  # trn1's kernels as before: empty lanes at the out-of-range token C (the device skips them there)
+            assert seen and bad, (what, "grid 1 no longer scatters empty lanes to C")
+        else:
+            assert seen and not bad, (what, f"{len(bad)} of {len(seen)} scatters with an index out of range or repeated",
+                                      bad[:3])
+        seen.clear()
+
+    C = 256  # rank 1's first expert takes most pairs (overflow passes past its first LW lanes), the others leave lanes empty
+    rest = torch.tensor([e for e in range(E) if e != El * rank])
+    topi = torch.stack([torch.cat([torch.tensor([El * rank]), rest[torch.randperm(E - 1, generator=g)[:K - 1]]])
+                        for _ in range(C)])
+    topv = (torch.rand(C, K, generator=g) + 0.1).bfloat16()
+    x = torch.randn(C, H, generator=g).bfloat16()
+    args = moe_ep.kernel_inputs(x, topv, topi, blob, lmap, 1, 10.0)
+    _sim(moe_ep.kiln_moe_ep_kernel, 1, **args)
+    check("prefill grid 1", True)
+    _sim(moe_ep.kiln_moe_ep_kernel, 2, **dict(args, spl=1))
+    check("prefill split", False)
+    _sim(moe_ep.kiln_moe_ep_kernel, 2, **args)
+    check("prefill unsplit grid 2", False)
+    x = torch.randn(128, H, generator=g).bfloat16()
+    topi = torch.stack([torch.cat([torch.tensor([El * rank]), rest[torch.randperm(E - 1, generator=g)[:K - 1]]])
+                        if r < 40 else torch.randperm(E, generator=g)[:K] for r in range(128)])
+    topv = (torch.rand(128, K, generator=g) + 0.1).bfloat16()
+    a2 = dict(x=x, topi=topi.to(torch.int32), wts=topv, lmap=lmap, gu=blob["gu"], dsg=blob["dsg"], dn=blob["dn"],
+              dsd=blob["dsd"], sgu=blob["sgu"], sdn=blob["sdn"], LW=moe_ep.SMALL_LW, act=1, lim=10.0, bc=moe_ep.BCAST,
+              rev=moe_ep.REV_SMALL2, tsc=0)
+    _sim(moe_ep.kiln_moe_ep_small2, 2, **dict(a2, spl=1))
+    check("decode v2 split", False)
+    _sim(moe_ep.kiln_moe_ep_small2, 2, **a2)
+    check("decode v2 unsplit grid 2", False)
+
+
+def test_moe_ep_lnc2_lines_leave_trn1_rev_unchanged():
+    """The LNC=2 fix's lines (marked "# lnc2") are left out of the source moe_ep hashes for grid-1 launches, so trn1's
+    REV values, and with them every trn1 EP graph key, are what engine-v0 fdea9af had; grid-2 launches pass the REV
+    of the whole text. A deliberate trn1 re-key (an edit to these kernels' shared source) updates the numbers here.
+    """
+    from kiln.kernels import moe_ep
+
+    assert (moe_ep.REV, moe_ep.REV_SMALL, moe_ep.REV_SMALL2, moe_ep.REV_SMALL3, moe_ep.REV_SMALL5) == (
+        2569844845, 2049637701, 3087051072, 2852879506, 1388171348)
+    assert moe_ep.REV_LNC2 != moe_ep.REV and moe_ep.REV_SMALL2_LNC2 != moe_ep.REV_SMALL2
 
 
 @needs_nki
@@ -313,3 +395,104 @@ def test_dsa_fused_query_split_is_the_whole_kernel(monkeypatch):
     assert torch.equal(one, two)
     ref = df.emulate(qI, w, pk, pos, q_lat, kc, 64, D ** -0.5, R ** -0.5)
     assert (one.float() - ref).abs().max() < 2e-2 * ref.abs().max()
+
+
+@needs_nki
+def test_dsa_long_select_lnc2_program_1_leaves_the_scratch_alone(monkeypatch):
+    """kernels/dsa_long_select.py at grid 2 (trn2, LNC=2): program 0 alone selects and program 1 waits at a core
+    barrier, so the HBM score scratch, one tensor shared by the two physical cores, is written and read back (the
+    level-2 indirect gathers) by one program only. Before, both programs ran the whole kernel on the same scratch and
+    the R8 long-context engine's 4096-page graphs answered wrong on trn2 (docs/neuron-notes.md "Long prompts on trn2").
+    In the simulator: grid 2 issues exactly grid 1's indirect gathers and gives grid 1's pools and scores, which equal
+    the host emulation's selection."""
+    import nki._backends.simulator as sim
+
+    from kiln.kernels import dsa_long_select as dls
+
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    n = [0]
+    orig = sim.dma_copy_indirect
+
+    def hook(**kw):
+        n[0] += 1
+        return orig(**kw)
+
+    monkeypatch.setattr(sim, "dma_copy_indirect", hook)
+    g = torch.Generator().manual_seed(11)
+    N, Hi, D, P, keep = 128, 4, 128, 2048, 64
+    qI = torch.randn(N, Hi, D, generator=g).bfloat16().float()
+    w = torch.randn(N, Hi, generator=g)
+    pk = torch.randn(P, D, generator=g).bfloat16().float()
+    npool = torch.randint(keep + 1, P, (N,), generator=g)
+    sub = dls.pick_sub(P, keep)
+    assert sub > 0  # two levels: the scratch is read back by indirect gathers
+    args = dict(dls.kernel_inputs(qI, w, pk, npool), keep=keep, scale=D ** -0.5, sub=sub, lsub=sub.bit_length() - 1,
+                one=0, loop=0)
+    res = {}
+    for grid, rev in ((1, dls.REV), (2, dls.REV_LNC2)):
+        n[0] = 0
+        out, outv = _sim(dls.kiln_dsa_long_select_kernel, grid, rev=rev, **args)
+        res[grid] = (torch.as_tensor(out).reshape(N, keep), torch.as_tensor(outv).reshape(N, keep), n[0])
+    assert res[1][2] > 0 and res[2][2] == res[1][2], f"indirect gathers: grid 1 {res[1][2]}, grid 2 {res[2][2]}"
+    assert torch.equal(res[1][0], res[2][0]) and torch.equal(res[1][1], res[2][1])
+    want, cnt, _ = dls.emulate(qI, w, pk, npool, keep, D ** -0.5)
+    for r in range(N):
+        c = int(cnt[r])
+        assert set(res[2][0][r, :c].tolist()) == set(want[r, :c].tolist()), r
+
+
+@needs_nki
+def test_dsa_long_pipe_and_trip_kernels_lnc2_program_1_leaves_the_scratch_alone(monkeypatch):
+    """The other long-context selection kernels that run dsa_long_select's tile on HBM score scratch (kernels/
+    dsa_long_pipe.py, every tile in one call; kernels/dsa_long_select_t.py, one tile under a run-time trip count) take
+    the same grid-2 form: program 0 alone selects. In the simulator grid 2 issues exactly grid 1's indirect gathers and
+    gives grid 1's pools and scores."""
+    import nki._backends.simulator as sim
+
+    from kiln.kernels import dsa_long_pipe as dp
+    from kiln.kernels import dsa_long_select as dls
+    from kiln.kernels import dsa_long_select_t as dst
+
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
+    n = [0]
+    orig = sim.dma_copy_indirect
+
+    def hook(**kw):
+        n[0] += 1
+        return orig(**kw)
+
+    monkeypatch.setattr(sim, "dma_copy_indirect", hook)
+    g = torch.Generator().manual_seed(12)
+    Hi, D, P, keep = 4, 128, 2048, 64
+    sub = dls.pick_sub(P, keep)
+    common = dict(keep=keep, scale=D ** -0.5, sub=sub, lsub=sub.bit_length() - 1, one=0)
+    for name, N in (("pipe", 256), ("trip", 128)):
+        qI = torch.randn(N, Hi, D, generator=g).bfloat16().float()
+        w = torch.randn(N, Hi, generator=g)
+        pk = torch.randn(P, D, generator=g).bfloat16().float()
+        npool = torch.randint(keep + 1, P, (N,), generator=g)
+        args = dls.kernel_inputs(qI, w, pk, npool)
+        res = {}
+        for grid in (1, 2):
+            n[0] = 0
+            if name == "pipe":
+                out, outv = _sim(dp.kiln_dsa_long_pipe_kernel, grid, rev=dp.REV if grid == 1 else dp.REV_LNC2,
+                                 per_chunk=dp.PER_CHUNK, ktall=1, **args, **common)
+            else:
+                out, outv = _sim(dst.kiln_dsa_long_select_t_kernel, grid, rev=dst.REV if grid == 1 else dst.REV_LNC2,
+                                 trip=torch.ones(1, 1, dtype=torch.int32), **args, **common)
+            res[grid] = (torch.as_tensor(out).reshape(N, keep), torch.as_tensor(outv).reshape(N, keep), n[0])
+        assert res[1][2] > 0 and res[2][2] == res[1][2], (name, res[1][2], res[2][2])
+        assert torch.equal(res[1][0], res[2][0]) and torch.equal(res[1][1], res[2][1]), name
+
+
+def test_dsa_long_select_lnc2_lines_leave_trn1_rev_unchanged():
+    """The grid-2 lines of the long-context selection kernels (marked "# lnc2") are left out of their grid-1 revisions:
+    trn1's graphs keep the keys they had before them; grid-2 launches pass the revisions of the whole texts."""
+    from kiln.kernels import dsa_long_pipe as dp
+    from kiln.kernels import dsa_long_pipe_x as dpx
+    from kiln.kernels import dsa_long_select as dls
+    from kiln.kernels import dsa_long_select_t as dst
+
+    assert (dls.REV, dp.REV, dst.REV, dpx.REV) == (2642970146, 1604308206, 1934064275, 1270195910)
+    assert dls.REV_LNC2 != dls.REV and dp.REV_LNC2 != dp.REV and dst.REV_LNC2 != dst.REV

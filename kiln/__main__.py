@@ -30,7 +30,9 @@ def main() -> None:
     ap.add_argument("--max-num-queued-tokens", type=int, default=None)
     ap.add_argument("--reasoning-parser", default=None, choices=sorted(REASONING_PARSERS))
     ap.add_argument("--tool-call-parser", default=None, choices=sorted(TOOL_PARSERS))
-    ap.add_argument("--spec-method", default=None, choices=["ngram", "suffix", "mtp"])
+    ap.add_argument("--spec-method", default=None, choices=["ngram", "suffix", "mtp", "eagle3"],
+                    help="eagle3: MTP drafting from the EAGLE-3 checkpoint --spec-draft-model (models/eagle3.py)")
+    ap.add_argument("--spec-draft-model", default=None, help="an EAGLE-3 draft checkpoint (local dir or hub id)")
     ap.add_argument("--spec-k", type=int, default=4)
     ap.add_argument("--tp", type=int, default=1, help="tensor-parallel ranks (one NeuronCore each)")
     ap.add_argument("--attention-tp", type=int, default=None,
@@ -63,11 +65,9 @@ def main() -> None:
         fmt = REASONING_PARSERS[args.reasoning_parser]
         rc = {"reasoning_start_str": fmt.start, "reasoning_end_str": fmt.end}
 
-    import uvicorn
-
     from .config import EngineConfig
     from .engine.engine import LLMEngine
-    from .server.api import build_app
+    from .server.api import build_app, serve
 
     cfg = EngineConfig(
         model_path=args.model, device=args.device, dtype=getattr(torch, args.dtype),
@@ -76,7 +76,8 @@ def main() -> None:
         schedule_policy=args.schedule_policy, eviction_policy=args.eviction_policy,
         eviction_policy_config=json.loads(args.radix_eviction_policy_config) if args.radix_eviction_policy_config else None,
         max_num_queued_reqs=args.max_num_queued_reqs, max_num_queued_tokens=args.max_num_queued_tokens,
-        spec_method=args.spec_method, spec_k=args.spec_k, tp=args.tp, attention_tp=args.attention_tp,
+        spec_method="mtp" if args.spec_method == "eagle3" else args.spec_method, spec_draft_model=args.spec_draft_model,
+        spec_k=args.spec_k, tp=args.tp, attention_tp=args.attention_tp,
         dp_attention=args.dp_attention, overlap=args.overlap,
         piecewise=args.piecewise, kv_cache_dtype=args.kv_cache_dtype, compile_cache_uri=args.compile_cache,
         weight_dtype=args.weight_dtype, mxfp4_packed=args.mxfp4_packed,
@@ -87,7 +88,7 @@ def main() -> None:
     engine = LLMEngine(cfg)
     app = build_app(engine, args.served_model_name or args.model, reasoning_parser=args.reasoning_parser,
                     tool_call_parser=args.tool_call_parser)
-    uvicorn.run(app, host=args.host, port=args.port)
+    serve(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

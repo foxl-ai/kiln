@@ -433,6 +433,35 @@ def test_cp_slot_classes_equal_fixed_slots(small):
     assert (got_l[~real] < -1e29).all()
 
 
+@pytest.mark.parametrize("small,frac", [(3, 0.5), (8, 0.5), (8, 1.0), (1, 0.0)])
+def test_cp_slot_classes_x_equal_classes(small, frac):
+    """models/mla.py _cp_attend_classes_x (KILN_DSA_CP_SLOTS_X, kernels/dsa_slots_x.py: each class's rows read and
+    written at their own index, one call) gives _cp_attend_classes' o and lse on every row, both classes populated or
+    one of them empty."""
+    from kiln.models import mla
+
+    g = torch.Generator().manual_seed(9)
+    T, keep, kp, R, H, NP = 13, 8, 4, 16, 3, 40
+    S1 = min(small - 1, keep)
+    nf = int(round(T * frac))
+    end = torch.cat([torch.randint(0, S1 + 1, (nf,), generator=g),
+                     torch.randint(S1 + 1, keep + 1, (T - nf,), generator=g)])[torch.randperm(T, generator=g)]
+    mine = (torch.arange(keep).view(1, keep) < end.view(T, 1)) & (torch.rand(T, keep, generator=g) < 0.8)
+    mine[torch.arange(T), (end - 1).clamp(min=0)] |= end > 0
+    tail_own = torch.rand(T, generator=g) < 0.6
+    rows_sel = torch.randint(0, NP, (T, keep), generator=g)
+    rows_tail = torch.randint(0, NP, (T, 1), generator=g)
+    npool = torch.randint(5, 20, (T,), generator=g)
+    positions = npool * kp + torch.randint(0, kp, (T,), generator=g)
+    kc = torch.randn(NP * kp, 1, R, generator=g)
+    q_all = torch.randn(T, H, R, generator=g) * 0.3
+    args = (q_all, kc, rows_sel, rows_tail, mine, tail_own, npool, positions, 0.25, kp, small, keep + 1)
+    want_o, want_l = mla._cp_attend_classes(*args)
+    got_o, got_l = mla._cp_attend_classes_x(*args)
+    torch.testing.assert_close(got_o, want_o, rtol=0, atol=1e-6)
+    torch.testing.assert_close(got_l, want_l, rtol=0, atol=1e-6)
+
+
 @pytest.mark.parametrize("small", [1, 2])
 def test_cp_engine_slot_classes(sparse, small, monkeypatch):
     """KILN_DSA_CP_SLOT_CLASSES=1 at tp 2 with a small buffer of 1 / 2 slots (so both classes have rows; prefill chunks
@@ -461,6 +490,158 @@ def test_cp_engine_slot_classes(sparse, small, monkeypatch):
     finally:
         eng.close()
     assert got == want
+
+
+@pytest.mark.parametrize("degree,small,plp_vp", [(2, 1, False), (2, 128, False), (2, 128, True), (1, 2, False)])
+def test_cp_rows_engine_matches_replicated(sparse, degree, small, plp_vp, monkeypatch):
+    """KILN_DSA_CP_DEGREE (models/mla.py attention_cp_rows): at tp 4 and DP attention 1 the DSA caches are context
+    parallel over 2 ranks inside 2 row groups (degree 2), each row group writing its share of every chunk row and
+    selecting and attending its half of the rows with every head, decode batches through attention_cp inside each row
+    group; the slot classes' small buffer of 1 slot (every row in the full buffer) or 128 (every row in the small
+    one). The greedy tokens and the prompt and token logprobs equal the replicated long path's at tp=1 (fp32) and the
+    tokens equal transformers', through chunked prefill (chunks that cut pools, sequence-parallel streams), a prefix
+    hit and batched decode. degree 1 is refused (a context-parallel degree is at least 2). plp_vp: the prompt logprobs
+    scored on each rank's vocabulary shard (KILN_PLP_VP, models/decoder.py _score_rows), the same within 2e-5."""
+    from kiln.engine.request import SamplingParams
+    from kiln.models import decoder, mla
+
+    path, hf = sparse
+    monkeypatch.setenv("KILN_DSA_POOL_CACHE", "separate")
+    monkeypatch.setattr(mla, "POOL_CACHE", "separate")
+    ps = glm.prompts(4, (37, 70, 9))
+    ps.append(ps[1][:48] + ps[0][:20])
+    sp = SamplingParams(max_new_tokens=10, ignore_eos=True, logprobs=0, prompt_logprobs=0)
+    kw = dict(page_size=8, max_prefill_tokens=12, max_num_seqs=4)
+    _, want = _generate(path, ps, 10, 16, monkeypatch, **kw)
+    assert [r.output_ids for r in want] == [glm.hf_greedy(hf, x, 10) for x in ps]
+    eng0 = glm.engine(path, **kw)
+    try:
+        ref = eng0.generate(ps, sp)
+    finally:
+        eng0.close()
+    monkeypatch.setenv("KILN_DSA_CP", "1")
+    monkeypatch.setenv("KILN_DSA_CP_DEGREE", str(degree))
+    monkeypatch.setenv("KILN_DSA_CP_SLOTS_SMALL", str(small))  # the spawned ranks read it at import
+    monkeypatch.setattr(mla, "CP_SLOTS_SMALL", small)
+    if plp_vp:  # rank 0 (this process) and the spawned ranks alike
+        monkeypatch.setenv("KILN_PLP_VP", "1")
+        monkeypatch.setattr(decoder, "PLP_VP", True)
+    if degree < 2:
+        with pytest.raises(ValueError):
+            dsa_long.cp_degree(4)
+        return
+    calls = {"rows": 0}
+    real = mla.attention_cp_rows
+
+    def counted(*a, **k):
+        calls["rows"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(mla, "attention_cp_rows", counted)
+    eng = glm.engine(path, tp=4, **kw)
+    try:
+        assert (eng.model.cp, eng.model.cp_rows, eng.model.attn_tp) == (2, 2, 4)
+        assert eng.runner.lps == 8 // 2
+        got = eng.generate(ps, sp)
+    finally:
+        eng.close()
+    assert calls["rows"] > 0
+    assert [r.output_ids for r in got] == [r.output_ids for r in want]
+    for g, w in zip(got, ref):
+        assert g.output_ids == w.output_ids
+        torch.testing.assert_close(torch.tensor([x[0] for x in g.logprobs]), torch.tensor([x[0] for x in w.logprobs]),
+                                   rtol=0, atol=2e-5)
+        assert sorted(g.prompt_logprobs) == sorted(w.prompt_logprobs)
+        torch.testing.assert_close(torch.tensor([v[0] for _, v in sorted(g.prompt_logprobs.items())]),
+                                   torch.tensor([v[0] for _, v in sorted(w.prompt_logprobs.items())]), rtol=0, atol=2e-5)
+
+
+def test_cp_rows_minimal_matches_replicated(tmp_path, monkeypatch):
+    """KILN_DSA_CP_DEGREE over the minimal layout (KILN_DSA_KV=minimal, models/mla.py attention_cp_rows' minimal branch):
+    at tp 4, 2 row groups of CP 2, V holding the owner's pool-key pieces and every rank the request's open-pool row. The
+    same greedy tokens and logprobs (2e-5) as the replicated minimal long path at tp=1 and transformers' tokens, through
+    chunks of 12 that cut pools of 4, a prefix hit and batched decode."""
+    from kiln.engine.request import SamplingParams
+    from kiln.models import mla
+
+    path = str(tmp_path)
+    hf = glm.build(path, seed=1, index_topk=16, max_position_embeddings=4096)
+    monkeypatch.setenv("KILN_DSA_KV", "minimal")
+    monkeypatch.setattr(mla, "KV_LAYOUT", "minimal")
+    ps = glm.prompts(5, (37, 70, 9, 23))
+    ps.append(ps[1][:48] + ps[0][:21])
+    kw = dict(page_size=8, max_prefill_tokens=12, max_num_seqs=4)
+    _, want = _generate(path, ps, 10, 16, monkeypatch, **kw)
+    assert [r.output_ids for r in want] == [glm.hf_greedy(hf, x, 10) for x in ps]
+    monkeypatch.setenv("KILN_DSA_CP", "1")
+    monkeypatch.setenv("KILN_DSA_CP_DEGREE", "2")
+    calls = {"rows": 0}
+    real = mla.attention_cp_rows
+
+    def counted(*a, **k):
+        calls["rows"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(mla, "attention_cp_rows", counted)
+    eng = glm.engine(path, tp=4, **kw)
+    try:
+        assert (eng.model.cp, eng.model.cp_rows) == (2, 2) and eng.runner.lps == 8 // 2
+        layers = [l for l in eng.model.kv_layers() if l.spec.mla is not None]
+        assert all(l.pool_key is None and l.open_pool is not None for l in layers)
+        got = eng.generate(ps, SamplingParams(max_new_tokens=10, ignore_eos=True, logprobs=0))
+    finally:
+        eng.close()
+    assert calls["rows"] > 0
+    assert [r.output_ids for r in got] == [r.output_ids for r in want]
+    for a, b in zip(got, want):
+        torch.testing.assert_close(torch.tensor([x[0] for x in a.logprobs]), torch.tensor([x[0] for x in b.logprobs]),
+                                   rtol=0, atol=2e-5)
+
+
+@pytest.mark.parametrize("F", [128, 1])
+def test_cp_rows_local_k(tmp_path, F, monkeypatch):
+    """KILN_DSA_CP_LOCAL_K (models/mla.py attention_cp_rows): each rank keeps its top K + 8 local pools (K 16 against
+    keep 32: index_topk 128, pools of 4, 2 row groups of CP 2 at tp 4), the merge runs over the top K, the
+    certificate flags the rows it cannot prove exact and those (up to KILN_DSA_CP_LOCAL_F per chunk) are selected
+    and attended again from the whole lists, the rest attend through one slot buffer. With F = 128 every failed row
+    is redone: the greedy tokens and logprobs (2e-5) equal the replicated long path's at tp=1 and transformers'
+    tokens, and some rows did fail (so the redo ran). With F = 1 rows past F are counted (they are not exact)."""
+    from kiln.engine.request import SamplingParams
+    from kiln.models import mla
+
+    path = str(tmp_path)
+    hf = glm.build(path, seed=3, index_topk=128, max_position_embeddings=4096)
+    monkeypatch.setenv("KILN_DSA_POOL_CACHE", "separate")
+    monkeypatch.setattr(mla, "POOL_CACHE", "separate")
+    ps = glm.prompts(6, (230, 301, 9))
+    ps.append(ps[1][:120] + ps[0][:40])
+    kw = dict(page_size=8, max_prefill_tokens=48, max_num_seqs=4, max_model_len=512)
+    sp = SamplingParams(max_new_tokens=8, ignore_eos=True, logprobs=0)
+    _, want = _generate(path, ps, 8, 16, monkeypatch, **kw)
+    assert [r.output_ids for r in want] == [glm.hf_greedy(hf, x, 8) for x in ps]
+    for k, v in (("KILN_DSA_CP", "1"), ("KILN_DSA_CP_DEGREE", "2"), ("KILN_DSA_CP_SLOTS_SMALL", "128"),
+                 ("KILN_DSA_CP_LOCAL_K", "16"), ("KILN_DSA_CP_LOCAL_F", str(F))):
+        monkeypatch.setenv(k, v)  # the spawned ranks read them at import
+    monkeypatch.setattr(mla, "CP_SLOTS_SMALL", 128)
+    monkeypatch.setattr(mla, "CP_LOCAL_K", 16)
+    monkeypatch.setattr(mla, "CP_LOCAL_F", F)
+    eng = glm.engine(path, tp=4, **kw)
+    try:
+        assert (eng.model.cp, eng.model.cp_rows) == (2, 2)
+        got = eng.generate(ps, sp)
+        cnt = sum(l.cp_localk.cpu().double() for l in eng.model.kv_layers() if hasattr(l, "cp_localk"))
+    finally:
+        eng.close()
+    rows, failed, past = cnt.tolist()
+    assert rows > 0 and failed > 0
+    if F >= 128:
+        assert past == 0
+        assert [r.output_ids for r in got] == [r.output_ids for r in want]
+        for a, b in zip(got, want):
+            torch.testing.assert_close(torch.tensor([x[0] for x in a.logprobs]),
+                                       torch.tensor([x[0] for x in b.logprobs]), rtol=0, atol=2e-5)
+    else:
+        assert past > 0
 
 
 def test_cp_engine_fewer_local_pools_than_keep(tmp_path, monkeypatch):
@@ -806,6 +987,49 @@ def test_cp_engine_all_local(tmp_path, all_local, page_keys, layout, monkeypatch
         assert [x[0] for x in a.logprobs] == [x[0] for x in b.logprobs]
     if seen and all_local:  # the spy sees rank 0's calls when it runs in this process
         assert max(seen) <= 16
+
+
+@pytest.mark.parametrize("layout,all_local", [("full", 1), ("minimal", 1), ("full", 0)])
+def test_cp_engine_decode_compact(tmp_path, layout, all_local, monkeypatch):
+    """KILN_DSA_CP_DECODE_COMPACT (kernels/dsa_slots_c.py, its emulation on the CPU: each decode row over its compacted
+    live slots) at tp 2, with and without KILN_DSA_CP_ALL_LOCAL + PAGE_KEYS: the greedy tokens equal the CP engine's
+    without it and its logprobs agree to fp32 summation order; prefill chunks are unchanged (the flag reads decode
+    batches only)."""
+    from kiln.engine.request import SamplingParams
+    from kiln.models import mla
+
+    path = str(tmp_path)
+    glm.build(path, seed=2, index_topk=64, max_position_embeddings=4096)
+    if layout == "minimal":
+        monkeypatch.setenv("KILN_DSA_KV", "minimal")
+        monkeypatch.setattr(mla, "KV_LAYOUT", "minimal")
+    else:
+        monkeypatch.setenv("KILN_DSA_POOL_CACHE", "separate")
+        monkeypatch.setattr(mla, "POOL_CACHE", "separate")
+    monkeypatch.setenv("KILN_DSA_CP_ALL_LOCAL", str(all_local))
+    monkeypatch.setenv("KILN_DSA_CP_PAGE_KEYS", str(all_local))
+    monkeypatch.setattr(mla, "CP_ALL_LOCAL", bool(all_local))
+    monkeypatch.setattr(mla, "CP_PAGE_KEYS", bool(all_local))
+    ps = glm.prompts(6, (41, 9, 66, 119, 125))
+    sp = SamplingParams(max_new_tokens=8, ignore_eos=True, logprobs=0)
+    kw = dict(page_size=8, max_prefill_tokens=12, max_num_seqs=4)
+    monkeypatch.setenv("KILN_DSA_CP", "1")
+    eng = glm.engine(path, tp=2, **kw)
+    try:
+        want = eng.generate(ps, sp)
+    finally:
+        eng.close()
+    monkeypatch.setenv("KILN_DSA_CP_DECODE_COMPACT", "1")
+    monkeypatch.setattr(mla, "CP_DECODE_COMPACT", True)
+    eng = glm.engine(path, tp=2, **kw)
+    try:
+        got = eng.generate(ps, sp)
+    finally:
+        eng.close()
+    assert [r.output_ids for r in got] == [r.output_ids for r in want]
+    for a, b in zip(got, want):
+        for x, y in zip(a.logprobs, b.logprobs):
+            assert abs(x[0] - y[0]) < 1e-4, (x, y)
 
 
 @pytest.mark.parametrize("A", [2, 8])

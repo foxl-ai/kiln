@@ -123,11 +123,30 @@ def test_glm5_next_async_mtp_equals_sync(tmp_path):
         assert got[0] == plain[0]
 
 
+def test_mtp_prep_gives_the_later_passes_positions_for_k_above_1():
+    """k = 3: after spec_post the board's newest token sits at base; the first MTP pass covers base_old .. base_old
+    + k with last index acc, the later two passes positions base and base + 1 (mtp_launch's last + 1 + s)."""
+    Q, k, ps = 4, 3, 4
+    board = torch.zeros(4, sa.width(Q, k))
+    board[1, :Q] = torch.tensor([61.0, 70.0, 0.0, 0.0])
+    board[1, Q:Q + 4] = torch.tensor([1.0, 13.0, 0.0, 1.0])  # acc 1, newest token at 13
+    slot_idx, valid = torch.tensor([1, 3]), torch.tensor([1.0, 0.0])
+    table = torch.tensor([[20, 21, 22, 23, 24], [0, 0, 0, 0, 0]])
+    pad = torch.full((2, Q), -7, dtype=torch.int64)
+    T, last, pos, slot, rpos, rslot = sa.mtp_prep(board, slot_idx, table, pad, valid, Q, ps, 1, None, k)
+    assert last[0] == 1 and pos[0].tolist() == [11, 12, 13, 14]
+    assert rpos[0].tolist() == [13, 14] and rslot[0].tolist() == [23 * 4 + 1, 23 * 4 + 2]
+    assert rpos[1].tolist() == [0, 0] and rslot[1].tolist() == [-7, -7]
+    assert len(sa.mtp_prep(board, slot_idx, table, pad, valid, Q, ps, 1)) == 4  # k 1: the graph is unchanged
+
+
+@pytest.mark.parametrize("k", [1, 3])
 @pytest.mark.parametrize("name", ["deepseek_v3", "glm_moe_dsa"])
-def test_mla_async_mtp_with_accepted_drafts_equals_sync(tmp_path, name):
+def test_mla_async_mtp_with_accepted_drafts_equals_sync(tmp_path, name, k):
     """DeepSeek-V3 and GLM-5.3 (MLA, DSA) whose MTP layer is the target's own copy (tests/test_mtp_mla.py
-    build_with_mtp copy_main: most drafts accepted, so both branches of every board update run), k=1: the blind
-    engine's tokens, logprobs and accepted count equal the synchronous MTP engine's, and its tokens plain greedy's."""
+    build_with_mtp copy_main: most drafts accepted, so both branches of every board update run), k=1 and k=3 (the
+    later passes' positions from mtp_prep): the blind engine's tokens, logprobs and accepted count equal the
+    synchronous MTP engine's, and its tokens plain greedy's."""
     from tests.test_mtp_mla import MODELS, build_with_mtp, engine
 
     build_with_mtp(name, str(tmp_path), seed=2, copy_main=True, num_hidden_layers=1, **MODELS[name])
@@ -136,18 +155,18 @@ def test_mla_async_mtp_with_accepted_drafts_equals_sync(tmp_path, name):
     plain = engine(str(tmp_path), spec_method=None, max_num_seqs=3)
     want = _gen(plain, ps, 24)
     plain.close()
-    sync = engine(str(tmp_path), max_num_seqs=3, spec_k=1)
+    sync = engine(str(tmp_path), max_num_seqs=3, spec_k=k)
     ref = _gen(sync, ps, 24)
     sync.close()
-    asy = engine(str(tmp_path), max_num_seqs=3, spec_k=1, overlap=True, spec_async=True)
+    asy = engine(str(tmp_path), max_num_seqs=3, spec_k=k, overlap=True, spec_async=True)
     assert asy.runner.spec_async
     w = asy.warmup()  # the small graphs too, on scratch slots only: the output below is unchanged
     assert any(k[0] == "spec_prep" for k in asy.runner.compile_seconds), w
     got = _gen(asy, ps, 24)
     asy.close()
-    _compare(f"{name} async MTP (copied layer)", got, ref)
+    _compare(f"{name} async MTP k={k} (copied layer)", got, ref)
     assert got[0] == want[0]
-    assert ref[2][1] / max(ref[2][0], 1) > 0.5  # the accepted branch ran
+    assert ref[2][1] / max(ref[2][0], 1) > (0.5 if k == 1 else 0.2)  # the accepted branch ran
 
 
 def test_glm5_next_async_with_oracle_drafts_accepts_and_keeps_greedy(tmp_path, monkeypatch):

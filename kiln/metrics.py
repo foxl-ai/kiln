@@ -82,6 +82,7 @@ class Metrics:
             f"kiln:jump_forward_tokens_total {engine.jump_forward_tokens}",
         ]
         lines += pd_lines(engine, loop)
+        lines += startup_lines(engine)
         with self.lock:
             lines += [
                 "# TYPE kiln:prompt_tokens_total counter", f"kiln:prompt_tokens_total {self.prompt_tokens}",
@@ -117,6 +118,17 @@ def pd_lines(engine, loop=None) -> list[str]:
     out.append(f"kiln:pd_inject_read_seconds_total {getattr(r, 'pd_inject_read_seconds', 0.0):.6f}")
     out.append(f"kiln:pd_inject_copies_total {getattr(r, 'pd_inject_copies', 0)}")
     out.append(f"kiln:pd_extract_runs_total {getattr(r, 'pd_extract_runs', 0)}")
+    nx = getattr(r, "_nixl", None)
+    if nx is not None:  # KILN_PD_TRANSPORT=nixl: rank 0's reads (decode) and the prefill engine's pins
+        h = Histogram()
+        for t in list(nx.read_times):
+            h.observe(t)
+        out += [f"kiln:pd_nixl_reads_total {nx.reads}", f"kiln:pd_nixl_read_bytes_total {nx.read_bytes}",
+                f"kiln:pd_nixl_read_seconds_total {nx.read_seconds:.6f}", "# TYPE kiln:pd_nixl_read_seconds histogram"]
+        out += h.lines("kiln:pd_nixl_read_seconds")
+        pins = getattr(engine, "_pd_pins", {})
+        seats = sum(g.pd_pinned for g in getattr(engine.scheduler, "groups", [engine.scheduler]))
+        out += ["# TYPE kiln:pd_nixl_pins gauge", f"kiln:pd_nixl_pins {len(pins)}", f"kiln:pd_nixl_pinned_seats {seats}"]
     snd = getattr(r, "_pd_snd", None)
     if snd is not None:
         st = snd.stats
@@ -141,7 +153,55 @@ def pd_lines(engine, loop=None) -> list[str]:
                 h.observe(t)
             out.append("# TYPE kiln:pd_transfer_seconds histogram")
             out += h.lines("kiln:pd_transfer_seconds")
+            out += [f"kiln:pd_recv_nixl_total {st.nixl}", f"kiln:pd_recv_nixl_bytes_total {st.nixl_bytes}",
+                    f"kiln:pd_recv_hellos_total {st.hellos}"]
+        # The prefill engine's handoff (its wall clock, in the meta) to rank 0's rows being in this engine's caches, per
+        # handoff, either transport: includes the wait for admission here.
+        h = Histogram()
+        for t in list(getattr(engine, "pd_handoff_seconds", [])):
+            h.observe(t)
+        out.append("# TYPE kiln:pd_handoff_seconds histogram")
+        out += h.lines("kiln:pd_handoff_seconds")
         if loop is not None:
             out += [f"kiln:pd_awaiting {len(loop.awaits)}", f"kiln:pd_arrived_unclaimed {len(loop.arrived)}",
                     f"kiln:pd_expired_total {loop.pd_expired}"]
+    return out
+
+
+def _bucket(key) -> str:
+    """A graph key as vllm-neuron's bucket_name label (e.g. prefill_s1024): the key's parts joined by "_"."""
+    return "_".join(str(k) for k in (key if isinstance(key, tuple) else (key,)))
+
+
+def startup_lines(engine) -> list[str]:
+    """vllm-neuron 0.24's start-up and per-graph metrics (docs/guides/features-guide.md "Neuron-specific metrics" at
+    release-0.24.0.1.1.0), under kiln: with Kiln's graph keys as the bucket label:
+    - startup_time_seconds: engine construction to the end of warmup;
+    - compilation_time_seconds{bucket}: a graph's first call (compile, or the load of a cached NEFF);
+    - model_load_time_seconds: the shard load;
+    - model_load_size_bytes: rank 0's parameters on the device;
+    - neff_execution_count{bucket}: graph executions;
+    - precompile_seconds: kiln/precompile.py's capture + parallel compile, when it ran."""
+    runner = getattr(engine, "runner", None)
+    out = []
+    if getattr(engine, "startup_seconds", None) is not None:
+        out += ["# TYPE kiln:startup_time_seconds gauge", f"kiln:startup_time_seconds {engine.startup_seconds:.3f}"]
+    if getattr(engine, "load_seconds", None) is not None:
+        out += ["# TYPE kiln:model_load_time_seconds gauge", f"kiln:model_load_time_seconds {engine.load_seconds:.3f}"]
+    model = getattr(engine, "model", None)
+    if model is not None and hasattr(model, "parameters"):
+        n = sum(p.numel() * p.element_size() for p in model.parameters())
+        out += ["# TYPE kiln:model_load_size_bytes gauge", f"kiln:model_load_size_bytes {n}"]
+    pre = getattr(engine, "precompile", None)
+    if pre:
+        out += ["# TYPE kiln:precompile_seconds gauge", f"kiln:precompile_seconds {pre['wall_seconds']}"]
+    if runner is not None:
+        cs = dict(getattr(runner, "compile_seconds", {}))
+        if cs:
+            out.append("# TYPE kiln:compilation_time_seconds gauge")
+            out += [f'kiln:compilation_time_seconds{{bucket_name="{_bucket(k)}"}} {v:.3f}' for k, v in cs.items()]
+        ec = dict(getattr(runner, "exec_counts", {}))
+        if ec:
+            out.append("# TYPE kiln:neff_execution_count counter")
+            out += [f'kiln:neff_execution_count{{bucket_name="{_bucket(k)}"}} {v}' for k, v in ec.items()]
     return out

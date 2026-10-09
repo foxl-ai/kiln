@@ -544,11 +544,15 @@ def kernel():
 
 # (chunk, v head) units interleaved. GLM-5.3-Flash KDA, 8 heads, trn1.2xlarge (tools/probe_delta_rule.py,
 # 2026-10-04): C=8192 10.84 / 8.37 / 8.73 / 8.68 ms at 1 / 2 / 4 / 6 units (C=2048 2.85 / 2.24 / 2.32 / 2.28).
-UNIT_GROUP = int(os.environ.get("KILN_DELTA_RULE_UNITS", 2))
+# KILN_DELTA_RULE_UNITS overrides the caller's ug (chunk(ug=...): 6 for glm5_next since 2026-10-07, bit-identical to
+# 2 and -0.13 / -0.17 ms per KDA layer at its R8 / G64 rank shapes, tools/probe_delta_rule_v2.py), else 2.
+UNIT_ENV = os.environ.get("KILN_DELTA_RULE_UNITS")
+UNIT_GROUP = int(UNIT_ENV or 2)
 
 
-def kernel_inputs(q, k, v, g, beta, S0, device=None):
-    """The kernel's arguments; T must be a multiple of 128 (chunk() pads)."""
+def kernel_inputs(q, k, v, g, beta, S0, device=None, ug: int | None = None):
+    """The kernel's arguments; T must be a multiple of 128 (chunk() pads); ug: the unit group (KILN_DELTA_RULE_UNITS
+    wins, else ug, else 2)."""
     T, Hk, Dk = k.shape
     Hv, Dv = v.shape[1:]
     if Dk != 128 or Dv != 128 or Hv % Hk:
@@ -558,13 +562,15 @@ def kernel_inputs(q, k, v, g, beta, S0, device=None):
     kind = KINDS["kda"] if g.dim() == 3 else KINDS["gdn"]
     return dict(q=q.float().contiguous(), k=k.float().contiguous(), v=v.float().contiguous(),
                 g=g.float().contiguous(), beta=beta.float().contiguous(), S0=S0.float().contiguous(),
-                cst=consts(device if device is not None else q.device), kind=kind, ug=UNIT_GROUP, rev=REV)
+                cst=consts(device if device is not None else q.device), kind=kind,
+                ug=int(UNIT_ENV) if UNIT_ENV else (ug or UNIT_GROUP), rev=REV)
 
 
-def chunk(q, k, v, g, beta, S0):
+def chunk(q, k, v, g, beta, S0, keep_pad: bool = False, ug: int | None = None):
     """linear_attn.chunk_scan's contract on the device inside the caller's graph: o [T, Hv, Dv] and
     the final state, fp32. T is padded to whole chunks with beta = g = 0 (the state is unchanged
-    by padding)."""
+    by padding); keep_pad returns o with its padding rows (a consumer that reads only the first T rows, as
+    kernels/gated_norm.py, then takes the kernel's output as is instead of a sliced copy)."""
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
     T = q.shape[0]
@@ -581,5 +587,5 @@ def chunk(q, k, v, g, beta, S0):
         # The runtime's LNC as the grid (platform.nki_grid: 2 on trn2, each physical core its own heads); grid 1
         # as before the split when KILN_LNC_SPLIT leaves this kernel out.
         grid = platform.nki_grid() if platform.lnc_split("delta_rule") else 1
-        o, S = wrap_nki(kernel())[grid](**kernel_inputs(q, k, v, g, beta, S0))
-    return (o[:T] if pad else o), S
+        o, S = wrap_nki(kernel())[grid](**kernel_inputs(q, k, v, g, beta, S0, ug=ug))
+    return (o[:T] if pad and not keep_pad else o), S

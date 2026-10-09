@@ -9,14 +9,18 @@ stops spending device time on output nobody will read.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import math
 import os
 import queue
+import signal
+import sys
 import threading
 import time
 import traceback
 import uuid
+import weakref
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI, HTTPException, Request as HTTPRequest
@@ -60,10 +64,36 @@ class _Submit:
 # How long a decode engine keeps a handoff nobody waits for, and a request waits for its handoff.
 PD_AWAIT_TIMEOUT_S = float(os.environ.get("KILN_PD_AWAIT_TIMEOUT_S", "600"))
 
+# Engine loops of this process, held weakly: at exit each loop's thread stops after its step and then its engine
+# closes (LLMEngine.close is idempotent; engine.py's own exit hook, which runs after this one, holds only
+# tensor-parallel engines, so a tp 1 pipeline stage 0 never sent its following stages the close frame).
+_LOOPS: weakref.WeakSet = weakref.WeakSet()
+
+
+@atexit.register
+def _stop_loops() -> None:
+    for lp in list(_LOOPS):
+        lp.stop()
+        lp.engine.close()
+
+
+def serve(app: FastAPI, **kwargs) -> None:
+    """uvicorn.run(app, **kwargs), with a SIGTERM that ends the process through SystemExit (status 143) once the server
+    has shut down. uvicorn 0.52 restores the previous handler and raises the signal again (Server.capture_signals);
+    under SIG_DFL that killed the process there, before atexit: no LLMEngine.close (the tensor-parallel workers died in
+    a broadcast, "Connection closed by peer"), no close frame from a pipeline's stage 0, no KILN_DSA_CP_LOCAL_K report,
+    and every server's KILN_TIMELINE 0 bytes (kiln-pd4-dec, 2026-10-07)."""
+    import uvicorn
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
+    uvicorn.run(app, **kwargs)
+
 
 class EngineLoop:
     def __init__(self, engine: LLMEngine):
         self.engine = engine
+        self._stopping = threading.Event()
         self.metrics = Metrics()
         self.inbox: queue.Queue = queue.Queue()
         self.streams: dict[str, _Stream] = {}
@@ -82,6 +112,17 @@ class EngineLoop:
         engine.pd_wake = lambda: self.inbox.put(("wake", None))
         self.thread = threading.Thread(target=self._run, name="kiln-engine", daemon=True)
         self.thread.start()
+        _LOOPS.add(self)
+
+    def stop(self, wait: float = 120.0) -> None:
+        """End the engine thread after its current step (at exit, before the engine closes). Idempotent."""
+        self._stopping.set()
+        self.inbox.put(("wake", None))
+        if self.thread.is_alive() and self.thread is not threading.current_thread():
+            self.thread.join(wait)
+            if self.thread.is_alive():
+                print(f"kiln: the engine thread did not stop within {wait:.0f} s; closing the engine anyway",
+                      flush=True)
 
     def submit_await(self, xfer: str, prompt_ids: list[int], params: SamplingParams) -> _Submit:
         """A decode engine's half of a disaggregated request: stream the request handoff `xfer` brings."""
@@ -217,7 +258,7 @@ class EngineLoop:
                 return
 
     def _run(self) -> None:
-        while True:
+        while not self._stopping.is_set():
             self._drain(block=not self.engine.has_work())
             if self.engine.pd_role == "decode":
                 self._pd_poll()
@@ -393,6 +434,10 @@ def build_app(engine: LLMEngine, model_name: str, reasoning_parser: str | None =
         out = {"status": "ok", "role": engine.pd_role or "both", "max_num_seqs": engine.cfg.max_num_seqs}
         if engine.pd_role is not None:
             out["layout"] = engine.runner.pd_signature()
+        if getattr(engine.cfg, "pp_stages", 1) > 1:  # a pipeline stage (engine/pp.py): the PD router's prefill units
+            lo, hi = getattr(engine.runner.model, "load_range", None) or (None, None)
+            out["pp"] = {"stage": engine.cfg.pp_stage, "stages": engine.cfg.pp_stages, "layers": [lo, hi],
+                         "follow": bool(getattr(engine.cfg, "pp_follow", False))}
         if engine.pd_role == "decode":
             out["pd_address"] = getattr(engine, "pd_address", None)
             out["pd_buffer_bytes"] = int(engine.cfg.pd_buffer_gb * 2**30)
@@ -729,6 +774,9 @@ def build_app(engine: LLMEngine, model_name: str, reasoning_parser: str | None =
                     pairs = list(zip(ids, lps)) if lps is not None else None
                     if text or finish or pairs:
                         for c in (chat_chunks(text, finish, pairs) if chat else [chunk(text, finish, pairs)]):
+                            if return_ids and ids:  # vLLM's return_token_ids, per streamed chunk too
+                                c["choices"][0]["token_ids"] = [int(t) for t in ids]
+                                ids = []
                             yield f"data: {json.dumps(c)}\n\n"
                     if finish is not None:
                         completed = True
@@ -842,5 +890,41 @@ def build_app(engine: LLMEngine, model_name: str, reasoning_parser: str | None =
                                stream=bool(body.get("stream")), priority=int(body.get("priority", 0)),
                                parse=parse, session_id=body.get("session_id"), tool_choice=tool_choice,
                                pd=body.get("kiln_pd"))
+
+    # vLLM's /tokenize and /detokenize (v0.24.0 vllm/entrypoints/serve/tokenize/protocol.py: TokenizeCompletionRequest
+    # {prompt, add_special_tokens=True, return_token_strs=False}, TokenizeChatRequest {messages,
+    # add_generation_prompt=True, continue_final_message=False, add_special_tokens=False, chat_template_kwargs, tools},
+    # TokenizeResponse {count, max_model_len, tokens, token_strs}, DetokenizeRequest {tokens}, DetokenizeResponse
+    # {prompt}), which vllm-neuron serves through vLLM's API server.
+    @app.post("/tokenize")
+    async def tokenize(http: HTTPRequest):
+        body = await http.json()
+        if "messages" in body:
+            if body.get("continue_final_message") and body.get("add_generation_prompt", True):
+                raise HTTPException(status_code=400, detail="Cannot set both `continue_final_message` and "
+                                                            "`add_generation_prompt` to True.")
+            kwargs = dict(body.get("chat_template_kwargs") or {})
+            if body.get("tools"):
+                kwargs["tools"] = body["tools"]
+            text = tok.apply_chat_template(body["messages"], add_generation_prompt=body.get("add_generation_prompt", True),
+                                           continue_final_message=bool(body.get("continue_final_message")),
+                                           tokenize=False, **kwargs)
+            ids = tok(text, add_special_tokens=bool(body.get("add_special_tokens", False)))["input_ids"]
+        elif isinstance(body.get("prompt"), str):
+            ids = tok(body["prompt"], add_special_tokens=bool(body.get("add_special_tokens", True)))["input_ids"]
+        else:
+            raise HTTPException(status_code=400, detail="prompt (a string) or messages is required")
+        out = {"count": len(ids), "max_model_len": engine.cfg.max_model_len, "tokens": list(ids)}
+        if body.get("return_token_strs"):
+            out["token_strs"] = tok.convert_ids_to_tokens(list(ids))
+        return out
+
+    @app.post("/detokenize")
+    async def detokenize(http: HTTPRequest):
+        body = await http.json()
+        ids = body.get("tokens")
+        if not isinstance(ids, list) or not all(isinstance(t, int) and t >= 0 for t in ids):
+            raise HTTPException(status_code=400, detail="tokens must be a list of non-negative integers")
+        return {"prompt": tok.decode(ids)}
 
     return app

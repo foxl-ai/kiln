@@ -146,10 +146,27 @@ def main() -> None:
     ap.add_argument("--decode-box-price", type=float, default=None)
     ap.add_argument("--metrics", default="", help="comma list of server URLs whose /metrics to record per level")
     ap.add_argument("--out", default=None, help="append one JSON line per level")
+    ap.add_argument("--prompt-ids", default=None,
+                    help="a 1-D int .npy of a tokenized real text (tools/text_prompt_ids.py): prompts are its consecutive, "
+                         "non-overlapping --input-len windows in the order asked for (warm-up first), instead of random ids "
+                         "(random ids route far more skewed than text: docs/neuron-notes.md \"EPLB on real text\")")
     a = ap.parse_args()
     rng = random.Random(a.seed)
+    text = None
+    if a.prompt_ids:
+        import numpy as np
+
+        text = {"ids": np.load(a.prompt_ids).astype(np.int64), "next": 0}
+        print(f"prompts: windows of {a.prompt_ids} ({len(text['ids'])} ids, {len(text['ids']) // a.input_len} windows)",
+              flush=True)
 
     def prompt():
+        if text is not None:
+            i = text["next"]
+            if (i + 1) * a.input_len > len(text["ids"]):
+                raise SystemExit(f"--prompt-ids ran out of windows after {i} prompts")
+            text["next"] = i + 1
+            return text["ids"][i * a.input_len:(i + 1) * a.input_len].tolist()
         return [rng.randrange(1000, a.vocab) for _ in range(a.input_len)]
 
     pp = a.prefill_box_price if a.prefill_box_price is not None else a.box_price

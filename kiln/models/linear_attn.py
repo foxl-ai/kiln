@@ -46,6 +46,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..config import LinearSpec
+from ..kernels import gated_norm
 
 NEG = -1e30
 # Tokens per sub-chunk of the chunked delta rule (the references use 64), per kind. KDA's
@@ -329,7 +330,12 @@ def _act_fn(name: str):
 def _causal_conv(xe: torch.Tensor, w: torch.Tensor, T: int) -> torch.Tensor:
     """Depthwise causal conv: xe [..., K - 1 + T, D] holds the K - 1 inputs before the T new
     ones, w [D, K]; out[t] = sum_j w[:, j] * xe[t + j], as F.conv1d with K - 1 left padding
-    (the references' causal_conv1d_fn / causal_conv1d_update). Accumulated in fp32."""
+    (the references' causal_conv1d_fn / causal_conv1d_update). Accumulated in fp32. Chunk and sequence forms on the
+    device run kernels/short_conv.py under KILN_LA_CONV_KERNEL=nki (the same products in the same order)."""
+    from ..kernels import short_conv
+
+    if short_conv.takes(xe, w, T):
+        return short_conv.conv(xe, w)
     K = w.shape[1]
     wf = w.float()
     y = xe[..., 0:T, :].float() * wf[:, 0]
@@ -540,12 +546,13 @@ def kernel_takes(spec: LinearSpec) -> bool:
 PROBE_LAST_STATE_ONLY = os.environ.get("KILN_PROBE_VERIFY_LAST_STATE_ONLY") == "1"
 
 
-def _nki_chunk(q, k, v, g, beta, S):
+def _nki_chunk(q, k, v, g, beta, S, keep_pad: bool = False, ug: int | None = None):
     """chunk_scan's contract through the NKI kernel (q, k with the layer's k heads: the kernel maps
-    each v head onto its k head itself)."""
+    each v head onto its k head itself); keep_pad: o with the kernel's padding rows, ug: its unit group
+    (delta_rule.chunk)."""
     from ..kernels import delta_rule
 
-    return delta_rule.chunk(q, k, v, g, beta, S)
+    return delta_rule.chunk(q, k, v, g, beta, S, keep_pad=keep_pad, ug=ug)
 
 
 def _write_rows(pool: torch.Tensor, rows: torch.Tensor, values: torch.Tensor) -> None:
@@ -797,7 +804,15 @@ def _mix_rows(model, layer, x: torch.Tensor, positions: torch.Tensor, slot_mappi
     if nv != nk and not nki_prefill:  # each k head serves nv / nk consecutive v heads (repeat_interleave)
         q = q.unsqueeze(2).expand(T, nk, nv // nk, dk).reshape(T, nv, dk)
         k = k.unsqueeze(2).expand(T, nk, nv // nk, dk).reshape(T, nv, dk)
-    scan = _nki_chunk if nki_prefill else (lambda *a: chunk_scan(*a, CHUNK or CHUNKS[sp.kind]))
+    # The gated norm below as one kernel on the delta rule's output (kernels/gated_norm.py), and the delta rule's unit
+    # group: GLM-5.3-Flash's defaults since 2026-10-07 (KILN_KDA_FUSED_NORM / KILN_DELTA_RULE_UNITS override them).
+    glm = getattr(cfg, "hybrid", None) is not None and cfg.hybrid.family == "glm5_next"
+    fused_norm = nki_prefill and dt == torch.bfloat16 and gated_norm.takes(sp.kind, sp.gate_act, dv, default=glm)
+    if nki_prefill:
+        # (another model keeps engine-v0's call unless it opts in, so its traced graphs stay as they were)
+        scan = (lambda *a: _nki_chunk(*a, keep_pad=fused_norm, ug=6 if glm else None)) if glm or fused_norm else _nki_chunk
+    else:
+        scan = lambda *a: chunk_scan(*a, CHUNK or CHUNKS[sp.kind])  # noqa: E731
 
     if form == "verify":
         S = layer.rec_state[read]
@@ -833,6 +848,8 @@ def _mix_rows(model, layer, x: torch.Tensor, positions: torch.Tensor, slot_mappi
         o, _ = scan(q, k, v, g, beta, q.new_zeros(nv, dk, dv))
 
     # Gated RMSNorm per head, then the output projection.
+    if fused_norm:  # o may carry the delta rule's padding rows; the kernel reads the first T
+        return F.linear(gated_norm.apply(o, z, layer.o_norm, cfg.rms_norm_eps), model._w(layer, "out"))
     of = o.to(dt).float()
     of = of * torch.rsqrt(of.pow(2).mean(-1, keepdim=True) + cfg.rms_norm_eps)
     if sp.kind == "gdn":  # Qwen3_5RMSNormGated: weight times the normalised value in the model dtype

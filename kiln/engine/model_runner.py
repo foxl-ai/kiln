@@ -9,8 +9,10 @@ the null page and their outputs are discarded.
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import shlex
+import sys
 import time
 import zlib
 from collections import defaultdict
@@ -114,7 +116,8 @@ def prefill_cc_args(ecfg) -> list[str]:
     if env is not None:
         return [] if env.strip() in ("", "none") else shlex.split(env)
     g = getattr(ecfg, "piecewise_prefill_moe_group", None)
-    return [PREFILL_BIG_LIMIT] if ecfg.piecewise and g is not None and g > PREFILL_DEFAULT_MOE_GROUP else []
+    big = (g is not None and g > PREFILL_DEFAULT_MOE_GROUP) or getattr(ecfg, "prefill_whole", False)
+    return [PREFILL_BIG_LIMIT] if ecfg.piecewise and big else []
 
 
 def canonicalize(gm) -> None:
@@ -193,6 +196,14 @@ def canonical_neuron_backend():
     return backend
 
 
+# KILN_PIECEWISE_PREFILL_CUTS=7,12,... (a measurement, off by default): one engine's prefill runs are also cut at these
+# layers, so it runs the graphs of a layer pipeline split there (--pp-split; engine/pp.py cuts every run at a stage's
+# bounds). A split that is not on the run bounds gives different graphs, which neuronx-cc fuses and rounds
+# differently: the 8-stage R8 pipeline at 7,12,16,23,28,35,40 took 197 at -5.954149 at 128k where one engine with its
+# 12-layer runs took it at -5.837149, while the 4 stages at 12,24,36 matched it bit for bit (2026-10-07).
+PREFILL_CUTS = tuple(int(x) for x in os.environ.get("KILN_PIECEWISE_PREFILL_CUTS", "").split(",") if x)
+
+
 def piecewise_groups(n_layers: int, group: int | None, alone=()) -> list[range]:
     """Consecutive runs of up to `group` layers; every layer in `alone` (the MoE layers) is a
     run of its own. The default keeps a dense model's step at about 14 layer launches: the
@@ -248,8 +259,35 @@ PROFILE_EXEC = os.environ.get("KILN_PROFILE_EXEC") == "1"
 EXEC_TIMES: dict = defaultdict(list)
 
 
+def _stage_prefill_fn(model, lo: int, hi: int):
+    """A pipeline stage's prefill call as one function (KILN_PREFILL_WHOLE): the prep (stage 0's hidden stream; every
+    stage's attention inputs), layers lo .. hi - 1 with their tensors passed in (model.group_fn, so the stage's model may
+    hold only its own layers), and the post. h_in: the previous stage's stream (None on stage 0). Returns the post's
+    output on the last stage, else (h, output): the stream for the next stage and the output every stage's engine
+    reads, as in the piecewise path, where every stage runs the post graph."""
+    group = model.group_fn(range(lo, hi))
+    last = hi == len(model.layers)
+
+    def f(input_ids, positions, block_table, slot_mapping, swa_table, swa_first, ngram_ids, state_slot, h_in,
+          last_index, temperature, top_p, top_k, min_p, noise, board, write_slot, bitmask, penalties, plp_targets,
+          *tensors):
+        h, attn = model.prep_prefill(input_ids, positions, block_table, swa_table, swa_first, ngram_ids)
+        if h_in is not None:
+            h = h_in.to(h.dtype).view(h.shape)
+        table_w = swa_table if swa_table is not None else block_table
+        bias_w = attn[model.window][0] if model.window is not None else None
+        kw = {"state_slot": state_slot} if state_slot is not None else {}
+        h = group(h, positions, slot_mapping, block_table, attn[None][0], table_w, bias_w, *tensors, **kw)
+        out = model.post_prefill(h, last_index, temperature, top_p, top_k, min_p, noise, board, write_slot, bitmask,
+                                 penalties, plp_targets)
+        return out if last else (h, out)
+
+    return f
+
+
 def _piecewise(model, compile_, group: int | None = None, moe_group: int | None = None,
-               prefill_moe_group: int | None = None, compile_prefill=None, decode_whole: bool = False, pp=None):
+               prefill_moe_group: int | None = None, compile_prefill=None, decode_whole: bool = False, pp=None,
+               prefill_whole: bool = False):
     """forward_decode / forward_prefill / forward_extend as prep graph -> one graph per run of
     layers (shared by every run with the same kinds) -> post graph, with the same signatures.
     Tables are chosen on the host exactly as DecoderForCausalLM._attn_inputs does; the
@@ -272,13 +310,21 @@ def _piecewise(model, compile_, group: int | None = None, moe_group: int | None 
 
     pp: a pipeline stage (engine/pp.py): (lo, hi, link). Its prefill runs only the layers lo .. hi - 1 (the runs cut
     at the stage's bounds), takes its input hidden stream from link when lo > 0 and sends its output when hi is not
-    the last layer; its decode, verify and mixed calls are not supported."""
+    the last layer; its decode, verify and mixed calls are not supported.
+
+    prefill_whole (KILN_PREFILL_WHOLE): a prefill call is one graph, forward_prefill compiled whole, or for a pipeline
+    stage _stage_prefill_fn's prep + its layers (+ the post on the last stage), the stream received before it and
+    sent after it."""
     import inspect
 
     kinds: dict[tuple, object] = {}
     blob = any(getattr(l, "moe_blob", False) for l in model.layers)
+    eagle = getattr(model, "eagle", None)
+    eagle_aux = set(eagle.aux_layers) if eagle is not None else set()
+    combine = compile_(model.eagle_combine) if eagle is not None else None
+    plan_len: dict[int, list[int]] = {}  # layers per run of each plan (the EAGLE-3 auxiliary streams' counts)
 
-    def make_plan(mg, comp=compile_, cache=kinds):
+    def make_plan(mg, comp=compile_, cache=kinds, cuts=()):
         if mg and blob:
             runs = piecewise_groups(len(model.layers), mg)
         else:
@@ -286,17 +332,28 @@ def _piecewise(model, compile_, group: int | None = None, moe_group: int | None 
         if pp is not None:  # this stage's layers only, every run cut at the stage's bounds
             lo, hi = pp[0], pp[1]
             runs = [range(max(r.start, lo), min(r.stop, hi)) for r in runs if r.stop > lo and r.start < hi]
+        if eagle_aux:  # an EAGLE-3 draft reads the stream once n layers ran: every n ends a run (models/eagle3.py)
+            cut = []
+            for r in runs:
+                bounds = [r.start, *sorted(b for b in eagle_aux if r.start < b < r.stop), r.stop]
+                cut += [range(a, b) for a, b in zip(bounds, bounds[1:])]
+            runs = cut
+        for c in cuts:  # PREFILL_CUTS
+            runs = [p for r in runs for p in ((range(r.start, c), range(c, r.stop)) if r.start < c < r.stop else (r,))]
         out = []
         for idxs in runs:
             key = tuple(model.layer_kind(i) for i in idxs)
             if key not in cache:
                 cache[key] = comp(model.group_fn(idxs))
             out.append((cache[key], tuple(t for i in idxs for t in model.layer_tensors(i))))
+        plan_len[id(out)] = [len(idxs) for idxs in runs]
         return out
 
     plan = make_plan(moe_group)
     if compile_prefill is not None:
-        plan_p = make_plan(prefill_moe_group or moe_group, compile_prefill, {})
+        plan_p = make_plan(prefill_moe_group or moe_group, compile_prefill, {}, PREFILL_CUTS)
+    elif PREFILL_CUTS:
+        plan_p = make_plan(prefill_moe_group or moe_group, cuts=PREFILL_CUTS)
     else:
         plan_p = plan if (prefill_moe_group or moe_group) == moe_group else make_plan(prefill_moe_group)
     windows = [None] + ([model.window] if model.window is not None else [])
@@ -323,8 +380,17 @@ def _piecewise(model, compile_, group: int | None = None, moe_group: int | None 
         last[0] = t
         return out
 
-    def with_h(out, h):  # an MTP head drafts from the final hidden states (forward_mtp)
-        return (out, h) if model.mtp is not None else out
+    def with_h(out, h):
+        """An MTP head drafts from the final hidden states (forward_mtp); an EAGLE-3 draft from the target's
+        auxiliary ones, combined (eagle_combine) over the streams layers() kept."""
+        if model.mtp is None:
+            return out
+        if eagle is not None:
+            aux = [aux_kept[n] for n in eagle.aux_layers]
+            return out, run(combine, *aux)
+        return out, h
+
+    aux_kept: dict[int, torch.Tensor] = {}
 
     def flat(prep):
         def f(*a):
@@ -344,11 +410,17 @@ def _piecewise(model, compile_, group: int | None = None, moe_group: int | None 
             os.makedirs(DUMP_PIECES, exist_ok=True)
             tag = f"{DUMP_PIECES}/r{model.tp_rank}-c{_DUMPED[0]}"
             _DUMPED[0] += 1
+        done = pp[0] if pp is not None else 0  # layers run so far, counted over the whole model
+        if done in eagle_aux:
+            aux_kept[done] = h
         for gi, (fn, tensors) in enumerate(plan):
             t0 = time.perf_counter() if PROFILE else 0.0
             if dump:
                 torch.save(h.cpu(), f"{tag}-p{gi}-in.pt")
             h = run(fn, h, positions, slot_mapping, block_table, biases[None], table_w, bias_w, *tensors, **kw)
+            done += plan_len[id(plan)][gi]
+            if done in eagle_aux:
+                aux_kept[done] = h
             if dump:
                 torch.save(h.cpu(), f"{tag}-p{gi}-out.pt")
             if PROFILE and h.device.type == "neuron":  # KILN_PROFILE_PIECES=1: time each group, synchronously
@@ -398,16 +470,54 @@ def _piecewise(model, compile_, group: int | None = None, moe_group: int | None 
         a = a.arguments
         h, *b = run(prep_p, a["input_ids"], a["positions"], a["block_table"], a["swa_table"], a["swa_first"],
                        a["ngram_ids"])
-        if pp is not None and pp[0] > 0:  # a later pipeline stage: the previous stage's output, not the embedding
+        # (a capture on the meta device, tools/compile_farm.py, traces each stage's graphs alone: no link)
+        if pp is not None and pp[0] > 0 and h.device.type != "meta":  # a later stage: the previous stage's output
             h = pp[2].recv(h.device).to(h.dtype).view(h.shape)
         h = layers(h, a["positions"], a["slot_mapping"], dict(zip(windows, b)), a["block_table"], a["swa_table"],
                    a["state_slot"], plan=plan_p)
-        if pp is not None and pp[1] < len(model.layers):
+        if pp is not None and pp[1] < len(model.layers) and h.device.type != "meta":
             pp[2].send(h)
         return with_h(run(post_p, h, a["last_index"], a["temperature"], a["top_p"], a["top_k"], a["min_p"], a["noise"],
                       a["board"], a["write_slot"], a["bitmask"], a["penalties"], a["plp_targets"]), h)
 
+    if prefill_whole and pp is None:  # KILN_PREFILL_WHOLE: the prefill call as one graph (prep, every layer, post)
+        whole_p = (compile_prefill or compile_)(model.forward_prefill)
+
+        def prefill(*args):  # noqa: F811
+            return run(whole_p, *args)
+
+    elif prefill_whole:  # a pipeline stage's call as one graph: prep, its layers, the post on the last stage
+        if model.mtp is not None:
+            raise NotImplementedError("KILN_PREFILL_WHOLE on a pipeline stage: no MTP / EAGLE-3 head")
+        lo, hi = pp[0], pp[1]
+        stage_p = (compile_prefill or compile_)(_stage_prefill_fn(model, lo, hi))
+        stage_t = tuple(t for i in range(lo, hi) for t in model.layer_tensors(i))
+
+        def prefill(*args):  # noqa: F811
+            a = sig["forward_prefill"].bind(*args)
+            a.apply_defaults()
+            a = a.arguments
+            dev = a["input_ids"].device
+            h_in = None
+            if lo > 0 and dev.type == "meta":  # a capture (tools/compile_farm.py), no link: the stream's shape alone,
+                # so the traced graph takes h_in as the running one does and their keys agree
+                h_in = model.prep_prefill(a["input_ids"], a["positions"], a["block_table"], a["swa_table"],
+                                          a["swa_first"], a["ngram_ids"])[0]
+            elif lo > 0:
+                h_in = pp[2].recv(dev)
+            out = run(stage_p, a["input_ids"], a["positions"], a["block_table"], a["slot_mapping"], a["swa_table"],
+                      a["swa_first"], a["ngram_ids"], a["state_slot"], h_in, a["last_index"], a["temperature"],
+                      a["top_p"], a["top_k"], a["min_p"], a["noise"], a["board"], a["write_slot"], a["bitmask"],
+                      a["penalties"], a["plp_targets"], *stage_t)
+            if hi < len(model.layers):  # (h, out): the stream for the next stage, the post's output for the engine
+                h, out = out
+                if dev.type != "meta":
+                    pp[2].send(h)
+            return out
+
     def extend(*args):
+        if pp is not None:
+            raise NotImplementedError("a pipeline stage (pp_stages > 1) runs no verify call")
         a = sig["forward_extend"].bind(*args)
         a.apply_defaults()
         a = a.arguments
@@ -421,6 +531,8 @@ def _piecewise(model, compile_, group: int | None = None, moe_group: int | None 
     def mixed(*args):
         """forward_mixed: the prefill groups' graphs (plan_p) over each group's chunk and decode rows; the
         post graph is the prefill's, sampling every chunk's last row and every decode row."""
+        if pp is not None:
+            raise NotImplementedError("a pipeline stage (pp_stages > 1) runs no mixed call")
         a = sig["forward_mixed"].bind(*args)
         a.apply_defaults()
         a = a.arguments
@@ -435,6 +547,7 @@ def _piecewise(model, compile_, group: int | None = None, moe_group: int | None 
         return with_h(run(post_p, h, a["last_index"], a["temperature"], a["top_p"], a["top_k"], a["min_p"], a["noise"],
                           a["board"], a["write_slot"], a["bitmask"], a["penalties"], a["plp_targets"]), h)
 
+    decode.plan_len, prefill.plan_len = plan_len[id(plan)], plan_len[id(plan_p)]  # layers per run (tests read them)
     return decode, prefill, extend, mixed
 
 
@@ -562,6 +675,7 @@ class ModelRunner:
         self._free_slots = list(range(n_slots - 2, -1, -1))
         self._slot: dict[str, int] = {}
         self.compile_seconds: dict[tuple, float] = {}
+        self.exec_counts: dict[tuple, int] = {}  # graph executions by key (vllm-neuron's neff_execution_count)
         self.calls: dict[tuple, int] = defaultdict(int)
         # meta: kiln/capture.py traces the device run's graphs on a host without NeuronCores, through
         # a backend that writes each graph's HLO into the compile cache instead of compiling it.
@@ -625,23 +739,25 @@ class ModelRunner:
         if device.type == "neuron":
             profiling.install_capture(getattr(model, "tp_rank", 0))  # KILN_CAPTURE_INPUTS (off by default)
         self.pp_link = None
+        self.pp_range: tuple[int, int] | None = None  # a pipeline stage's layers [lo, hi)
         pp = None
         if getattr(ecfg, "pp_stages", 1) > 1:  # one long prefill over several engines (engine/pp.py)
             from . import pp as _pp
 
             if not ecfg.piecewise:
                 raise ValueError("a pipeline stage (pp_stages > 1) needs piecewise=True")
-            n = len(model.layers)
-            split = tuple(ecfg.pp_split) if ecfg.pp_split else _pp.default_split(
-                [getattr(l, "dsa", None) is not None or bool(getattr(getattr(l, "spec", None), "mla", None))
-                 for l in model.layers], ecfg.pp_stages)
-            lo, hi = _pp.stage_range(n, split, ecfg.pp_stage)
+            lo, hi = _pp.model_stage_range(model.layers, ecfg.pp_stages, ecfg.pp_stage, ecfg.pp_split)
+            if getattr(model, "load_range", None) not in (None, (lo, hi)):
+                raise RuntimeError(f"pipeline stage: layers {lo}..{hi - 1} planned, {model.load_range} loaded")
             self.pp_link = _pp.StageLink(ecfg, getattr(model, "tp_rank", 0))
+            self.pp_range = (lo, hi)
+            self.pp_ranges = [list(_pp.model_stage_range(model.layers, ecfg.pp_stages, t, ecfg.pp_split))
+                              for t in range(ecfg.pp_stages)]
             pp = (lo, hi, self.pp_link)
         if ecfg.piecewise:
             self._decode, self._prefill, self._extend, self._mixed = _piecewise(
                 model, compile_, ecfg.piecewise_group, ecfg.piecewise_moe_group, ecfg.piecewise_prefill_moe_group,
-                compile_prefill, ecfg.decode_whole, pp)
+                compile_prefill, ecfg.decode_whole, pp, getattr(ecfg, "prefill_whole", False))
         else:
             self._decode = compile_(model.forward_decode)
             self._prefill = compile_(model.forward_prefill)
@@ -657,9 +773,9 @@ class ModelRunner:
         if self.spec_async:
             from . import spec_async as _sa
 
-            if ecfg.spec_k != 1:
-                raise NotImplementedError("spec_async: MTP with spec_k 1 only (the later passes' positions would come "
-                                          "from the device too)")
+            if ecfg.spec_k != 1 and self.window is not None:
+                raise NotImplementedError("spec_async with spec_k > 1 on sliding-window layers (the later MTP "
+                                          "passes' window tables would come from the device too)")
             if self.ps & (self.ps - 1):
                 raise ValueError(f"spec_async needs a power-of-two page size, not {self.ps}")
             Q, k, Nd, ps = 1 + ecfg.spec_k, ecfg.spec_k, self.dp, self.ps
@@ -668,7 +784,8 @@ class ModelRunner:
                 "spec_prep": compile_(lambda b, si, t, r, pad, v, di=None: _sa.spec_prep(b, si, t, r, pad, v, Q, k, ps,
                                                                                        Nd, di)),
                 "spec_post": compile_(lambda b, si, o, ids, ra, v: _sa.spec_post(b, si, o, ids, ra, v, Q, k)),
-                "mtp_prep": compile_(lambda b, si, t, pad, v, di=None: _sa.mtp_prep(b, si, t, pad, v, Q, ps, Nd, di)),
+                "mtp_prep": compile_(lambda b, si, t, pad, v, di=None: _sa.mtp_prep(b, si, t, pad, v, Q, ps, Nd, di,
+                                                                                   k)),
                 "mtp_post": compile_(lambda b, si, d, v: _sa.mtp_post(b, si, d, v, Q, k)),
                 "spec_init": compile_(lambda b, tb, si, base, cur, v: _sa.spec_init(b, tb, si, base, cur, v, Q, k)),
                 "spec_host_init": compile_(lambda b, si, tok, base, cur, v: _sa.spec_host_init(b, si, tok, base, cur, v,
@@ -889,6 +1006,7 @@ class ModelRunner:
               "mixed": self._mixed}.get(name) or self._spec_fns[name]
         args = [self._dev(a) for a in host_args]
         first = key not in self.compile_seconds
+        self.exec_counts[key] = self.exec_counts.get(key, 0) + 1
         t = time.perf_counter()
         if profiling.CAPTURE is not None:  # KILN_CAPTURE_INPUTS: arm the input dump for the chosen calls
             profiling.CAPTURE.begin(name)
@@ -1324,8 +1442,9 @@ class ModelRunner:
         for g, b in place:
             i = g * B + b
             hidx[i] = i * Q + np.arange(Q)  # the verify's rows of this sequence
+        rest = [DEV + "mtp_prep:4", DEV + "mtp_prep:5"] if self.spec_k > 1 else [None, None]  # the later passes
         args = [DEV + "mtp_prep:0", DEV + "mtp_prep:2", G(table), DEV + "mtp_prep:3", hkey, hidx, DEV + "mtp_prep:1",
-                PARAM + "norm", None, None]
+                PARAM + "norm", *rest]
         self._exec("mtp", self._mtp_key(B, Q, P, hkey), self._with_sp_src(args, hkey))
         self._exec("mtp_post", ("mtp_post", B, Q), [SPEC, slot_idx, DEV + "mtp", valid])
 
@@ -1362,6 +1481,9 @@ class ModelRunner:
         last = np.zeros(N, np.int64)
         table = np.full((N, 1, P), NULL_PAGE, np.int64)
         last_tok = np.full(N, -1, np.int64)  # the column taking the sampled token from the token board (-1: none)
+        r_ = self.spec_k - 1  # the later passes' positions end .. end + r_ - 1, as mtp_launch's last + 1 + s
+        pos_r = np.zeros((N, 1, r_), np.int64)
+        slot_r = self.pad_slots((N, 1, r_))
         for j, (x, (g, _b)) in enumerate(zip(seqs, place)):
             r, m = x.req, x.num_tokens
             if x.sample:
@@ -1378,9 +1500,15 @@ class ModelRunner:
             last[g] = m - 1
             npg = min(len(r.pages), P)
             table[g, 0, :npg] = r.pages[:npg]
+            for s in range(r_):  # the engine reserved these pages (a dry pool: a padding write, a worse draft)
+                p = x.end + s
+                pos_r[g, 0, s] = p
+                if p // self.ps < len(pages):
+                    slot_r[g, 0, s] = pages[p // self.ps] * self.ps + p % self.ps
         self._exec("mtp_prefill_ids", ("mtp_prefill_ids", N, Qm), [BOARD, slot_idx, ids, last_tok])
         G = self._grp
-        args = [DEV + "mtp_prefill_ids:0", G(pos), G(table), G(slot), hkey, hidx, last, PARAM + "norm", None, None]
+        rest = [G(pos_r), G(slot_r)] if r_ else [None, None]
+        args = [DEV + "mtp_prefill_ids:0", G(pos), G(table), G(slot), hkey, hidx, last, PARAM + "norm", *rest]
         self._exec("mtp", self._mtp_key(1, Qm, P, hkey), self._with_sp_src(args, hkey))
         self._exec("mtp_post", ("mtp_post", N, 1 + self.spec_k), [SPEC, slot_idx, DEV + "mtp", valid])
 
@@ -1713,6 +1841,36 @@ class ModelRunner:
         return [(i, l) for i, l in enumerate(getattr(self.model, "layers", []))
                 if getattr(l, "ep_s", 0) and getattr(l, "ep_stats", None) is not None]
 
+    def eplb_trace(self, path: str, tag: int) -> None:
+        """KILN_EPLB_TRACE=<file> (opt-in, measurement): the expert counts every rank recorded since the last trace
+        (ep_stats: routing ids of this rank's sequence-parallel rows, placement-free), all-reduced and appended by rank 0
+        to <file> as {"layers": [layer index], "tags": [prefill calls so far], "counts": int32 [traces, layers, E]}, then
+        zeroed. Waits for the calls in flight (a sync per traced step)."""
+        if self.tp_send is not None:
+            self.tp_send(("eplb_trace", None, [path, tag]))
+        self._eplb_trace(path, tag)
+
+    def _eplb_trace(self, path: str, tag: int) -> None:
+        import torch.distributed as dist
+
+        layers = self._eplb_layers()
+        if not layers:
+            return
+        self._settle()
+        stats = torch.stack([l.ep_stats.cpu().to(torch.float64) for _, l in layers])
+        for _, l in layers:
+            l.ep_stats.copy_(torch.zeros(l.ep_stats.shape, dtype=l.ep_stats.dtype))
+        if self.model.tp_size > 1 and dist.is_initialized():
+            dist.all_reduce(stats)
+        if self.model.tp_rank == 0:
+            rec = getattr(self, "_eplb_trace_rec", None)
+            if rec is None:
+                rec = self._eplb_trace_rec = {"layers": [i for i, _ in layers], "tags": [], "counts": []}
+            rec["tags"].append(int(tag))
+            rec["counts"].append(stats.round().to(torch.int32))
+            torch.save({"layers": rec["layers"], "tags": rec["tags"], "counts": torch.stack(rec["counts"])}, path + ".tmp")
+            os.replace(path + ".tmp", path)
+
     def _eplb_reset(self) -> None:
         self._settle()
         for _, l in self._eplb_layers():
@@ -1750,12 +1908,14 @@ class ModelRunner:
             mine = {El + j: new[rank * s + j] for j in range(s) if new[rank * s + j] != l.ep_experts[El + j]}
             plan.append((i, l, new, mine))
         job = {"plan": plan, "moved": moved, "staged": {}, "error": None, "t0": t0,
-               "prep_s": time.perf_counter() - t0}
+               "prep_s": time.perf_counter() - t0, "stop": threading.Event()}
 
         def load_all():
             try:
                 ck = self.ep_checkpoint() if hasattr(self, "ep_checkpoint") else None
                 for i, l, _, mine in plan:
+                    if job["stop"].is_set():  # eplb_stop: the engine is closing; nothing will commit this
+                        return
                     if mine:
                         job["staged"][i] = self.ep_prepare(l, i, mine, ck)
             except BaseException as e:  # reported at commit, on every rank
@@ -1765,6 +1925,21 @@ class ModelRunner:
         job["thread"] = threading.Thread(target=load_all, name="eplb-load", daemon=True)
         job["thread"].start()
         self._eplb_job = job
+
+    def eplb_stop(self, timeout: float = 300.0) -> None:
+        """Stop a prepared rebalance's host thread after the layer it is loading and wait for it (this rank only:
+        rank 0 from LLMEngine.close, the other ranks when ModelRunner.serve ends). A thread left loading slots at
+        interpreter exit aborts the process ("terminate called without an active exception": a pipeline stage's
+        exit skipped its log upload, kiln-pd4-s2 pc-s2ep-A, 2026-10-07)."""
+        job = getattr(self, "_eplb_job", None)
+        if job is None or not job["thread"].is_alive():
+            return
+        job["stop"].set()
+        job["thread"].join(timeout)
+        if job["thread"].is_alive():
+            print(f"kiln eplb: the rebalance's loading thread did not stop within {timeout:g} s", file=sys.stderr,
+                  flush=True)
+        self._eplb_job = None
 
     def _eplb_commit(self) -> int | None:
         import torch.distributed as dist
@@ -1940,6 +2115,33 @@ class ModelRunner:
                 return None  # a pool kept in another layout than state_shapes(): not regrouped
         return out
 
+    def pd_stage_names(self) -> set[str] | None:
+        """A pipeline stage's share of a handoff (engine/pp.py): a stage allocates every layer's paged caches and state
+        rows, in global order (kv_layers(), state_layers()), and writes only those of its own layers [lo, hi); these
+        are the pd names (pd_caches(), st<i>) of the layers of its range. None outside a pipeline."""
+        if self.pp_range is None:
+            return None
+        if self.aux_caches:
+            raise NotImplementedError("a pipeline stage's handoff of a model's aux caches")
+        lo, hi = self.pp_range
+        pos = {id(l): i for i, l in enumerate(self.model.layers)}
+        kv = [pos.get(id(l)) for l in self.model.kv_layers()]
+        out = set()
+        for name, _ in self.pd_caches():
+            i = int(name[1:].split(".")[0])  # k<i>, v<i>, s<i>.<state>: kv layer i
+            if kv[i] is None:
+                raise NotImplementedError(f"a pipeline stage's handoff of cache {name}: a layer outside the decoder "
+                                          "layers (an MTP layer)")
+            if lo <= kv[i] < hi:
+                out.add(name)
+        if self.state is not None:
+            st = [pos[id(l)] for l in self.model.state_layers()]
+            pools = self.state.pools()
+            if len(pools) != 2 * len(st):  # pd_state_split's order: every layer's conv state, then its recurrent state
+                raise NotImplementedError(f"a pipeline stage's handoff of {len(pools)} state pools for {len(st)} layers")
+            out |= {f"st{i}" for i in range(len(pools)) if lo <= st[i % len(st)] < hi}
+        return out
+
     def pd_regroupable(self) -> bool:
         """Whether a handoff can cross attention TP degrees (a latency prefill engine at DP attention 1 into a decode
         engine at DP attention 4, say): every paged cache is replicated over an attention group at ANY attention TP
@@ -1989,7 +2191,7 @@ class ModelRunner:
         return self._pd_snd
 
     def pd_extract(self, xfer: str, dest: str, pages: list[int], n_tok: int, srow: int | None, group: int,
-                   meta: dict | None = None) -> None:
+                   meta: dict | None = None, names: set[str] | None = None, prefix: str = "") -> None:
         """Prefill side: every rank of the request's group copies its share of the request's KV (positions 0 ..
         n_tok - 1, held in `pages`) and state row `srow` to the host and queues it to `dest`; rank 0 then
         queues the meta. Called right after the step that sampled the first token was read back and before
@@ -2001,7 +2203,8 @@ class ModelRunner:
             runs = self._pd_local_page_runs(pages, n_tok)
         else:
             runs = disagg.slot_runs(pages, 0, n_tok, self.ps)
-        args = [xfer, dest, runs, n_tok, srow, group]
+        # names: only these caches and state pools (a pipeline stage's own layers, pd_stage_names); prefix: its parts'
+        args = [xfer, dest, runs, n_tok, srow, group, sorted(names) if names is not None else None, prefix]
         if self.tp_send is not None:
             self.tp_send(("pd_extract", None, args))
         self._pd_extract(*args)
@@ -2044,9 +2247,11 @@ class ModelRunner:
             return torch.empty((0, *c.shape[1:]), dtype=c.dtype)
         return parts[0] if len(parts) == 1 else torch.cat(parts)
 
-    def _pd_extract(self, xfer: str, dest: str, runs, n_tok: int, srow: int | None, group: int) -> None:
+    def _pd_extract(self, xfer: str, dest: str, runs, n_tok: int, srow: int | None, group: int,
+                    names: list[str] | None = None, prefix: str = "") -> None:
         if not self._pd_group_ranks(group, sending=True):
             return
+        keep = set(names) if names is not None else None
         from . import disagg
 
         t = time.perf_counter()
@@ -2057,6 +2262,8 @@ class ModelRunner:
         self.pd_extract_runs = getattr(self, "pd_extract_runs", 0) + len(runs)
         split, rep = [], []
         for (name, is_rep), c in zip(self.pd_caches(), self._paged_caches()):
+            if keep is not None and name not in keep:
+                continue
             if cp > 1:  # every rank's local rows are its own (whole local pages)
                 split.append((name, self._pd_rows(c, runs, 0, n_rows)))
             elif is_rep:
@@ -2064,10 +2271,11 @@ class ModelRunner:
             else:
                 split.append((name, self._pd_rows(c, runs, 0, n_tok)))
         if srow is not None:
-            split += [(f"st{i}", p[srow].to("cpu", copy=True)) for i, p in enumerate(self.state.pools())]
+            split += [(f"st{i}", p[srow].to("cpu", copy=True)) for i, p in enumerate(self.state.pools())
+                      if keep is None or f"st{i}" in keep]
         self.pd_extract_seconds = getattr(self, "pd_extract_seconds", 0.0) + time.perf_counter() - t
         snd = self._pd_sender()
-        for part, named in ((f"s{a}", split), (f"r{a}", rep)):
+        for part, named in ((f"{prefix}s{a}", split), (f"{prefix}r{a}", rep)):
             table, bufs = disagg.pack_arrays(named)
             snd.enqueue(dest, {"kind": "part", "xfer": xfer, "part": part, "arrays": table}, bufs)
 
@@ -2097,8 +2305,23 @@ class ModelRunner:
         if cp == 1:
             return None
         _, a = self.pd_attention()
+        # The rank's index in its CP group: with row groups (KILN_DSA_CP_DEGREE below the attention TP) the attention
+        # group is attn_tp / cp groups of cp consecutive ranks, each holding pools m * cp + a % cp (models/decoder.py
+        # long_grp_index). Comparing with a itself selected nothing on ranks cp and up: a non-CP 8K pipeline into the
+        # R8LK decode (CP 8 at attention TP 32) died in _pd_slots on 24 of 32 ranks (kiln-nx-dec nx8k-host-r8).
         pos = torch.arange(n_tok)
-        return pos[((pos % self.ps) // kp) % cp == a]
+        return pos[((pos % self.ps) // kp) % cp == a % cp]
+
+    def _pd_local_slots(self, pages: list[int], pos: np.ndarray) -> np.ndarray:
+        """This rank's local slots of positions pos (ascending) of a request held in `pages`: the plain slot without
+        CP; under CP the positions must be ones this rank holds (_pd_cp_select)."""
+        cp, kp = self._pd_cp()
+        pg = np.asarray(pages, np.int64)
+        if cp == 1:
+            return pg[pos // self.ps] * self.ps + pos % self.ps
+        lps = self.ps // cp
+        within = pos % self.ps
+        return pg[pos // self.ps] * lps + (within // kp) // cp * kp + within % kp
 
     def _pd_slots(self, pages: list[int], n_tok: int):
         """This rank's (first slot, count) runs for a handoff's positions in `pages`, in the order of its rows."""
@@ -2107,11 +2330,7 @@ class ModelRunner:
         cp, kp = self._pd_cp()
         if cp == 1:
             return disagg.slot_runs(pages, 0, n_tok, self.ps)
-        pos = self._pd_cp_select(n_tok)
-        lps = self.ps // cp
-        within = pos % self.ps
-        local = torch.as_tensor(pages, dtype=torch.int64)[pos // self.ps] * lps + (within // kp) // cp * kp + within % kp
-        local = local.numpy()
+        local = self._pd_local_slots(pages, self._pd_cp_select(n_tok).numpy())
         cut = np.flatnonzero(np.diff(local) != 1) + 1
         bounds = np.concatenate([[0], cut, [len(local)]])
         return [(int(local[x]), int(y - x)) for x, y in zip(bounds[:-1], bounds[1:])]
@@ -2135,8 +2354,12 @@ class ModelRunner:
             self._pd_prefetch(*it)
 
     def _pd_inject(self, parts: dict | None, pages: list[int], n_tok: int, srow: int | None, group: int,
-                   settle: bool = True, sender_cp: int = 1, xfer: str | None = None, sender_a: int = 0) -> None:
+                   settle: bool = True, sender_cp: int = 1, xfer: str | None = None, sender_a: int = 0,
+                   nixl: dict | None = None) -> None:
         if not self._pd_group_ranks(group, sending=False):
+            return
+        if nixl is not None:  # KILN_PD_TRANSPORT=nixl: read the rows out of the prefill ranks' memory (engine/nixl_kv.py)
+            self._pd_pull(nixl, pages, n_tok, srow, settle, sender_cp, xfer or "", sender_a)
             return
         if sender_cp > 1:  # whole local pages from the same rank of a CP engine of the same degree (pd_extract)
             if self._pd_cp()[0] != sender_cp:
@@ -2157,6 +2380,12 @@ class ModelRunner:
         if pre is None and parts is None:
             raise RuntimeError(f"handoff {xfer}: no prefetch on this rank and no parts to read")
         rows_of = pre.result() if pre is not None else self._pd_assemble(parts, n_tok, sender_cp, sender_a)
+        missing = [n for n, _ in self.pd_caches() if n not in rows_of]
+        if srow is not None:
+            missing += [f"st{i}" for i in range(len(self.state.pools())) if f"st{i}" not in rows_of]
+        if missing:
+            raise RuntimeError(f"handoff {xfer}: no rows for {len(missing)} caches / state pools ({missing[:6]}): a "
+                               "pipeline handoff whose stages do not cover every layer")
         t_read = time.perf_counter()
         self.pd_inject_read_seconds = getattr(self, "pd_inject_read_seconds", 0.0) + t_read - t
         self.pd_inject_copies = getattr(self, "pd_inject_copies", 0) + len(runs) * len(self._paged_caches()) + \
@@ -2190,7 +2419,16 @@ class ModelRunner:
         """This rank's rows of a complete handoff on the host: every paged cache's [n_tok, ...] rows in position order
         (a replicated cache's attention-rank slices concatenated; under CP only the positions this rank holds) and every
         state pool's row (st<i>). sender_a: the sender's attention TP when it differs from this engine's (0: the same);
-        the state rows are then regrouped from its ranks (pd_regroupable, disagg.regroup)."""
+        the state rows are then regrouped from its ranks (pd_regroupable, disagg.regroup). A pipeline's handoff
+        (disagg.combine_stages) holds each stage's parts under its prefix p<stage>. with that stage's layers only; the
+        stages' rows are assembled one stage at a time and together cover every cache and pool."""
+        prefixes = sorted({k.split(".", 1)[0] + "." for k in parts if "." in k}) or [""]
+        out = {}
+        for pf in prefixes:
+            out.update(self._pd_assemble_one(parts, pf, n_tok, sender_cp, sender_a))
+        return out
+
+    def _pd_assemble_one(self, parts: dict, pf: str, n_tok: int, sender_cp: int, sender_a: int) -> dict:
         from . import disagg
 
         A, a = self.pd_attention()
@@ -2199,26 +2437,44 @@ class ModelRunner:
             if As != A:
                 raise RuntimeError(f"a handoff from a CP engine at attention TP {As} into attention TP {A}: CP to CP "
                                    f"moves local pages rank to rank and needs the same degree")
-            got = disagg.read_parts({"parts": parts}, [f"s{a}"])[f"s{a}"]
+            got = disagg.read_parts({"parts": parts}, [f"{pf}s{a}"])[f"{pf}s{a}"]
             return dict(got)
         if As != A and not self.pd_regroupable():
             raise RuntimeError(f"a handoff from attention TP {As} into attention TP {A}: this model's caches or state "
                                f"are not regroupable (ModelRunner.pd_regroupable)")
         src = disagg.sender_ranks(As, A, a)
-        got = disagg.read_parts({"parts": parts}, [f"s{b}" for b in src] + [f"r{b}" for b in range(As)])
+        got = disagg.read_parts({"parts": parts}, [f"{pf}s{b}" for b in src] + [f"{pf}r{b}" for b in range(As)])
         sel = self._pd_cp_select(n_tok)
         out = {}
         for name, is_rep in self.pd_caches():
             if is_rep:
-                rows = torch.cat([got[f"r{b}"][name] for b in range(As)]) if As > 1 else got["r0"][name]
+                if name not in got[f"{pf}r0"]:
+                    continue  # another stage's layer (a pipeline's handoff)
+                if sel is not None:
+                    # Under CP this rank keeps ~1 / cp of the positions: pick them out of each sender rank's slice
+                    # (rep_slice) before joining, so only those rows are read out of the parts (read_parts maps the
+                    # files: an unselected row is never touched) and copied, instead of every rank joining the whole
+                    # prompt's rows and selecting afterwards (R8 at 1M: the latent of every position on each of 32
+                    # ranks, the second token's 2.3 s, kiln-pd4-dec e2e4-r8).
+                    pieces = []
+                    for b in range(As):
+                        lo, hi = disagg.rep_slice(n_tok, b, As)
+                        m = sel[(sel >= lo) & (sel < hi)] - lo
+                        pieces.append(got[f"{pf}r{b}"][name].index_select(0, m))
+                    out[name] = torch.cat(pieces) if len(pieces) > 1 else pieces[0]
+                    continue
+                rows = torch.cat([got[f"{pf}r{b}"][name] for b in range(As)]) if As > 1 else got[f"{pf}r0"][name]
             else:
-                rows = got[f"s{a}"][name]
+                if name not in got[f"{pf}s{a}"]:
+                    continue
+                rows = got[f"{pf}s{a}"][name]
             out[name] = rows if sel is None else rows.index_select(0, sel)
         if As == A:
-            out.update({k: v for k, v in got[f"s{a}"].items() if k.startswith("st")})
+            out.update({k: v for k, v in got[f"{pf}s{a}"].items() if k.startswith("st")})
         elif self.state is not None:
             for i, (axis, widths) in enumerate(self.pd_state_split()):
-                out[f"st{i}"] = disagg.regroup({b: got[f"s{b}"][f"st{i}"] for b in src}, axis, widths, As, A, a)
+                if f"st{i}" in got[f"{pf}s{src[0]}"]:
+                    out[f"st{i}"] = disagg.regroup({b: got[f"{pf}s{b}"][f"st{i}"] for b in src}, axis, widths, As, A, a)
         return out
 
     def pd_prefetch(self, xfer: str, parts: dict, group: int, n_tok: int = 0, sender_cp: int = 1,
@@ -2242,6 +2498,147 @@ class ModelRunner:
         while len(self._pd_pre) >= 4096:  # handoffs aborted before their admission never collect theirs
             self._pd_pre.pop(next(iter(self._pd_pre)))
         self._pd_pre[xfer] = self._pd_pool.submit(self._pd_assemble, parts, n_tok, sender_cp, sender_a)
+
+    # -- the NIXL transport (KILN_PD_TRANSPORT=nixl, engine/nixl_kv.py) --
+
+    def pd_nixl_init(self, d: str) -> None:
+        """Every rank: register this rank's paged caches and state pools with its own NIXL agent and write its export
+        into directory d (rank 0 then reads all of them, nixl_kv.read_exports)."""
+        if self.tp_send is not None:
+            self.tp_send(("pd_nixl_init", None, [d]))
+        self._pd_nixl_init(d)
+
+    def _pd_nixl_init(self, d: str) -> None:
+        from . import nixl_kv
+
+        rank = getattr(self.model, "tp_rank", 0)
+        regions = [(name, c) for (name, _), c in zip(self.pd_caches(), self._paged_caches())]
+        if self.state is not None:
+            regions += [(f"st{i}", p) for i, p in enumerate(self.state.pools())]
+        self._nixl = nixl_kv.Rank(f"kiln-{os.path.basename(d)}-r{rank}", regions, self.device)
+        A, a = self.pd_attention()
+        group = self.dp_group if self.dp > 1 else 0
+        nixl_kv.write_export(d, rank, self._nixl.export(
+            tp_rank=rank, dp_group=self.dp_group, a=a, A=A, sends=self._pd_group_ranks(group, sending=True),
+            register_s=round(self._nixl.register_seconds, 4)))
+        self._nixl_exports: dict[str, list[dict]] = {}
+
+    def _pd_nixl_load(self, path: str) -> list[dict]:
+        """A prefill engine's exports (the hello frame its sender opened the connection with, as the receiver wrote
+        it), by global rank. Cached per file: a restarted prefill engine is another engine id and so another file."""
+        got = self._nixl_exports.get(path)
+        if got is None:
+            with open(path) as f:
+                ranks = json.load(f)["ranks"]
+            got = self._nixl_exports[path] = sorted(ranks, key=lambda e: e["tp_rank"])
+        return got
+
+    def _pd_pull(self, nixl: dict, pages: list[int], n_tok: int, srow: int | None, settle: bool, sender_cp: int,
+                 xfer: str, sender_a: int) -> None:
+        """Decode side, this rank's rows of a NIXL handoff: every paged cache's positions (the ones this rank holds
+        under CP) and its state row, read from the sending group's ranks straight into `pages` and `srow`. One
+        descriptor per run of positions consecutive on both sides, one transfer per remote rank, all started at once
+        and waited for before this returns (so before the step that reads them is launched). A pipeline's handoff
+        (nixl["pp"], disagg.combine_stages) reads each stage's own caches and pools (its "names") from that stage's
+        ranks, every stage's transfers in the same batch."""
+        from . import disagg, nixl_kv
+
+        t = time.perf_counter()
+        A, a = self.pd_attention()
+        As = sender_a or A
+        if As != A and not self.pd_regroupable():
+            raise RuntimeError(f"a handoff from attention TP {As} into attention TP {A}: this model's caches or state "
+                               f"are not regroupable (ModelRunner.pd_regroupable)")
+        mine = self._nixl.table
+        pools = self.state.pools() if self.state is not None else []
+        plans: dict[tuple[int, int, str], list] = {}  # (stage, sender attention rank, local memory) -> descriptors
+        remote: dict[tuple[int, int], dict] = {}
+        stage_rows = []  # (stage, sender attention rank, pool, remote address, row bytes): state rows to regroup
+        for si, nx in enumerate(nixl["pp"] if "pp" in nixl else [nixl]):
+            exps = self._pd_nixl_load(nx["exports"])
+            ranks = nx["ranks"]
+            if len(ranks) != As:
+                raise RuntimeError(f"handoff {xfer}: {len(ranks)} sender ranks named for attention TP {As}")
+            keep = set(nx["names"]) if nx.get("names") is not None else None
+            if sender_cp > 1:  # whole local pages, rank to rank (_pd_local_page_runs on both sides)
+                if self._pd_cp()[0] != sender_cp or As != A:
+                    raise RuntimeError(f"a handoff from a CP {sender_cp} engine at attention TP {As} needs a CP "
+                                       f"{sender_cp} decode engine at the same attention TP, not CP {self._pd_cp()[0]} "
+                                       f"/ {A}")
+                rs = nixl_kv.local_page_slots(nx["pages"], n_tok, nx["page_size"], nx["page_size"] // sender_cp)
+                ls = nixl_kv.local_page_slots(pages, n_tok, self.ps, self.lps)
+            else:
+                sel = self._pd_cp_select(n_tok)
+                pos = np.arange(n_tok, dtype=np.int64) if sel is None else sel.numpy().astype(np.int64)
+                rs = nixl_kv.pos_slots(nx["pages"], int(nx["page_size"]), pos)
+                ls = self._pd_local_slots(pages, pos)
+            segs = nixl_kv.segments(rs, ls)
+
+            def region(b: int, name: str, exps=exps, ranks=ranks):
+                rva, _, rrb = exps[ranks[b]]["regions"][name]
+                lva, _, lrb = mine[name]
+                return rva, rrb, lva, lrb
+
+            for name, is_rep in self.pd_caches():
+                if keep is not None and name not in keep:
+                    continue  # another stage's layer
+                b = a % As if is_rep and sender_cp == 1 else a
+                if name not in mine:
+                    continue  # an empty cache (no rows on this rank)
+                rva, rrb, lva, lrb = region(b, name)
+                if rrb != lrb:
+                    raise RuntimeError(f"handoff {xfer} cache {name}: a row is {rrb} bytes on the sender, {lrb} here")
+                remote[(si, b)] = exps[ranks[b]]
+                plans.setdefault((si, b, self._nixl.mem), []).extend((lva + l0 * lrb, rva + r0 * rrb, n * lrb)
+                                                                     for r0, l0, n in segs)
+            if srow is None:
+                continue
+            idx = [i for i in range(len(pools)) if keep is None or f"st{i}" in keep]
+            if As == A:
+                for i in idx:
+                    rva, rrb, lva, lrb = region(a, f"st{i}")
+                    if rrb != lrb:
+                        raise RuntimeError(f"handoff {xfer} state pool {i}: a row is {rrb} bytes on the sender, {lrb} "
+                                           "here")
+                    remote[(si, a)] = exps[ranks[a]]
+                    plans.setdefault((si, a, self._nixl.mem), []).append((lva + srow * lrb, rva + int(nx["srow"]) * rrb,
+                                                                          lrb))
+            else:  # regrouped on the host: a share of a head-split row is not one contiguous range
+                for b in disagg.sender_ranks(As, A, a):
+                    for i in idx:
+                        rva, _, rrb = exps[ranks[b]]["regions"][f"st{i}"]
+                        remote[(si, b)] = exps[ranks[b]]
+                        stage_rows.append((si, b, i, rva + int(nx["srow"]) * rrb, rrb))
+        staged = []
+        if stage_rows:
+            buf, base = self._nixl.staging(sum(r[4] for r in stage_rows))
+            off = 0
+            for si, b, i, ra, n in stage_rows:
+                plans.setdefault((si, b, "DRAM"), []).append((base + off, ra, n))
+                staged.append((b, i, off, n))
+                off += n
+        if settle:  # the reads land like eager copies: nothing queued may still write these pages (_pd_inject)
+            self._settle()
+        self._nixl.read([(remote[(si, b)], lst, mem) for (si, b, mem), lst in plans.items()], what=xfer)
+        if staged:
+            split = self.pd_state_split()
+            for i, p in enumerate(pools):
+                axis, widths = split[i]
+                rows = {}
+                for b, j, off, n in staged:
+                    if j == i:
+                        shape = list(p.shape[1:])
+                        shape[axis] = shape[axis] * A // As
+                        rows[b] = buf[off : off + n].view(p.dtype).reshape(shape)
+                if rows:
+                    p[srow].copy_(disagg.regroup(rows, axis, widths, As, A, a))
+        self.pd_inject_seconds = getattr(self, "pd_inject_seconds", 0.0) + time.perf_counter() - t
+        self.pd_inject_copies = getattr(self, "pd_inject_copies", 0) + sum(len(v) for v in plans.values())
+        if PD_TRACE:
+            with open(os.path.join(PD_TRACE, f"inject-r{getattr(self.model, 'tp_rank', 0)}.jsonl"), "a") as f:
+                f.write(f'{{"t": {t:.4f}, "xfer": "{xfer}", "nixl": 1, "descs": {sum(len(v) for v in plans.values())}, '
+                        f'"bytes": {sum(n for v in plans.values() for _, _, n in v)}, '
+                        f'"read_s": {time.perf_counter() - t:.4f}}}\n')
 
     def pd_rng_state(self, rid: str):
         """The sampler's random state of a request (None for a greedy one), for a handoff."""
@@ -2268,6 +2665,29 @@ class ModelRunner:
                     seen.add(id(t))
                     out.append(t)
         return out
+
+    def pp_set_defer(self, on: bool) -> None:
+        """A pipeline stage under KILN_PP_ASYNC + KILN_PP_OVERLAP: whether the step about to launch defers its outputs'
+        host copies (an overlapped step) or sends them at once (a synchronous one), on every
+        rank; told to the other ranks only when it changes."""
+        from . import pp as _pp
+
+        if self.pp_link is None or not (_pp.ASYNC and _pp.OVERLAP) or self.pp_link.defer == on:
+            return
+        if self.tp_send is not None:
+            self.tp_send(("pp_defer", None, [on]))
+        self.pp_link.defer = on
+
+    def pp_flush(self) -> None:
+        """A pipeline stage under KILN_PP_ASYNC + KILN_PP_OVERLAP (engine/pp.py): the deferred output of the last prefill
+        call goes to the next stage now, on every rank (each sends its own rows). A no-op elsewhere."""
+        from . import pp as _pp
+
+        if self.pp_link is None or not (_pp.ASYNC and _pp.OVERLAP):
+            return
+        if self.tp_send is not None:
+            self.tp_send(("pp_flush", None, []))
+        self.pp_link.flush()
 
     def zero_buffers(self, which: str = "all") -> None:
         """Back to the zeros they were created with, on every rank: every device_buffers() tensor ("all"),
@@ -2323,9 +2743,12 @@ class ModelRunner:
         while True:
             msg = recv()
             if msg is None:
+                self.eplb_stop()  # a rebalance still loading slots on this rank's host thread
                 if getattr(self, "_pd_snd", None) is not None:  # handoff parts still queued go out first
                     self._pd_snd.flush()
                     self._pd_snd.close()
+                if self.pp_link is not None:  # a pipeline stage's frames still queued (KILN_PP_ASYNC) go out first
+                    self.pp_link.close()
                 return
             name, key, host_args = msg
             if name == "reload":
@@ -2336,10 +2759,13 @@ class ModelRunner:
                 continue
             local = {"state_copy": self._copy_state, "state_save": self._state_save, "state_load": self._state_load,
                      "state_drop": self._state_drop, "zero_buffers": self._zero_buffers,
+                     "pp_flush": lambda: self.pp_link.flush(),
+                     "pp_defer": lambda on: setattr(self.pp_link, "defer", on),
                      "fill_slots": self._fill_slots, "eplb_prep": self._eplb_prep, "eplb_commit": self._eplb_commit,
+                     "eplb_trace": self._eplb_trace,
                      "eplb_reset": self._eplb_reset, "pd_extract": self._pd_extract,
                      "pd_inject": self._pd_inject, "pd_prefetch": self._pd_prefetch,
-                     "pd_inject_many": self._pd_inject_many,
+                     "pd_inject_many": self._pd_inject_many, "pd_nixl_init": self._pd_nixl_init,
                      "pd_prefetch_many": lambda items: [self._pd_prefetch(*it) for it in items]}.get(name)
             if local is not None:
                 local(*host_args)

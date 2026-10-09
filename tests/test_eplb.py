@@ -273,3 +273,89 @@ def test_decode_replicas_follows_the_small_lane_kernel_in_use(monkeypatch):
     assert eplb.decode_replicas() is True
     monkeypatch.setenv("KILN_EPLB_DECODE", "0")
     assert eplb.decode_replicas() is False
+
+
+def test_eplb_trace_dumps_every_prefill_steps_counts(tmp_path, monkeypatch):
+    """KILN_EPLB_TRACE (ModelRunner.eplb_trace): every engine step with prefill calls appends the all-reduced expert
+    counts its calls recorded, then zeroes them: every record holds the same number of pairs in every layer (each
+    layer routes the same rows), a multiple of top-k, at least every prompt token's pairs over the run (the recorder
+    counts a call's padded rows too: 224 pairs here for 94 prompt tokens at top-2), and the tags count the calls."""
+    pytest.importorskip("transformers.models.glm5_next.modeling_glm5_next")
+    from kiln.config import ModelConfig
+    from kiln.engine.request import SamplingParams
+    from tests.test_glm5_next import build, prompts
+
+    build(str(tmp_path), index_topk=16)
+    cfg = ModelConfig.from_pretrained(str(tmp_path))
+    ps = prompts(17, (40, 33, 21))
+    sp = SamplingParams(max_new_tokens=4, ignore_eos=True, logprobs=1)
+    trace = tmp_path / "trace.pt"
+    monkeypatch.setenv("KILN_EPLB_TRACE", str(trace))
+    _run(str(tmp_path), 4, monkeypatch, ps, sp, 1, record=True, dp_attention=2, piecewise=True, piecewise_group=2)
+    rec = torch.load(trace)
+    counts = rec["counts"]
+    assert counts.ndim == 3 and counts.shape[1] == len(rec["layers"]) and counts.shape[2] == cfg.num_experts
+    assert counts.shape[0] >= 2, "more than one prefill step traced"
+    assert rec["tags"] == sorted(rec["tags"]) and len(set(rec["tags"])) == len(rec["tags"])
+    k = cfg.num_experts_per_tok
+    per = counts.sum(dim=2)  # [records, layers]
+    assert bool((per == per[:, :1]).all()) and bool((per % k == 0).all()) and bool((per > 0).all()), per
+    assert int(per[:, 0].sum()) >= sum(len(p) for p in ps) * k
+
+
+def test_closing_an_engine_joins_its_rebalance_thread(tmp_path, monkeypatch):
+    """A rebalance loads its new slots on a host thread (ModelRunner._eplb_prep, "eplb-load"); an engine closed while
+    that thread runs stops it after the layer in hand and joins it (ModelRunner.eplb_stop), instead of leaving it to the
+    interpreter's exit, where a thread still loading aborted a pipeline stage ("terminate called without an active
+    exception", and its log upload never ran: kiln-pd4-s2 pc-s2ep-A, 2026-10-07). Red before: close() returned with the
+    thread alive. Rank 0's loading is slowed (each layer's real ep_prepare after 0.5 s) so the thread is still running
+    when close() comes."""
+    import threading
+    import time
+
+    pytest.importorskip("transformers.models.glm5_next.modeling_glm5_next")
+    from kiln.config import EngineConfig
+    from kiln.engine.engine import LLMEngine
+    from kiln.engine.request import SamplingParams
+    from tests.test_glm5_next import build, prompts
+
+    build(str(tmp_path), index_topk=16)
+    monkeypatch.setenv("KILN_MOE_EP", "1")
+    monkeypatch.setenv("KILN_EP_REDUNDANT", "1")
+    monkeypatch.setenv("KILN_EPLB_RECORD", "1")
+    monkeypatch.delenv("KILN_EPLB_INIT", raising=False)
+    eng = LLMEngine(EngineConfig(model_path=str(tmp_path), device="cpu", dtype=torch.float32, page_size=4,
+                                 num_pages=256, max_num_seqs=3, max_model_len=256, max_prefill_tokens=16, tp=2))
+    closed = False
+    try:
+        eng.generate(prompts(5, (40, 33)), SamplingParams(max_new_tokens=2, ignore_eos=True))
+        r = eng.runner
+        real = r.ep_prepare
+
+        def slow(*a):
+            time.sleep(0.5)
+            return real(*a)
+
+        r.ep_prepare = slow
+        if hasattr(r, "ep_checkpoint"):  # the thread's first step, so it is running even if rank 0 moves no slot
+            ck = r.ep_checkpoint
+
+            def slow_ck():
+                time.sleep(0.5)
+                return ck()
+
+            r.ep_checkpoint = slow_ck
+        r.eplb_prepare()
+        job = r._eplb_job
+        assert job is not None and job["thread"].is_alive()
+        layers = sum(1 for *_, mine in job["plan"] if mine)
+        eng.close()
+        closed = True
+        assert not job["thread"].is_alive(), "close() left the rebalance thread loading"
+        assert not [x for x in threading.enumerate() if x.name == "eplb-load" and x.is_alive()]
+        if layers > 1:  # stopped after the layer in hand, not after loading every layer (before: close() returned
+            # at once, the thread loaded all of them while the workers were stopped, and one of theirs aborted)
+            assert len(job["staged"]) < layers, (len(job["staged"]), layers)
+    finally:
+        if not closed:
+            eng.close()

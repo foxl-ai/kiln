@@ -116,6 +116,11 @@ QSHARD = os.environ.get("KILN_DSA_QSHARD", "0") == "1"
 # for the rest, each buffer's kernel call running its live rows only. Exact for any split; opt-in (new graphs).
 CP_SLOT_CLASSES = os.environ.get("KILN_DSA_CP_SLOT_CLASSES", "0") == "1"
 CP_SLOTS_SMALL = int(os.environ.get("KILN_DSA_CP_SLOTS_SMALL", "128"))
+# KILN_DSA_CP_SLOTS_X=1 (opt-in, with the classes): both classes in one kernels/dsa_slots_x.py call that reads and
+# writes each row at its own index (_cp_attend_classes_x), the same o / lse bit for bit without the per-class row
+# gathers of q_all / rows / bias / o / lse and the merge. Alone (1024 rows x 64 heads, trn1) no faster: the call is
+# the slots kernel's time either way (tools/probe_cp_slots_x.py, kernels/dsa_slots_x.py's docstring).
+CP_SLOTS_X = os.environ.get("KILN_DSA_CP_SLOTS_X", "0") == "1"
 # Context-parallel decode batches whose local pools fit keep (opt-in, attention_cp's decode branch only; prefill chunks
 # trace as before). KILN_DSA_CP_ALL_LOCAL=1: when a rank holds at most keep local pools (any context up to keep A kpool
 # tokens: 16,384 at A = 8, so every 8K row), every visible one is a candidate and the visible ones are a prefix (local
@@ -124,8 +129,45 @@ CP_SLOTS_SMALL = int(os.environ.get("KILN_DSA_CP_SLOTS_SMALL", "128"))
 # was 2.15 ms of a 7.05 ms DSA layer, ~1.6 ms of it engines idle on [1, 1]-slice gathers (CP-64 profile, 2026-10-06).
 # KILN_DSA_CP_PAGE_KEYS=1: the local pool keys read as whole page rows (the cache viewed as [pages, ppl Di], the
 # block table as the index: 2 KiB descriptors at GLM-5.3-Flash's ppl 8, Di 128, against 256 B rows), the same values.
+# KILN_DSA_LONG_PIPE=1 (opt-in): a chunk's query tiles through kernels/dsa_long_pipe.py in one call (the selection of
+# tile t overlapping the scores of tile t + 1; pools, order and scores bit-identical to one dsa_long_select call per
+# tile: tools/probe_lc_pipe.py) instead of one call per 128 queries.
+LONG_PIPE = os.environ.get("KILN_DSA_LONG_PIPE", "0") == "1"
+# KILN_DSA_LONG_PE=1 (opt-in, with KILN_DSA_LONG_PIPE=1; NOT exact): the pipelined call through
+# kernels/dsa_long_pipe_x.py with the head sum on the tensor engine (bf16 head terms: scores within 6.6e-3 of the row
+# maximum, 0.74 of 128 selected entries per row differ on real text; 18.0 -> 10.6 ms per 1024 queries at keep 128 x
+# 32,768 pools, docs/neuron-notes.md "Lever-1 per-step kernels"). Needs the needle and NLL gates.
+LONG_PE = os.environ.get("KILN_DSA_LONG_PE", "0") == "1"
+# KILN_DSA_CP_FLAGSTAT=1 (opt-in, a measurement): attention_cp_rows counts, per DSA layer, how often a rank's local
+# list would have been too short if each rank kept only its top K (K in CP_FLAG_KS) instead of keep: a (row, rank)
+# whose entry K (its (K + 1)-th largest local score, the list being in value order) is at or above the row's merged
+# keep-th value. Only those (row, rank) pairs could make a local-top-K merge inexact. Counts accumulate in each
+# layer's cp_flagstat buffer: [pairs, rows, then per K: flagged pairs, flagged rows].
+CP_FLAGSTAT = os.environ.get("KILN_DSA_CP_FLAGSTAT", "0") == "1"
+CP_FLAG_KS = (64, 96, 128, 192, 256)
+# KILN_DSA_CP_LOCAL_K=K (opt-in; a multiple of 8 below keep with A K >= keep): attention_cp_rows' local selection keeps
+# each rank's top K + 8 pools instead of keep (the kernel extracts in rounds of 8), the merge runs over each rank's top
+# K, and a row's merge is exact unless a CERTIFICATE fails: some rank's (K + 1)-th value is valid and at or above the
+# merged keep-th value, or the merge selects fewer than keep while some rank dropped a valid pool (every pool not in
+# the union is at or below its rank's (K + 1)-th value, so with the certificate it is strictly below the threshold,
+# ties included). Rows that fail it, up to CP_LOCAL_F per chunk and row group, are selected again with the whole keep
+# list on every rank, merged and attended from that (the default path's arithmetic for those rows), so the chunk is
+# exact; rows past CP_LOCAL_F are not, and each layer counts them (layer.cp_localk: [rows, failed, past F]).
+# Real text (KILN_DSA_CP_FLAGSTAT, lever-1 R8, rank 0's row group, 128k + 1M, 2026-10-07): K = 128 failed 0 of
+# 3,232,768 rows, K = 96 63 of them; K = 128 is twice the mean share of a rank at CP 8.
+CP_LOCAL_K = int(os.environ.get("KILN_DSA_CP_LOCAL_K", "0") or 0)
+CP_LOCAL_F = int(os.environ.get("KILN_DSA_CP_LOCAL_F", "128"))
+VISIBLE_SCORE = -5e29  # kernels/dsa_topk.VISIBLE: scores at or below it are not candidates
 CP_ALL_LOCAL = os.environ.get("KILN_DSA_CP_ALL_LOCAL", "0") == "1"
 CP_PAGE_KEYS = os.environ.get("KILN_DSA_CP_PAGE_KEYS", "0") == "1"
+# KILN_DSA_CP_DECODE_COMPACT=1 (opt-in, attention_cp's decode branch only): a decode batch's partial attention through
+# kernels/dsa_slots_c.py, which compacts each row's live slots (the rank's selected local pools and its tail, ~65 of the
+# 640 at A = 8) into one 128-slot chunk inside the kernel and attends only those; a call with any row over 128 live
+# slots takes the kernel's full loop. The same tokens and scores; fp32 summation order differs from dsa_slots.
+CP_DECODE_COMPACT = os.environ.get("KILN_DSA_CP_DECODE_COMPACT", "0") == "1"
+# KILN_DSA_CP_DEBUG_EPS=<e> (debug only, default 0: no change): a decode batch's partial attention scaled by 1 + e, a
+# perturbation of fp32-rounding size, to measure how far the decode outputs move for a numerically neutral change.
+CP_DEBUG_EPS = float(os.environ.get("KILN_DSA_CP_DEBUG_EPS", "0"))
 KV_LAYOUT = os.environ.get("KILN_DSA_KV", "full")
 if KV_LAYOUT not in ("full", "minimal"):
     raise ValueError(f"KILN_DSA_KV must be full or minimal, not {KV_LAYOUT!r}")
@@ -400,9 +442,11 @@ def init_layer(layer, cfg: ModelConfig, spec: AttnSpec, p, lin, tp: int) -> None
     lin("w_uk", "self_attn.kv_b_proj", nh * dn, r)  # W_UK of this rank's heads, [nh * dn, r]
     lin("w_uv", "self_attn.kv_b_proj", nh * dv, r)  # W_UV, [nh * dv, r]
     lin("o", "self_attn.o_proj", H, nh * dv)
-    if QSHARD and tp > 1 and long_capable(spec) and m.q_lora_rank is not None:
+    rows_cp = _dsa_long.cp_enabled() and tp > 1 and _dsa_long.cp_degree(tp) < tp  # CP row groups (attention_cp_rows)
+    if (QSHARD or rows_cp) and tp > 1 and long_capable(spec) and m.q_lora_rank is not None:
         # every head (KILN_DSA_QSHARD): a long-context chunk's own rows attend with all of them (only set here, so
-        # the default layers' static attributes are unchanged)
+        # the default layers' static attributes are unchanged); also with context-parallel row groups
+        # (KILN_DSA_CP_DEGREE), whose row groups attend their own rows with every head
         layer.qshard = True
         Hh = spec.num_heads
         lin("q_b_all", "self_attn.q_b_proj", Hh * (dn + dr), m.q_lora_rank)
@@ -783,11 +827,15 @@ def attention(model, layer, x, positions, slot_mapping, table, bias, top=None, w
                 raise NotImplementedError("context-parallel DSA (models/dsa_long.py): MTP selections and verify batches")
             if state_slot is None or getattr(layer, "open_pool", None) is None:
                 raise RuntimeError("the minimal DSA cache needs the request's state row (layer.open_pool, state_slot)")
+            if getattr(model, "cp_rows", 1) > 1 and table.dim() == 1:  # a chunk over context-parallel row groups
+                return attention_cp_rows(model, layer, x, positions, slot_mapping, table, state_slot=state_slot)
             return attention_cp(model, layer, x, positions, slot_mapping, table, state_slot=state_slot)
         return attention_minimal(model, layer, x, positions, slot_mapping, table, bias, top, want_top, state_slot)
     if getattr(model, "cp", 1) > 1 and long_capable(layer.spec):
         if want_top or top is not None or bias.dim() == 5:
             raise NotImplementedError("context-parallel DSA (models/dsa_long.py): MTP selections and verify batches")
+        if getattr(model, "cp_rows", 1) > 1 and table.dim() == 1:  # a chunk over context-parallel row groups
+            return attention_cp_rows(model, layer, x, positions, slot_mapping, table)
         return attention_cp(model, layer, x, positions, slot_mapping, table)
     m = layer.spec.mla
     d = m.dsa
@@ -834,13 +882,20 @@ def attention(model, layer, x, positions, slot_mapping, table, bias, top=None, w
         # KILN_DSA_FUSED=1: a pooled DSA layer's prefill chunk as one kernel, the indexer scores, their selection and
         # the attention over the latent (kernels/dsa_fused.py); the selection never leaves the chip, and no scratch
         # staging (GLM-5.3-Flash has no IndexShare layer reading it).
-        from ..kernels import dsa_fused
+        from ..kernels import dsa_fused, dsa_split
 
         (q_r, q_p), wi, _, pk = index
         nh, dn, dv, r = layer.nh, m.qk_nope_head_dim, m.v_head_dim, m.kv_lora_rank
         q_lat = torch.einsum("qhd,hdr->qhr", q_nope.reshape(T, nh, dn), model._w(layer, "w_uk").view(nh, dn, r))
-        ol = dsa_fused.attend(q_p.reshape(T, d.n_heads, -1), wi.view(T, d.n_heads), pk[0], positions, q_lat, kc[0],
-                              d.topk // d.kpool, d.head_dim ** -0.5, m.softmax_scale).to(model.dtype)
+        if dsa_split.split_takes(model, T):
+            # KILN_DSA_SPLIT_SELECT=1: each rank of the attention group selects for its block of the rows, the group
+            # gathers the pool selection, every rank attends all rows (kernels/dsa_split.py; the same result)
+            ol = dsa_split.attend_split(model, q_p.reshape(T, d.n_heads, -1), wi.view(T, d.n_heads), pk[0], positions,
+                                        q_lat, kc[0], d.topk // d.kpool, d.head_dim ** -0.5,
+                                        m.softmax_scale).to(model.dtype)
+        else:
+            ol = dsa_fused.attend(q_p.reshape(T, d.n_heads, -1), wi.view(T, d.n_heads), pk[0], positions, q_lat, kc[0],
+                                  d.topk // d.kpool, d.head_dim ** -0.5, m.softmax_scale).to(model.dtype)
         out = torch.einsum("qhr,hvr->qhv", ol, model._w(layer, "w_uv").view(nh, dv, r)).reshape(T, nh * dv)
         out = F.linear(out, model._w(layer, "o"))
         return (out, None) if want_top else out
@@ -1107,21 +1162,30 @@ def attention_long(model, layer, q_nope, qi, wi, positions, table, q_resid=None)
     return F.linear(out, model._w(layer, "o"))
 
 
+def _cp_pg(model):
+    """The context-parallel collectives' process group: the row group (cp_group, KILN_DSA_CP_DEGREE), else the
+    attention group."""
+    pg = getattr(model, "cp_group", None)
+    return model.attn_group if pg is None else pg
+
+
 def _cp_gather(model, x: torch.Tensor) -> torch.Tensor:
-    """[A, ...]: every attention-group member's x, in attention-rank order (a zero-padded group all-reduce: exact)."""
+    """[A, ...]: every attention-group member's x, in attention-rank order (a zero-padded group all-reduce: exact).
+    With row groups (KILN_DSA_CP_DEGREE): every member of this rank's row group, A = cp of them."""
     A = model.cp
     full = x.unsqueeze(0) * model.long_grp_onehot.to(x.dtype).view(A, *[1] * x.dim())
-    return model._all_reduce(full.contiguous(), model.attn_group)
+    return model._all_reduce(full.contiguous(), _cp_pg(model))
 
 
 def _cp_reduce_scatter(model, x: torch.Tensor) -> torch.Tensor:
-    """Block attention-rank of A equal row blocks of x [A r, ...] summed over the attention group."""
+    """Block attention-rank of A equal row blocks of x [A r, ...] summed over the attention group (the row group with
+    KILN_DSA_CP_DEGREE)."""
     if x.device.type == "cpu":
-        y = model._all_reduce(x, model.attn_group)
+        y = model._all_reduce(x, _cp_pg(model))
         return y.reshape(model.cp, -1, *x.shape[1:]).index_select(0, model.long_grp_index)[0]
     import torch.distributed._functional_collectives as funcol
 
-    return funcol.reduce_scatter_tensor(x, "sum", 0, model.attn_group)
+    return funcol.reduce_scatter_tensor(x, "sum", 0, _cp_pg(model))
 
 
 def _cp_local_all(sc: torch.Tensor, nloc: torch.Tensor, prow: torch.Tensor, keep: int):
@@ -1146,6 +1210,27 @@ def _cp_local_all(sc: torch.Tensor, nloc: torch.Tensor, prow: torch.Tensor, keep
     lval = torch.where(on, sc, torch.full_like(sc, NEG_INF))
     rows = torch.where(on, pr, pr[:, :1])
     return lp, lc, lval, rows
+
+
+def _lnc2() -> bool:
+    """Whether this graph is traced for trn2 at LNC=2 (False on the host, where no runtime is configured)."""
+    from .. import platform
+
+    try:
+        return platform.nki_grid() == 2
+    except RuntimeError:
+        return False
+
+
+def _pool_row_flat(table: torch.Tensor, pg: torch.Tensor, mm: torch.Tensor, ppl: int) -> torch.Tensor:
+    """pool_row of a chunk's one block table [P] at LNC=2: the page of each local pool by a 1-D gather of the table,
+    not an element gather from the table broadcast to [rows, P]. Equal values. On trn2 the broadcast form computes wrong
+    in the 4096-page piece graphs of the R8 long-context engine (a 32 MB broadcast int64 [1024, 4096]): with it, and the
+    selection kernel's shared scratch at grid 2 (kernels/dsa_long_select.py), the 4096-page bucket answered the needle
+    wrong (docs/neuron-notes.md "Long prompts on trn2"). Alone on one core both forms are exact (tools/probe_cp_gathers.py),
+    and the 1024-page graphs are right with either. trn1 keeps the broadcast form and its graph keys."""
+    pgc = pg.clamp(max=table.shape[-1] - 1)
+    return table.view(-1)[pgc.reshape(-1)].view(pgc.shape) * ppl + (mm - pg * ppl)
 
 
 def attention_cp(model, layer, x, positions, slot_mapping, table, state_slot=None):
@@ -1253,8 +1338,11 @@ def attention_cp(model, layer, x, positions, slot_mapping, table, state_slot=Non
     # slots: the local list (selected ones attended), then the tail pool if this rank owns it
     ppl = ps // (kp * A)
     tb = table.view(1, -1).expand(T, -1) if table.dim() == 1 else table
+    flat = table.dim() == 1 and _lnc2()  # see _pool_row_flat
     def pool_row(mm):
         pg = torch.floor(mm.to(torch.float32) * (1.0 / ppl)).to(torch.int64)
+        if flat:
+            return _pool_row_flat(table, pg, mm, ppl)
         return tb.gather(1, pg.clamp(max=tb.shape[1] - 1)) * ppl + (mm - pg * ppl)
     tail_m = torch.floor(npool.to(torch.float32) * (1.0 / A)).to(torch.int64)
     tail_own = (npool - tail_m * A) == rank.view(())
@@ -1270,8 +1358,9 @@ def attention_cp(model, layer, x, positions, slot_mapping, table, state_slot=Non
     if CP_SLOT_CLASSES and table.dim() == 1:
         q_lat = torch.einsum("thd,hdr->thr", q_nope.reshape(T, nh, dn), model._w(layer, "w_uk").view(nh, dn, r))
         q_all = _cp_gather(model, q_lat).permute(1, 0, 2, 3).reshape(T, A * nh, r)
-        o_r, lse_r = _cp_attend_classes(q_all, layer.k_cache, rows_sel, rows_tail, mine, tail_own, npool, positions,
-                                        m.softmax_scale, kp, CP_SLOTS_SMALL, n_slots)
+        o_r, lse_r = (_cp_attend_classes_x if CP_SLOTS_X else _cp_attend_classes)(
+            q_all, layer.k_cache, rows_sel, rows_tail, mine, tail_own, npool, positions, m.softmax_scale, kp,
+            CP_SLOTS_SMALL, n_slots)
         return _cp_combine(model, layer, o_r, lse_r, T, A, nh, r, dv)
     # by broadcasting, not concatenation (dsa_long.slots: NCC_IFML902 on a concatenate of these pieces)
     sl = torch.arange(n_slots, device=positions.device).view(1, n_slots)
@@ -1286,7 +1375,14 @@ def attention_cp(model, layer, x, positions, slot_mapping, table, state_slot=Non
     # every head's latent query (the heads are split over the group: gather them), partial attention, combine
     q_lat = torch.einsum("thd,hdr->thr", q_nope.reshape(T, nh, dn), model._w(layer, "w_uk").view(nh, dn, r))
     q_all = _cp_gather(model, q_lat).permute(1, 0, 2, 3).reshape(T, A * nh, r)
-    o_r, lse_r = _dsa_long.cp_attend_partial(q_all, layer.k_cache, srows, sbias, m.softmax_scale)
+    if CP_DECODE_COMPACT and table.dim() == 2:  # a decode batch: each row over its live slots (dsa_slots_c)
+        from ..kernels import dsa_slots_c
+
+        o_r, lse_r = dsa_slots_c.attend(q_all, layer.k_cache, srows, sbias, m.softmax_scale, lse=True)
+    else:
+        o_r, lse_r = _dsa_long.cp_attend_partial(q_all, layer.k_cache, srows, sbias, m.softmax_scale)
+    if CP_DEBUG_EPS and table.dim() == 2:
+        o_r = o_r * (1.0 + CP_DEBUG_EPS)
     lse_all = _cp_gather(model, lse_r.float())  # [A, T, H]
     LSE = torch.logsumexp(lse_all, dim=0)  # [T, H]
     part = o_r * torch.exp(lse_r - LSE).unsqueeze(-1)  # [T, H, R]
@@ -1294,6 +1390,281 @@ def attention_cp(model, layer, x, positions, slot_mapping, table, state_slot=Non
     o = _cp_reduce_scatter(model, part)  # [T, nh, R]: this rank's heads
     out = torch.einsum("thr,hvr->thv", o.to(model.dtype), model._w(layer, "w_uv").view(nh, dv, r)).reshape(T, nh * dv)
     return F.linear(out, model._w(layer, "o"))
+
+
+def attention_cp_rows(model, layer, x, positions, slot_mapping, table, state_slot=None):
+    """attention_cp of a prefill chunk (table [P], positions [T]) over context-parallel ROW GROUPS
+    (KILN_DSA_CP_DEGREE, models/dsa_long.py cp_degree_env). The attention group (attention TP = TP, DP attention 1)
+    is R = cp_rows row groups of A = cp consecutive ranks; each row group holds a context-parallel copy of the
+    sequence's DSA cache (its rank c holds context pools m A + c), so every rank writes ITS share of all T rows'
+    latent, indexer rows and pool keys, while row group g selects and attends only the chunk's rows g n .. (g + 1) n
+    - 1 (n = T / R) with every head (the whole-head q_b / W_UK / W_UV / o_proj copies, layer.qshard). Per rank the
+    selection, the merge (over the A ranks of the row group) and the slot attention (the slot classes,
+    _cp_attend_classes, over the rank's own selected pools and its tail) are those of an n-row chunk at CP A, while
+    the chunk has T rows. The row group's partials are combined by log-sum-exp with a reduce-scatter onto n / A-row
+    sub-blocks: rank c of row group g ends with rows g n + c n / A .., i.e. block g A + c of T / (R A) rows, its
+    tensor-parallel rank's sequence-parallel block. Returns the o_proj output of those rows in their place of a zero
+    [T, H]: the token mixer's world reduction (_attn_all_reduce: a reduce-scatter under KILN_SP_RS) sums each row's
+    one value with zeros, exactly, as for attention_long_qshard."""
+    m = layer.spec.mla
+    d = m.dsa
+    kp, Di = d.kpool, d.head_dim
+    A, R = model.cp, model.cp_rows
+    rank = model.long_grp_index  # this rank within its row group
+    T = x.shape[0]
+    Hh, dn, dv, r = layer.spec.num_heads, m.qk_nope_head_dim, m.v_head_dim, m.kv_lora_rank
+    if T % (A * R):
+        raise ValueError(f"context-parallel row groups: a {T}-row chunk does not divide into {R} x {A} row blocks")
+    minimal = minimal_layout(m)
+    if (m.qk_rope_head_dim or m.q_lora_rank is None or not getattr(layer, "qshard", False) or kp < 2
+            or (layer.pool_key is None and not minimal) or (minimal and state_slot is None)):
+        raise NotImplementedError("context-parallel row groups need a NoPE pooled DSA layer with q_lora, the whole-head "
+                                  "copies and the separate pool-key cache (KILN_DSA_POOL_CACHE), or the minimal layout "
+                                  "with the request's state row")
+    n = T // R
+    keep = d.topk // kp
+    scale = Di ** -0.5
+    ps = model.page_size
+    gi = model.cp_row_index
+
+    def mine(t):  # this row group's rows
+        return t.reshape(R, n, *t.shape[1:]).index_select(0, gi)[0]
+
+    # every row's latent and indexer key rows (_project / _indexer's arithmetic, dr = 0), this row group's queries
+    a = F.linear(x, model._w(layer, "w_a"))
+    ql = m.q_lora_rank
+    q_resid = rms_norm(a[:, :ql], layer.q_a_norm, m.norm_eps)
+    c = rms_norm(a[:, ql:ql + r], layer.kv_a_norm, m.norm_eps)
+    qrb = mine(q_resid)
+    q_p = F.linear(qrb, model._w(layer, "idx_wq")).view(n, d.n_heads, Di)
+    ki = F.linear(x, model._w(layer, "idx_wk"))
+    ki = F.layer_norm(ki.float(), (Di,), layer.idx_knorm_w.float(), layer.idx_knorm_b.float(), 1e-6).to(x.dtype)
+    w2 = F.linear(mine(x).float(), layer.idx_wproj) * d.n_heads ** -0.5
+    ki = torch.cat([ki, F.linear(x, layer.idx_pool_gate)], dim=-1)
+
+    # this rank's share of every row (attention_cp's writes; padded rows to the dump slot)
+    real = slot_mapping >= ps
+    dump = _dsa_long.cp_dump_slot(ps, A)
+    ls = _dsa_long.cp_local_slots(positions, table, ps, kp, A, rank)
+    ls = torch.where(real, ls, torch.full_like(ls, dump))
+    model._store(layer.k_cache, ls, c.unsqueeze(1))
+    if not minimal:  # here, before slots4: the full layout's trace (so its graph keys) as before the minimal branch
+        model._store(layer.v_cache, ls, ki.unsqueeze(1))
+    first = positions - positions % kp
+    pos4 = (first.unsqueeze(-1) + torch.arange(kp, device=positions.device, dtype=positions.dtype)).reshape(-1)
+    slots4 = _dsa_long.cp_local_slots(pos4, table, ps, kp, A, rank)
+    slots4 = torch.where(real.repeat_interleave(kp), slots4, torch.full_like(slots4, dump))
+    if minimal:
+        # V holds the owner's pool-key pieces (the others and padded rows write the dump slot); the open-pool row of
+        # the request is updated on every rank (attention_cp's minimal branch)
+        write_pool_keys_minimal(model, layer, d, positions, table, slot_mapping, ki, state_slot, slots=slots4)
+    else:
+        vrows = layer.v_cache[slots4]
+        if model.fp8_max is not None:
+            vrows = vrows.to(model.dtype)
+        from .glm5_next import pool_keys
+
+        keys = pool_keys(layer, d, vrows.reshape(T, kp, -1)[..., : 2 * Di])
+        layer.pool_key.index_put_((slots4,), keys.reshape(T * kp, Di // kp).to(layer.pool_key.dtype))
+
+    # this row group's rows: the local selection in the kernel's value order, the exact merge over the row group
+    prow = _dsa_long.cp_pool_rows(table, ps, kp, A)  # [Pl]
+    pk = (layer.v_cache if minimal else layer.pool_key).view(-1, Di)[prow]  # [Pl, Di]
+    if model.fp8_max is not None and pk.dtype != model.dtype:
+        pk = pk.to(model.dtype)
+    pos_b = mine(positions)
+    npool = _dsa_long.npools(pos_b, kp)
+    nloc = _dsa_long.cp_local_count(npool, A, rank)
+    Pl = prow.shape[-1]
+    cpu = x.device.type == "cpu"
+    from ..kernels import dsa_long_select
+
+    K = _local_k(keep, A)
+    if not K:  # (the default path's code as it was, line for line: graph keys hash the printed trace)
+        if not cpu and not Pl < keep:
+            lp, lc, lval = _select_tiles(q_p, w2, pk, nloc, keep, scale, vorder=True)
+        else:
+            sc = _dsa_long.scores(q_p, w2, pk, nloc, scale)  # [n, Pl]
+            lp, lc = _dsa_long.select(sc, keep) if cpu else _dsa_long.select_device(sc, keep)
+            k = torch.arange(keep, device=lp.device).view(1, keep)
+            fill = sc.new_full((n, keep), NEG_INF) if Pl < keep else torch.full_like(sc[:, :keep], NEG_INF)
+            lval = torch.where(k < lc.view(n, 1), sc.gather(1, lp), fill)
+            lp, lc, lval = dsa_long_select.value_order(lp, lc, lval)
+        cpool = lp * A + rank.view(())
+        every_val = _cp_gather(model, lval).permute(1, 0, 2)  # [n, A, keep]
+        every_c = _cp_gather(model, cpool.to(torch.float32)).permute(1, 0, 2)
+        sel = _dsa_long.cp_merge(every_val, every_c, keep, None, Pl * A)  # [n, A, keep]
+        if CP_FLAGSTAT and getattr(layer, "cp_flagstat", None) is not None:
+            _cp_flagstat(layer, every_val, sel, keep)
+        chosen = sel.permute(1, 0, 2).reshape(A, n * keep)
+        chosen = chosen.to(torch.float32).index_select(0, rank).view(n, keep) > 0  # this rank's selected entries
+    else:  # KILN_DSA_CP_LOCAL_K: each rank's top K + 8, the merge over the top K, the certificate's (K + 1)-th values
+        lp, lc, lval = _cp_local_lists(q_p, w2, pk, nloc, K + 8, scale, Pl, cpu)
+        lp = lp[:, :K]
+        cpool = lp * A + rank.view(())
+        every_val = _cp_gather(model, lval[:, :K + 1].contiguous()).permute(1, 0, 2)  # [n, A, K + 1]
+        every_c = _cp_gather(model, cpool.to(torch.float32)).permute(1, 0, 2)  # [n, A, K]
+        vk = every_val[:, :, :K]
+        sel = _dsa_long.cp_merge(vk, every_c, keep, None, Pl * A)  # [n, A, K]
+        fail = _local_k_fail(vk, every_val[:, :, K], sel, keep)  # [n], the same on every rank of the row group
+        chosen = _cp_chosen(sel, rank, A, n, K)
+        # the failed rows again from every rank's whole keep list (up to nF of them, the first ones)
+        nF = min(CP_LOCAL_F, n)
+        fi, nf = _dsa_long.compact(fail.to(torch.float32).view(1, n), nF)
+        fi = fi.view(nF)
+        live = torch.arange(nF, device=fi.device) < nf.view(())
+        nloc_f = torch.where(live, nloc[fi], torch.zeros_like(nloc[fi]))
+        lp_f, _, lval_f = _cp_local_lists(q_p[fi], w2[fi], pk, nloc_f, keep, scale, Pl, cpu,
+                                          trip=(nf > 0).to(torch.int32))  # an empty tile does not run (~0.24 ms)
+        lp_f = torch.where(live.view(nF, 1), lp_f, torch.zeros_like(lp_f))  # (stale memory when it did not run)
+        lval_f = torch.where(live.view(nF, 1), lval_f, torch.full_like(lval_f, NEG_INF))
+        cpool_f = lp_f * A + rank.view(())
+        ev_f = _cp_gather(model, lval_f).permute(1, 0, 2)  # [nF, A, keep]
+        ec_f = _cp_gather(model, cpool_f.to(torch.float32)).permute(1, 0, 2)
+        chosen_f = _cp_chosen(_dsa_long.cp_merge(ev_f, ec_f, keep, None, Pl * A), rank, A, nF, keep) & live.view(nF, 1)
+        if getattr(layer, "cp_localk", None) is not None:
+            nff = nf.to(torch.float32).view(1)
+            layer.cp_localk.add_(torch.cat([torch.full_like(nff, float(n)), nff, (nff - float(nF)).clamp(min=0.0)]))
+    ppl = ps // (kp * A)
+    tb = table.view(1, -1).expand(n, -1)
+    flat = _lnc2()  # see _pool_row_flat
+
+    def pool_row(mm):
+        pg = torch.floor(mm.to(torch.float32) * (1.0 / ppl)).to(torch.int64)
+        if flat:
+            return _pool_row_flat(table, pg, mm, ppl)
+        return tb.gather(1, pg.clamp(max=tb.shape[1] - 1)) * ppl + (mm - pg * ppl)
+
+    tail_m = torch.floor(npool.to(torch.float32) * (1.0 / A)).to(torch.int64)
+    tail_own = (npool - tail_m * A) == rank.view(())
+    rows_sel = pool_row(lp)
+    rows_tail = pool_row(tail_m.clamp(max=Pl - 1).view(n, 1))
+    from ..kernels import dsa_decode
+
+    n_slots = keep + 1 if cpu else dsa_decode.NCH * 128
+    # every head's latent query of this row group's rows (whole-head q_b, W_UK), the partial attention over this
+    # rank's slots
+    q = F.linear(qrb, model._w(layer, "q_b_all")).view(n, Hh, dn)
+    q_lat = torch.einsum("thd,hdr->thr", q, model._w(layer, "w_uk_all").view(Hh, dn, r))
+    if not K:
+        o_r, lse_r = (_cp_attend_classes_x if CP_SLOTS_X else _cp_attend_classes)(
+            q_lat, layer.k_cache, rows_sel, rows_tail, chosen, tail_own, npool, pos_b, m.softmax_scale, kp,
+            CP_SLOTS_SMALL, n_slots)
+    else:  # every row in one buffer of CP_SLOTS_SMALL slots (its K entries and the tail), the failed rows replaced
+        o_r, lse_r = _cp_attend_classes(q_lat, layer.k_cache, rows_sel, rows_tail, chosen, tail_own, npool, pos_b,
+                                        m.softmax_scale, kp, CP_SLOTS_SMALL, n_slots, single=True)
+        tb_f = table.view(1, -1).expand(nF, -1)
+        pg_f = torch.floor(lp_f.to(torch.float32) * (1.0 / ppl)).to(torch.int64)
+        rows_f = tb_f.gather(1, pg_f.clamp(max=tb_f.shape[1] - 1)) * ppl + (lp_f - pg_f * ppl)
+        o_f, lse_f = _cp_attend_classes(q_lat[fi], layer.k_cache, rows_f, rows_tail[fi], chosen_f,
+                                        tail_own[fi] & live, npool[fi], pos_b[fi], m.softmax_scale, kp,
+                                        CP_SLOTS_SMALL, n_slots)
+        slot = (torch.cumsum(fail.to(torch.float32), 0) - 1.0).clamp(min=0.0).to(torch.int64)  # its place in fi
+        use = fail & (slot < nF)
+        slot = slot.clamp(max=nF - 1)
+        o_r = torch.where(use.view(n, 1, 1), o_f[slot], o_r)
+        lse_r = torch.where(use.view(n, 1), lse_f[slot], lse_r)
+    # combined over the row group onto n / A-row sub-blocks, then W_UV and o_proj of every head for this rank's rows
+    lse_all = _cp_gather(model, lse_r.float())  # [A, n, Hh]
+    LSE = torch.logsumexp(lse_all, dim=0)  # [n, Hh]
+    part = (o_r * torch.exp(lse_r - LSE).unsqueeze(-1)).contiguous()  # [n, Hh, r] = [A n / A, Hh, r]
+    o = _cp_reduce_scatter(model, part)  # [n / A, Hh, r]: this rank's sub-block
+    out = torch.einsum("thr,hvr->thv", o.to(model.dtype), model._w(layer, "w_uv_all").view(Hh, dv, r))
+    out = F.linear(out.reshape(n // A, Hh * dv), model._w(layer, "o_all"))  # [n / A, H]
+    oh = (model.cp_row_onehot.view(R, 1) * model.long_grp_onehot.view(1, A)).reshape(R * A).to(out.dtype)
+    full = out.unsqueeze(0) * oh.view(R * A, 1, 1)
+    return full.reshape(T, -1)
+
+
+def local_k_counts(model) -> list[float] | None:
+    """KILN_DSA_CP_LOCAL_K's counters of this rank's row group, summed over the layers: [rows, rows that failed the
+    certificate, failed rows past KILN_DSA_CP_LOCAL_F (not exact)], or None when the counters are off."""
+    tot = None
+    for l in model.kv_layers():
+        b = getattr(l, "cp_localk", None)
+        if b is not None:
+            v = b.detach().cpu().double()
+            tot = v if tot is None else tot + v
+    return None if tot is None else tot.tolist()
+
+
+def local_k_report(before: list[float] | None, after: list[float] | None, what: str) -> str | None:
+    """One line for a gate's log: the counters' change over `what` (None when the counters are off)."""
+    if after is None:
+        return None
+    r, fl, past = (a - b for a, b in zip(after, before or [0.0, 0.0, 0.0]))
+    return (f"local-K {what}: {fl:.0f} of {r:.0f} rows failed the certificate ({fl / max(r, 1):.2e}), {past:.0f} past "
+            f"KILN_DSA_CP_LOCAL_F ({'EXACT' if past == 0 else 'NOT EXACT'})")
+
+
+def _cp_local_lists(q_, w_, pk, nloc, L: int, scale: float, Pl: int, cpu: bool, trip=None):
+    """KILN_DSA_CP_LOCAL_K: (pools, counts, values) of this rank's local top L of rows q_ in the selection kernel's
+    value order (attention_cp_rows' selection; a module function, not a closure: a closure would turn the caller's
+    variables into cells, which renames their nodes in the trace and so moves every graph key). trip (an int tensor
+    of one element, 0 or 1, at most 128 rows): kernels/dsa_long_select_t.py, the tile run only when trip is 1 (its
+    outputs are stale memory at 0: the caller masks them)."""
+    from ..kernels import dsa_long_select
+
+    rr = q_.shape[0]
+    if not cpu and not Pl < L:
+        if trip is not None and rr <= 128:
+            from ..kernels import dsa_long_select_t
+
+            return dsa_long_select_t.select(q_, w_, pk, nloc, L, scale, trip, vorder=True)
+        return _select_tiles(q_, w_, pk, nloc, L, scale, vorder=True)
+    sc_ = _dsa_long.scores(q_, w_, pk, nloc, scale)  # [rr, Pl]
+    lp_, lc_ = _dsa_long.select(sc_, L) if cpu else _dsa_long.select_device(sc_, L)
+    k_ = torch.arange(L, device=lp_.device).view(1, L)
+    fill_ = sc_.new_full((rr, L), NEG_INF) if Pl < L else torch.full_like(sc_[:, :L], NEG_INF)
+    lv = torch.where(k_ < lc_.view(rr, 1), sc_.gather(1, lp_), fill_)
+    return dsa_long_select.value_order(lp_, lc_, lv)
+
+
+def _cp_chosen(sel_, rank, A: int, rr: int, L: int):
+    """This rank's selected entries [rr, L] of a merge's [rr, A, L] selection."""
+    c_ = sel_.permute(1, 0, 2).reshape(A, rr * L)
+    return c_.to(torch.float32).index_select(0, rank).view(rr, L) > 0
+
+
+def _local_k(keep: int, A: int) -> int:
+    """KILN_DSA_CP_LOCAL_K for a merge of A ranks' lists into keep pools (0: off, or not below keep)."""
+    K = CP_LOCAL_K
+    if K <= 0 or K >= keep:
+        return 0
+    if K % 8 or A * K < keep:
+        raise ValueError(f"KILN_DSA_CP_LOCAL_K={K}: a multiple of 8 with {A} x K >= keep {keep}")
+    return K
+
+
+def _local_k_fail(vk, nxt, sel, keep: int):
+    """[n] bool, KILN_DSA_CP_LOCAL_K's certificate failed: vk [n, A, K] every rank's top K (value order, NEG_INF past
+    its count), nxt [n, A] each rank's (K + 1)-th, sel the merge of vk. A row fails when some rank's (K + 1)-th is a
+    candidate and reaches the merged keep-th value, or the merge selected fewer than keep (then every candidate
+    belongs, and a rank with a (K + 1)-th dropped one)."""
+    n = vk.shape[0]
+    t = torch.where(sel, vk, torch.full_like(vk, 3.0e38)).amin(dim=-1).amin(dim=-1)  # [n] the merged keep-th value
+    # (against a tensor, not a float literal: a comparison with one lowers to f64, NCC_ESPP004 on trn1)
+    short = sel.to(torch.float32).sum(dim=-1).sum(dim=-1) < torch.full_like(t, float(keep))
+    vis = torch.full_like(nxt, VISIBLE_SCORE)
+    bad = (nxt > vis) & ((nxt >= t.view(n, 1)) | short.view(n, 1))
+    return bad.to(torch.float32).amax(dim=-1) > 0
+
+
+def _cp_flagstat(layer, every_val, sel, keep: int) -> None:
+    """KILN_DSA_CP_FLAGSTAT: add this chunk's counts to layer.cp_flagstat (see CP_FLAGSTAT). every_val [n, A, keep]
+    every rank's local list in value order (NEG_INF past its count), sel the merge's selection."""
+    n, A, _ = every_val.shape
+    t = torch.where(sel, every_val, torch.full_like(every_val, 3.0e38)).amin(dim=-1).amin(dim=-1)  # [n]
+    vis = torch.full_like(every_val[:, :, 0], VISIBLE_SCORE)
+    parts = [torch.full_like(t[:1], float(n * A)), torch.full_like(t[:1], float(n))]
+    for K in CP_FLAG_KS:
+        if K >= keep:
+            parts += [torch.zeros_like(t[:1]), torch.zeros_like(t[:1])]
+            continue
+        kk = every_val[:, :, K]  # [n, A]
+        flag = ((kk >= t.view(n, 1)) & (kk > vis)).to(torch.float32)
+        parts += [flag.sum().view(1), (flag.amax(dim=-1)).sum().view(1)]
+    layer.cp_flagstat.add_(torch.cat(parts))
 
 
 def _cp_combine(model, layer, o_r, lse_r, T: int, A: int, nh: int, r: int, dv: int):
@@ -1308,7 +1679,7 @@ def _cp_combine(model, layer, o_r, lse_r, T: int, A: int, nh: int, r: int, dv: i
 
 
 def _cp_attend_classes(q_all, kc, rows_sel, rows_tail, mine, tail_own, npool, positions, scale: float, kp: int,
-                       small: int, full: int):
+                       small: int, full: int, single: bool = False):
     """(o [T, H, R] fp32, lse [T, H] fp32): this rank's partial attention of every row over its selected local pools
     and its tail, as attention_cp's fixed slots give it, with each row in a buffer sized by where its selected entries
     end. The local lists come in the selection kernel's value order (score descending, pool ascending:
@@ -1342,6 +1713,18 @@ def _cp_attend_classes(q_all, kc, rows_sel, rows_tail, mine, tail_own, npool, po
         ok = ((sl < L) & ms).unsqueeze(-1) | ((sl == L).unsqueeze(-1) & tail_tok)
         return rows, torch.where(ok, 0.0, NEG_INF).to(torch.float32)
 
+    if single:  # every row fits by construction (KILN_DSA_CP_LOCAL_K): its keep entries, the tail, zero padding
+        if small < keep + 1:
+            raise ValueError(f"one slot buffer of {small} slots for lists of {keep} and the tail")
+        C = small
+        sl = torch.arange(C, device=dev).view(1, C)
+        rs = torch.cat([rows_sel, rows_sel.new_zeros(T, C - keep)], dim=1) if C > keep else rows_sel
+        ms = torch.cat([mine, mine.new_zeros(T, C - keep)], dim=1) if C > keep else mine
+        rows = torch.where(sl < keep, rs, torch.where(sl == keep, rows_tail, torch.zeros_like(rows_tail)))
+        ok = ((sl < keep) & ms).unsqueeze(-1) | ((sl == keep).unsqueeze(-1) & tail_tok)
+        bias = torch.where(ok, 0.0, NEG_INF).to(torch.float32)
+        return dsa_slots_n.attend(q_all, kc, rows, bias, scale, torch.full((1,), T, dtype=torch.int64, device=dev),
+                                  lse=True)
     out_o, out_l = [], []
     for want, (C, L) in ((fits, (small, S1)), (~fits, (full, keep))):
         idx, n = _dsa_long.compact(want.to(torch.float32).view(1, T), T)  # this buffer's rows first
@@ -1355,6 +1738,42 @@ def _cp_attend_classes(q_all, kc, rows_sel, rows_tail, mine, tail_own, npool, po
     o = torch.where(fits.view(T, 1, 1), out_o[0], out_o[1])
     lse = torch.where(fits.view(T, 1), out_l[0], out_l[1])
     return o, lse
+
+
+def _cp_attend_classes_x(q_all, kc, rows_sel, rows_tail, mine, tail_own, npool, positions, scale: float, kp: int,
+                         small: int, full: int):
+    """_cp_attend_classes (the same classes, buffers and o / lse, bit for bit) through kernels/dsa_slots_x.py: both
+    classes in one call over the full-size q_all, rows and bias, each class's rows read and written at their own row
+    (its compact() index list), so no row of q_all, rows, bias, o or lse is gathered and nothing is merged
+    (KILN_DSA_CP_SLOTS_X)."""
+    from ..kernels import dsa_slots_x
+
+    T, keep = mine.shape
+    dev = q_all.device
+    S1 = min(small - 1, keep)
+    j = torch.arange(keep, device=dev).view(1, keep)
+    bound = torch.where(mine, j + 1, torch.zeros_like(j)).amax(-1)
+    fits = bound <= S1
+    t4 = torch.arange(kp, device=dev).view(1, 1, kp)
+    tail_tok = tail_own.view(T, 1, 1) & (npool.view(T, 1, 1) * kp + t4 <= positions.view(T, 1, 1))
+
+    def build(C: int, L: int):
+        sl = torch.arange(C, device=dev).view(1, C)
+        if C <= keep:
+            rs, ms = rows_sel[:, :C], mine[:, :C]
+        else:
+            cl = sl.clamp(max=keep - 1).expand(T, C)
+            rs, ms = torch.gather(rows_sel, 1, cl), torch.gather(mine, 1, cl)
+        rows = torch.where(sl < L, rs, torch.where(sl == L, rows_tail, torch.zeros_like(rows_tail)))
+        ok = ((sl < L) & ms).unsqueeze(-1) | ((sl == L).unsqueeze(-1) & tail_tok)
+        return rows, torch.where(ok, 0.0, NEG_INF).to(torch.float32)
+
+    classes = []
+    for want, (C, L) in ((fits, (small, S1)), (~fits, (full, keep))):
+        idx, n = _dsa_long.compact(want.to(torch.float32).view(1, T), T)
+        rows, bias = build(C, L)
+        classes.append((rows, bias, idx.view(T), n.view(1)))
+    return dsa_slots_x.attend(q_all, kc, classes, scale)
 
 
 def _index_scorer_takes(layer, table, q) -> bool:
@@ -1416,6 +1835,32 @@ def _select_tiles(q_p, w, pk, npool, keep: int, scale: float, vorder: bool = Fal
     kw = {"vorder": True} if vorder else {}  # (vorder: the kernel's value order, CP slot classes)
     if n <= 128:
         return dsa_long_select.select(q_p, w, pk, npool, keep, scale, **kw)
+    if LONG_PIPE:  # every tile in one software-pipelined call (KILN_DSA_LONG_PIPE): the same results bit for bit
+        from ..kernels import dsa_long_pipe
+
+        P = pk.shape[0]
+        if LONG_PE:  # KILN_DSA_LONG_PE: the head sum on the tensor engine (not exact)
+            from ..kernels import dsa_long_pipe_x
+
+            if dsa_long_pipe_x.supported(n, q_p.shape[1], q_p.shape[2], P, keep, dsa_long_select.pick_sub(P, keep)):
+                return dsa_long_pipe_x.select(q_p, w, pk, npool, keep, scale, skip=False, pe=True, **kw)
+        sub = dsa_long_select.pick_sub(P, keep)
+        if dsa_long_pipe.supported(n, q_p.shape[1], q_p.shape[2], P, keep, sub):
+            return dsa_long_pipe.select(q_p, w, pk, npool, keep, scale, **kw)
+        blk = dsa_long_pipe.MAX_TILES * 128
+        if n > blk and dsa_long_pipe.supported(blk, q_p.shape[1], q_p.shape[2], P, keep, sub):
+            # A chunk past MAX_TILES tiles per rank (an R8 rank holds a quarter of a 16384-row chunk: 32 tiles): the
+            # pipelined call over each block of MAX_TILES tiles, a tail under two tiles one call per tile, rather
+            # than every tile its own call.
+            parts = []
+            for i in range(0, n, blk):
+                m = min(blk, n - i)
+                if dsa_long_pipe.supported(m, q_p.shape[1], q_p.shape[2], P, keep, sub):
+                    parts.append(dsa_long_pipe.select(q_p[i:i + m], w[i:i + m], pk, npool[i:i + m], keep, scale, **kw))
+                else:
+                    parts += [dsa_long_select.select(q_p[j:j + 128], w[j:j + 128], pk, npool[j:j + 128], keep, scale,
+                                                     **kw) for j in range(i, i + m, 128)]
+            return tuple(torch.cat([p[j] for p in parts]) for j in range(3))
     parts = [dsa_long_select.select(q_p[i:i + 128], w[i:i + 128], pk, npool[i:i + 128], keep, scale, **kw)
              for i in range(0, n, 128)]
     return tuple(torch.cat([p[j] for p in parts]) for j in range(3))

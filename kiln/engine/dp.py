@@ -166,7 +166,8 @@ class DPScheduler:
             live = list(g.running) + list(g.waiting)
             load = sum(r.dp_charge if r.dp_charge is not None else r.num_tokens for r in live)
             held = self._held[i] = self.held(g, req)
-            key = (len(live) >= g.cfg.max_num_seqs, load + req.num_tokens - held, len(live), i)
+            seats = len(live) + g.pd_pinned  # a nixl prefill engine's pins hold seats until released
+            key = (seats >= g.cfg.max_num_seqs, load + req.num_tokens - held, seats, i)
             if best is None or key < best:
                 best = key
         return best[3]

@@ -317,10 +317,12 @@ def with_layer(model, i: int, body):
     return f, tuple(tensors.values())
 
 
-def linear_parts(model, cfg, i: int, inp: dict, T: int, ss) -> None:
+def linear_parts(model, cfg, i: int, inp: dict, T: int, ss, R: int | None = None) -> None:
     """A hyper-connection model's linear-attention layer piece by piece (models/hybrid.py layer,
     models/linear_attn.mix): both blocks with their hyper-connections, the mixer and the MLP alone,
-    the mHC collapse alone, and the mixer's own pieces; ss: the state slot (chunk form)."""
+    the mHC collapse alone, and the mixer's own pieces; ss: the state slot (chunk form). R: the hidden
+    state's rows (T x DP-attention groups; the attention block and the mixer take them all and run their group's
+    T, linear_attn.mix's _attn_in), T the rows of every per-group piece."""
     import torch.nn.functional as F_
 
     from kiln.models import hybrid as hy
@@ -334,8 +336,10 @@ def linear_parts(model, cfg, i: int, inp: dict, T: int, ss) -> None:
     W = cfg.hybrid.hc * H
     pos, slots = inp["positions"], inp["slots"]
     eps = cfg.rms_norm_eps
-    streams = (torch.randn(T, W, generator=g)).to(torch.bfloat16).to(DEV)
-    x = rms_norm(torch.randn(T, H, generator=g).to(torch.bfloat16), torch.ones(H, dtype=torch.bfloat16), eps).to(DEV)
+    R = R or T
+    streams = (torch.randn(R, W, generator=g)).to(torch.bfloat16).to(DEV)
+    xR = rms_norm(torch.randn(R, H, generator=g).to(torch.bfloat16), torch.ones(H, dtype=torch.bfloat16), eps).to(DEV)
+    x = xR[:T].contiguous()
     say(f"layer {i} ({sp.kind}): {L.nk} k / {L.nv} v heads x {sp.head_k_dim} on this rank, conv {L.conv_dim}, "
         f"KILN_LINEAR_ATTN_KERNEL={la.LINEAR_ATTN_KERNEL} (takes this layer: {la.kernel_takes(sp)})", flush=True)
 
@@ -350,17 +354,47 @@ def linear_parts(model, cfg, i: int, inp: dict, T: int, ss) -> None:
                                                                     lambda x: mixer(V, x, p, s)), streams, pos, slots)
     run("ffn block (mHC + MLP)", lambda V, st: hy._block(model, V, "ffn", st, V.post_norm,
                                                          lambda x: hy._mlp(model, V, x)), streams)
-    run("mHC collapse alone", lambda V, st: hy._mhc(model, V, "attn", st.view(T, cfg.hybrid.hc, H))[0], streams)
-    run("mixer alone (linear_attn.mix)", mixer, x, pos, slots)
+    run("mHC collapse alone", lambda V, st: hy._mhc(model, V, "attn", st.view(R, cfg.hybrid.hc, H))[0], streams)
+    run("mixer alone (linear_attn.mix)", mixer, xR, pos, slots)
+    from kiln.kernels import gated_norm as gn
+
+    if la.kernel_takes(sp) and sp.kind == "kda":  # the same mixer with the gated norm as a kernel toggled
+        was = gn.MODE
+        gn.MODE = "0" if gn.takes("kda", sp.gate_act, sp.head_v_dim, default=True) and was != "0" else "1"
+        try:
+            run(f"mixer alone, KILN_KDA_FUSED_NORM={gn.MODE}", mixer, xR, pos, slots)
+        finally:
+            gn.MODE = was
     run("MLP alone", lambda V, x: hy._mlp(model, V, x), x)
     run("in_qkv projection", lambda V, x: F_.linear(x, model._w(V, "in_qkv")), x)
     run("KDA gates (f_a, f_b, b, g_a, g_b)", lambda V, x: (F_.linear(F_.linear(x, V.f_a), V.f_b).float().sum()
                                                           + F_.linear(x, model._w(V, "in_b")).float().sum()
                                                           + F_.linear(F_.linear(x, V.g_a), V.g_b).float().sum()), x)
+    if sp.kind == "kda" and L.g_a is not None:  # the projections of x as one matmul (fix 4's sizing), against both
+        cd, dk_, gr = L.conv_dim, sp.head_k_dim, L.g_a.shape[0]
+
+        def unfused(V, x):
+            return (F_.linear(x, model._w(V, "in_qkv")).float().sum()
+                    + F_.linear(F_.linear(x, V.f_a), V.f_b).float().sum() + F_.linear(x, model._w(V, "in_b")).float().sum()
+                    + F_.linear(F_.linear(x, V.g_a), V.g_b).float().sum())
+
+        def fused(V, x):
+            y = F_.linear(x, torch.cat([model._w(V, "in_qkv"), V.f_a, V.g_a, model._w(V, "in_b")]))
+            return (y[:, :cd].float().sum() + F_.linear(y[:, cd:cd + dk_], V.f_b).float().sum()
+                    + y[:, cd + dk_ + gr:].float().sum() + F_.linear(y[:, cd + dk_:cd + dk_ + gr], V.g_b).float().sum())
+
+        run("in_qkv + gates, one graph", unfused, x)
+        run("in_qkv + gates, one concatenated matmul", fused, x)
     D = L.conv_dim
     xe = torch.randn(T + sp.conv_kernel - 1, D, generator=g).to(torch.bfloat16).to(DEV)
     run("short conv", lambda V, xe: la._causal_conv(xe, V.conv_w, T), xe)
     run("output projection", lambda V, o: F_.linear(o, model._w(V, "out")), torch.randn(T, L.nv * sp.head_v_dim).to(torch.bfloat16).to(DEV))
+    if sp.kind == "kda":  # the gated norm between the delta rule and the output projection, both ways
+        o32 = torch.randn(T, L.nv, sp.head_v_dim, generator=g).to(DEV)
+        zg = torch.randn(T, L.nv, sp.head_v_dim, generator=g).to(torch.bfloat16).to(DEV)
+        run("gated norm (XLA, _mix_rows's tail)", lambda V, o, z: gn.reference(o, z, V.o_norm, eps), o32, zg)
+        if la.kernel_takes(sp):
+            run("gated norm (kernels/gated_norm.py)", lambda V, o, z: gn.apply(o, z, V.o_norm, eps), o32, zg)
     from tests.test_delta_rule import inputs
 
     q, k, v, gate, beta, S0 = (t.to(DEV) for t in inputs(T, L.nk, L.nv, sp.kind == "kda", seed=5,
@@ -1094,7 +1128,7 @@ def run(args, rank: int = 0, port: int = 0) -> None:
     if "laparts" in args.what:
         for label, i in kinds.items():
             if "linear" in label and (args.part_layers is None or i in args.part_layers):
-                linear_parts(model, cfg, i, inp, T, ss)
+                linear_parts(model, cfg, i, inp, T, ss, R)
     if "parts" in args.what:
         for label, i in kinds.items():
             if args.part_layers is None or i in args.part_layers:

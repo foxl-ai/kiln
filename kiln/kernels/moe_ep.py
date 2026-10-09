@@ -517,6 +517,8 @@ if nki is not None:
         tf = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=tf, data=cn, op0=nl.add, operand0=float(C), op1=nl.multiply, operand1=0.5,
                            engine=nisa.vector_engine)
+        if S.get("dmy", False):  # lnc2
+            _dummy_lanes(tf, C, 128)  # lnc2
         nisa.tensor_copy(dst=ts[:, sb:sb + 1], src=tf, engine=nisa.vector_engine)
 
     def _lane_weights(S, P, ts, e_cmp, w):
@@ -584,6 +586,8 @@ if nki is not None:
                  rcv=_rcv(L["rcv"], LW), sp=L["sp"], pid=L["pid"], wr=L["wr"], DG=DG)
         S2 = dict(H=H, M=M, CT=CT, LW=LW2, NS=NS2, gu=gu, sgu=sgu, dn=dn, sdn=sdn, sels=sels, act=act, lim=lim,
                   tsc=tsc, rcv=_rcv(L["rcv"], LW2), sp=L["sp"], pid=L["pid"], wr=L["wr"], DG=DG)
+        S["dmy"] = L["npg"] == 2  # lnc2
+        S2["dmy"] = L["npg"] == 2  # lnc2
 
         # 0. The plan.
         tk = nl.ndarray((128, NT, K), dtype=i32, buffer=nl.sbuf)  # topi[T 128 + p, k]
@@ -685,6 +689,8 @@ if nki is not None:
         Pd = dict(NT=NT, C=C, K=K, jrow=jrow, ones1=ones1, loc_h=loc_h, wts=wts)
 
         # 1. out = 0.
+        if L["npg"] == 2:  # lnc2
+            C = C + 128  # lnc2
         out = nl.ndarray((C, H), dtype=x.dtype, buffer=nl.shared_hbm)
         _zero_out(out, C, H, L)
 
@@ -950,6 +956,8 @@ if nki is not None:
         tf = nl.ndarray((LW, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=tf, data=cn, op0=nl.add, operand0=float(C), op1=nl.multiply, operand1=0.5,
                            engine=nisa.vector_engine)
+        if P.get("dmy", False):  # lnc2
+            _dummy_lanes(tf, C, LW)  # lnc2
         nisa.tensor_copy(dst=ts, src=tf, engine=nisa.vector_engine)
 
     def _weights_s(P, ts, e_cmp, LW, w):
@@ -1280,6 +1288,10 @@ if nki is not None:
         SB = dict(H=H, M=M, CT=CT, LW=128, NS=1, gu=gu, sgu=sgu, dn=dn, sdn=sdn, sels=_consts(bc), act=act, lim=lim,
                   tsc=tsc, rcv=_rcv(L["rcv"], 128), sp=L["sp"], pid=L["pid"], wr=L["wr"])
         Pd = dict(NT=P["NT"], C=C, K=K, jrow=P["jrow_b"], ones1=P["ones1"], loc_h=P["loc_h"], wts=wts)
+        P["dmy"] = L["npg"] == 2  # lnc2
+        SB["dmy"] = L["npg"] == 2  # lnc2
+        if L["npg"] == 2:  # lnc2
+            C = C + 128  # lnc2
         out = nl.ndarray((C, H), dtype=x.dtype, buffer=nl.shared_hbm)
         _zero_out(out, C, H, L)
         xrs = nl.ndarray((LW, H), dtype=bf16, buffer=nl.sbuf)  # the small loop's x rows, zeroed once
@@ -1729,20 +1741,46 @@ if nki is not None:
 
     # --- end of the small-lane kernel v5's source ---
 
+    # --- LNC=2 (trn2): the scatter's dummy rows. The lines marked "# lnc2" above are this fix's; _kernel_rev drops them
+    # from the source it hashes for grid-1 launches, so trn1's kernels, their REV and their graph keys are as before ---
+
+    def _dummy_lanes(tf, C: int, n: int):
+        """At LNC=2 (trn2) an empty lane's token C (tf, fp32 [n, 1], one lane per partition) becomes the dummy row
+        C + lane, so that every index of the scatter read-modify-write (_pass, _pass_s: dma_compute with a vector_offset
+        destination) is in range and unique: the kernels then allocate out with 128 rows past C, which no caller reads.
+        Why: an out-of-range index in that scatter under oob_mode=skip breaks the DMA engine at LNC=2 (2026-10-06,
+        trn2.48xlarge, SDK 2.32: a later DMA aborts with TDR_PREF_DESC_* on the dynamic queues and the execution times out;
+        docs/neuron-notes.md "The EP hang at LNC=2 is the scatter's out-of-bound skip"), and "unique_indices must be True
+        (non-unique indices not yet supported)" for a scatter RMW (nki/isa/_advanced.py dma_compute). The gathers keep
+        their out-of-range token (C + lane is past C) and their skip, which the device handles."""
+        pi = nl.ndarray((n, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.iota(dst=pi, pattern=[[0, 1]], offset=0, channel_multiplier=1)  # the lane (partition) index
+        pf = nl.ndarray((n, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=pf, src=pi, engine=nisa.vector_engine)
+        em = nl.ndarray((n, 1), dtype=nl.float32, buffer=nl.sbuf)  # [token == C] lane
+        nisa.scalar_tensor_tensor(dst=em, data=tf, op0=nl.greater_equal, operand0=float(C), op1=nl.multiply,
+                                  operand1=pf)
+        nisa.tensor_tensor(dst=tf, data1=tf, data2=em, op=nl.add, engine=nisa.vector_engine)
+
 else:
     kiln_moe_ep_core = kiln_moe_ep_kernel = kiln_moe_ep_small = kiln_moe_ep_small2 = kiln_moe_ep_small3 = kiln_moe_ep_small5 = None
 
 
-def _kernel_rev(end: str = "    # --- end of the dequantize-first kernel's source") -> int:
+def _kernel_rev(end: str = "    # --- end of the dequantize-first kernel's source", lnc2: bool = False) -> int:
     """CRC-32 of the kernel source from the start of the NKI block up to the marker `end` (LNL's cache key does not
     see NKI source: moe_prefill._kernel_rev). Each kernel hashes its own range, so editing one does not recompile
-    every graph of the other."""
+    every graph of the other. Lines marked "# lnc2" (code that only runs at LNC=2, where the kernel sees two programs)
+    are left out unless lnc2: a grid-1 (trn1) launch traces exactly the source it hashes, so its REV, graph keys and
+    NEFFs stay as before those lines; a grid-2 launch passes the REV of the whole text."""
     import zlib
 
     src = open(__file__).read()
     a = src.index("if nki is not None:\n    DGU = ")
     b = src.index(end, a)
-    return zlib.crc32(src[a:b].encode())
+    text = src[a:b]
+    if not lnc2:
+        text = "".join(ln for ln in text.splitlines(keepends=True) if "# lnc2" not in ln)
+    return zlib.crc32(text.encode())
 
 
 REV = _kernel_rev()
@@ -1750,6 +1788,9 @@ REV_SMALL = _kernel_rev("    # --- end of the small-lane kernel's source")
 REV_SMALL2 = _kernel_rev("    # --- end of the small-lane kernel v2's source")
 REV_SMALL3 = _kernel_rev("    # --- end of the small-lane kernel v3's source")
 REV_SMALL5 = _kernel_rev("    # --- end of the small-lane kernel v5's source")
+# The grid-2 (trn2 LNC=2) launches' revisions: the whole source, the "# lnc2" lines included (_kernel_rev).
+REV_LNC2 = _kernel_rev(lnc2=True)
+REV_SMALL2_LNC2 = _kernel_rev("    # --- end of the small-lane kernel v2's source", lnc2=True)
 # The scale broadcast (kernel argument bc): 3 matmuls per 512-column scale row (hi, mid, lo selected and
 # accumulated in PSUM, exact by construction) or 1 (one ones matmul over the three parts: exact only if the
 # tensor engine's sum over its three partitions is, which tools/probe_moe_ep.py --bc 1 checks).
@@ -1821,7 +1862,8 @@ def kernel_inputs(x, topv, topi, blob, lmap, act: int = 1, lim: float = 10.0, LW
     sg, sd = (blob["tsg"], blob["tsd"]) if tsc else (blob["sgu"], blob["sdn"])
     args = dict(x=x, topi=topi.to(torch.int32), wts=topv.to(torch.bfloat16), lmap=lmap.to(torch.int32),
                 gu=blob["gu"], sgu=sg, dn=blob["dn"], sdn=sd, LW=LW, LW2=LW2, PMAX=PM,
-                act=act, lim=float(lim), bc=BCAST if bc is None else bc, rev=REV, tsc=int(tsc))
+                act=act, lim=float(lim), bc=BCAST if bc is None else bc, rev=REV_LNC2 if _lnc2() else REV,
+                tsc=int(tsc))
     if split(blob["gu"].shape[2], x.shape[1]):  # only then: an unsplit call's arguments, and so its graph key, are as before
         args["spl"] = 1
     if DGE == "sw":
@@ -1850,6 +1892,15 @@ def grid() -> int:
     from .. import platform
 
     return platform.nki_grid()
+
+
+def _lnc2() -> bool:
+    """The kernels launch at grid 2 (trn2 at LNC=2), where kiln_moe_ep_kernel and kiln_moe_ep_small2 return 128 dummy
+    rows past their input's (_dummy_lanes); False on trn1 and on a host with no runtime configured (tests)."""
+    try:
+        return grid() == 2
+    except RuntimeError:
+        return False
 
 
 def split(M: int | None = None, H: int | None = None) -> int:
@@ -1897,7 +1948,7 @@ def moe_ep(x, topv, topi, blob, lmap, act: int = 1, lim: float = 10.0) -> torch.
         out = wrap_nki(kiln_moe_ep_small2)[grid()](
             x=x, topi=topi.to(torch.int32), wts=topv.to(torch.bfloat16), lmap=lmap.to(torch.int32), gu=blob["gu"],
             dsg=blob["dsg"], dn=blob["dn"], dsd=blob["dsd"], sgu=sg, sdn=sd, LW=SMALL_LW, act=act, lim=float(lim),
-            bc=BCAST, rev=REV_SMALL2, tsc=int(tsc), **({"spl": 1} if spl else {}))
+            bc=BCAST, rev=REV_SMALL2_LNC2 if _lnc2() else REV_SMALL2, tsc=int(tsc), **({"spl": 1} if spl else {}))
     elif uses_small(T):
         C, K = topi.shape
         El = blob["gu"].shape[0]
@@ -1909,6 +1960,8 @@ def moe_ep(x, topv, topi, blob, lmap, act: int = 1, lim: float = 10.0) -> torch.
             lim=float(lim), rev=REV_SMALL)
     else:
         out = wrap_nki(kiln_moe_ep_kernel)[grid()](**kernel_inputs(x, topv, topi, blob, lmap, act, lim))
+    if _lnc2():  # kiln_moe_ep_kernel / kiln_moe_ep_small2 at LNC=2: 128 dummy rows past the input's (_dummy_lanes)
+        return out[:T]
     return out[:T] if pad else out
 
 

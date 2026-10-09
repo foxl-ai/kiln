@@ -90,11 +90,23 @@ def _mine(x: torch.Tensor, N: int, dp_index: torch.Tensor | None) -> torch.Tenso
     return x.reshape(N, B, *x.shape[1:]).index_select(0, dp_index).reshape(B, *x.shape[1:])
 
 
+# neuronx-cc 2.27 misreads the board in a ONE-row reader graph (R = 1: no DP attention, decode bucket 1) at k = 1:
+# spec_prep's draft column and mtp_prep's acc and base came back 0, so every overlapped EAGLE-3 k 1 draft was rejected
+# (Llama-3.1-8B-Instruct TP 4 on trn2.3xlarge: 0 of 128 per prompt against ~0.75 synchronous; trn1.2xlarge, the graphs
+# alone: R = 1 wrong at k 1, R = 2 and R = 16 right, k 3 right, board widths 7, 8 and 16 alike; SDK 2.32, 2026-10-07).
+# The readers therefore run a one-row call on the row twice and return the first copy; every other shape traces as
+# before.
+
+
 def spec_prep(board, slot_idx, table, rows, pad_slot, valid, Q: int, k: int, ps: int, N: int, dp_index=None):
     """board [S, W] fp32; slot_idx [R] int64 (R = N * B, group-major; padding rows: a scratch slot); table [B, P]
     int64 and rows [B, Q] int64 (this rank's group); pad_slot [B, Q] int64 (KV slots for padding rows);
     valid [R] fp32 (1 for a real row). Returns ids [R, Q] int64, draft [R * Q] int64, and this group's
     positions [B, Q], KV slots [B, Q] and state rows [B, 1 + Q] (int64)."""
+    if slot_idx.shape[0] == 1:  # see above: the row twice, the first copy back
+        ids, draft, pos, slot, st = spec_prep(board, slot_idx.repeat(2), table.repeat(2, 1), rows.repeat(2, 1),
+                                              pad_slot.repeat(2, 1), valid.repeat(2), Q, k, ps, N, dp_index)
+        return ids[:1], draft[:Q], pos[:1], slot[:1], st[:1]
     sb = board.index_select(0, slot_idx)  # [R, W]
     T, acc, base, cur, drafts = sb[:, :Q], sb[:, Q], sb[:, Q + 1], sb[:, Q + 2], sb[:, Q + 4:Q + 4 + k]
     row0 = (T * _onehot(acc, Q)).sum(-1, keepdim=True)  # the newest token: T[acc]
@@ -140,17 +152,32 @@ def spec_post(board, slot_idx, out, ids, rows_all, valid, Q: int, k: int):
     return torch.cat([T, acc.unsqueeze(1), real.to(torch.float32).unsqueeze(1)], dim=1)
 
 
-def mtp_prep(board, slot_idx, table, pad_slot, valid, Q: int, ps: int, N: int, dp_index=None):
+def mtp_prep(board, slot_idx, table, pad_slot, valid, Q: int, ps: int, N: int, dp_index=None, k: int = 1):
     """After spec_post: the MTP pass over the verified positions, ids T [R, Q] int64 (global), last_index acc [R]
-    int64 (global), and this group's positions base_old .. [B, Q] and KV slots [B, Q]."""
+    int64 (global), and this group's positions base_old .. [B, Q] and KV slots [B, Q]. With k > 1 also the later
+    single-position passes' positions and KV slots [B, k - 1] (DecoderForCausalLM.forward_mtp_k pos_rest /
+    slot_rest): base, base + 1, ..., after the newest token's position base, as ModelRunner.mtp_launch's
+    last + 1 + s."""
+    if slot_idx.shape[0] == 1:  # see spec_prep: the row twice, the first copy back
+        out = mtp_prep(board, slot_idx.repeat(2), table.repeat(2, 1), pad_slot.repeat(2, 1), valid.repeat(2), Q, ps,
+                       N, dp_index, k)
+        return tuple(o[:1] for o in out)
     sb = board.index_select(0, slot_idx)
     T, acc, base = sb[:, :Q], sb[:, Q], sb[:, Q + 1]
     first = base - 1.0 - acc
     pos = first.unsqueeze(1) + torch.arange(Q, device=board.device, dtype=torch.float32).unsqueeze(0)
     pos_g, valid_g = _mine(pos, N, dp_index), _mine(valid, N, dp_index)
-    pos_g = torch.where(valid_g.unsqueeze(1) > 0, pos_g, torch.zeros_like(pos_g))  # a padded row sits at position 0
-    slot_g = torch.where(valid_g.unsqueeze(1) > 0, _slots(pos_g, table, ps), pad_slot)
-    return T.to(torch.int64), acc.to(torch.int64), pos_g.to(torch.int64), slot_g
+    keep = valid_g.unsqueeze(1) > 0
+    pos_g = torch.where(keep, pos_g, torch.zeros_like(pos_g))  # a padded row sits at position 0
+    slot_g = torch.where(keep, _slots(pos_g, table, ps), pad_slot)
+    out = (T.to(torch.int64), acc.to(torch.int64), pos_g.to(torch.int64), slot_g)
+    if k == 1:
+        return out
+    rest = base.unsqueeze(1) + torch.arange(k - 1, device=board.device, dtype=torch.float32).unsqueeze(0)
+    rest_g = _mine(rest, N, dp_index)
+    rest_g = torch.where(keep, rest_g, torch.zeros_like(rest_g))
+    rslot_g = torch.where(keep, _slots(rest_g, table, ps), pad_slot[:, : k - 1])
+    return out + (rest_g.to(torch.int64), rslot_g)
 
 
 def mtp_post(board, slot_idx, drafts, valid, Q: int, k: int):

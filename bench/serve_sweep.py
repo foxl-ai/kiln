@@ -135,6 +135,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "placement a warm-up window gives; the pause is printed, outside both levels")
     ap.add_argument("--eplb-dump", default=None, help="with --eplb-rebalance: save each level's all-reduced counts "
                                                        "to <this>.L<level>.pt (KILN_EPLB_INIT files)")
+    ap.add_argument("--prompt-ids", default=None,
+                    help="prompts as consecutive non-overlapping --input-len windows of a tokenized text (1-D int .npy, "
+                         "tools/text_prompt_ids.py) instead of random ids: real routing; the graphs are the same")
     ap.add_argument("--keep-cache", action="store_true",
                     help="do not flush the prefix cache between levels: a level repeated (--shared-prefix-len N N) "
                          "then measures a warm cache, a server's steady state")
@@ -146,6 +149,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="EngineConfig.hicache_host_gb: host-memory KV tier per rank (engine/hicache.py; no graph changes)")
     ap.add_argument("--no-ckpt-lookahead", action="store_true",
                     help="EngineConfig.state_checkpoint_lookahead=False (junction checkpoints only one request late)")
+    # One long prefill over several engines (engine/pp.py): this process is stage --pp-stage of --pp-stages, its layers
+    # cut at --pp-split (comma list; default by measured weight), listening on --pp-listen and sending to --pp-next.
+    ap.add_argument("--pp-stages", type=int, default=1)
+    ap.add_argument("--pp-stage", type=int, default=0)
+    ap.add_argument("--pp-split", default=None, help="comma list: the first layer of every stage after the first")
+    ap.add_argument("--pp-listen", default=None, help="host:port (rank r on port + r): the previous stage connects")
+    ap.add_argument("--pp-next", default=None, help="host:port of the next stage's --pp-listen")
+    ap.add_argument("--pp-follow", action="store_true",
+                    help="only stage 0 takes requests; the other stages follow its plan frames (tools/pp_follow.py)")
     ap.add_argument("--provider", action="append", default=[],
                     help="name=input,cached_input,output dollars per 1M tokens, repeatable (default: the list price "
                          "0.15,0.03,0.50 and DeepInfra's discounted 0.075,0.015,0.25, whose cached price is assumed "
@@ -180,6 +192,9 @@ def engine_config(args, core_base: int = 0):
         **({"state_checkpoint_lookahead": False} if getattr(args, "no_ckpt_lookahead", False) else {}),
         **({"hicache_host_gb": args.hicache_host_gb} if getattr(args, "hicache_host_gb", 0) else {}),
         **({"page_size": args.page_size} if getattr(args, "page_size", 0) else {}),
+        **({"pp_stages": args.pp_stages, "pp_stage": args.pp_stage, "pp_listen": args.pp_listen,
+            "pp_next": args.pp_next, "pp_split": ladder(args.pp_split), "pp_follow": getattr(args, "pp_follow", False)}
+           if getattr(args, "pp_stages", 1) > 1 else {}),
     )
 
 
@@ -252,7 +267,9 @@ def run_level(eng, args, conc: int, n_req: int, prompt, params):
     if split:
         print(f"device time split: prefill call {split['prefill_call_s']:.3f} s, decode call "
               f"{split['decode_call_s']:.3f} s, per step {split['step_s']:.3f} s; prefill {split['prefill_share']:.1%} "
-              f"of the attributed time over {split['steps']} steps", flush=True)
+              f"of the attributed time over {split['steps']} steps"
+              f"{'' if split['per_step_separable'] else ' (every step made one call: the per-step cost is in the calls)'}",
+              flush=True)
     return recs, wall, split
 
 
@@ -299,12 +316,24 @@ def device_split(steps: list, overlap: bool) -> dict | None:
         return None
     t = np.array([r[0] for r in rows])
     X = np.array([[r[1], r[2], 1.0] for r in rows])
-    (a, b, c), *_ = np.linalg.lstsq(X, t, rcond=None)
+    # When every step made the same number of calls (a lone request: each step one prefill call or one decode
+    # call), decode_calls + prefill_calls is the intercept column and a per-step cost cannot be told apart from
+    # the per-call ones. lstsq then returns the minimum-norm solution, which moves about a third of each call's
+    # cost into the per-step term and makes the decode call negative. Measured on trn2 (a lone 32k prompt, the
+    # lever-1 long-context engine): prefill call 0.786 s, per step 0.411 s, decode call -0.375 s, while the
+    # runtime trace (KILN_RT_INSPECT) showed 1.238 s of device execution per prefill call with 0.05-0.09 ms
+    # between its graphs. So the calls are fitted alone there: each call's cost includes its step's host time.
+    separable = int(np.linalg.matrix_rank(X)) == 3
+    if separable:
+        (a, b, c), *_ = np.linalg.lstsq(X, t, rcond=None)
+    else:
+        (a, b), *_ = np.linalg.lstsq(X[:, :2], t, rcond=None)
+        c = 0.0
     d_sum, p_sum = X[:, 0].sum(), X[:, 1].sum()
     tot = a * d_sum + b * p_sum
     return {"decode_call_s": float(a), "prefill_call_s": float(b), "step_s": float(c), "steps": len(rows),
             "prefill_share": float(b * p_sum / tot) if tot > 0 else 0.0,
-            "decode_calls": int(d_sum), "prefill_calls": int(p_sum)}
+            "decode_calls": int(d_sum), "prefill_calls": int(p_sum), "per_step_separable": separable}
 
 
 def kv_report(eng, args, conc: int, running: list, done: list) -> None:
@@ -462,10 +491,40 @@ def sampling(args, seed: int = 0):
                                   ignore_eos=True)
 
 
+_TEXT = {"ids": None, "path": None, "next": 0}
+
+
+def text_prompter(args, seed: int):
+    """--prompt-ids: prompts of input_len taken as consecutive, non-overlapping windows of a tokenized text (a 1-D int
+    .npy, tools/text_prompt_ids.py), in the order the run asks for them across every level and the warm-up, so no window
+    is used twice and the prefix cache never hits; two runs with the same arguments get the same prompts in the same
+    order (the seed is not used). Running out of text is an error, not a wrap."""
+    import numpy as np
+
+    if _TEXT["path"] != args.prompt_ids:
+        _TEXT.update(ids=np.load(args.prompt_ids).astype(np.int64), path=args.prompt_ids, next=0)
+    ids, L = _TEXT["ids"], args.input_len
+
+    def take(n: int = L) -> list[int]:
+        i = _TEXT["next"]
+        _TEXT["next"] += 1
+        if (i + 1) * L > len(ids):
+            raise SystemExit(f"--prompt-ids {args.prompt_ids}: {len(ids)} tokens hold {len(ids) // L} windows of {L}, "
+                             f"window {i} was asked for")
+        return ids[i * L : i * L + n].tolist()
+
+    take.unique = take
+    return take
+
+
 def prompter(args, vocab: int, seed: int, n: int = 0):
     """Random-token prompts of input_len. With a shared prefix length n, each is one of --num-prefixes
     seeded random prefixes of n tokens (chosen at random) plus input_len - n unique tokens. The
     returned function's .unique() is always a fully unique prompt (the warm-up request's)."""
+    if getattr(args, "prompt_ids", None):
+        if n or getattr(args, "input_len_min", 0):
+            raise SystemExit("--prompt-ids takes neither --shared-prefix-len nor --input-len-min")
+        return text_prompter(args, seed)
     rng = random.Random(seed if not n else seed * 1_000_003 + n)  # the same prefixes for every level of n
     lo = 1000 if vocab > 2000 else 0  # (tiny test vocabularies)
     unique = lambda n=args.input_len: [rng.randrange(lo, vocab) for _ in range(n)]  # noqa: E731

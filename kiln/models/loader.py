@@ -11,6 +11,7 @@ from safetensors import safe_open
 from ..config import LinearSpec, ModelConfig
 from . import hybrid, linear_attn, mla
 from .decoder import DecoderForCausalLM
+from ..kernels import nkilib_dense
 from .quant import FP8, dequant, fit_e4m3_max, mxfp4_unpack, quantize_fp8_rows
 
 ARCHITECTURES = {a: DecoderForCausalLM for a in (
@@ -180,12 +181,20 @@ def load_model(path: str, cfg: ModelConfig, dtype: torch.dtype, device: torch.de
                tp_rank: int = 0, tp_size: int = 1, tp_group=None, keep_fp8: bool = False,
                fp8_max: float = 240.0, vocab_parallel: bool = False, packed_mxfp4: bool = False,
                mtp: bool = False, moe_kernel: str = "xla", attn_tp: int | None = None, attn_group=None,
-               dp_attention: int = 1, max_num_seqs: int | None = None, pd_role: str | None = None):
+               dp_attention: int = 1, max_num_seqs: int | None = None, pd_role: str | None = None,
+               pp: tuple | None = None, eagle3=None):
     """keep_fp8: weights the checkpoint quantizes stay FP8 on the device (dequantized in-graph);
     otherwise they are dequantized to `dtype` here. fp8_max: the device's largest finite e4m3.
     attn_tp / attn_group: the attention TP (DecoderForCausalLM; None = its default); dp_attention:
     DP-attention groups (DecoderForCausalLM: DP attention); max_num_seqs: the engine's (the automatic
-    expert-parallel default, decoder.moe_ep_enabled)."""
+    expert-parallel default, decoder.moe_ep_enabled).
+
+    pp: (stage, stages, split) of a pipeline stage (engine/pp.py): only the layers [lo, hi) that stage runs are read
+    from the checkpoint and put on the device (model.load_range); every other decoder layer's parameters stay on the
+    meta device, unread, so a stage costs ~1 / stages of the layers' HBM, host memory and load time. Model-generic: the
+    filter is the layer loop below, whatever the architecture (KILN_PP_ALL_LAYERS=1 loads every layer as before).
+    Embeddings, the final norm, the LM head and model-level tensors load on every stage (prep and post graphs run
+    there)."""
     cls = ARCHITECTURES.get(cfg.architecture)
     if cls is None:
         raise NotImplementedError(f"architecture {cfg.architecture} is not supported (have: {sorted(ARCHITECTURES)})")
@@ -197,17 +206,32 @@ def load_model(path: str, cfg: ModelConfig, dtype: torch.dtype, device: torch.de
         model = cls(cfg, dtype, max_positions, tp_rank, tp_size, tp_group, keep_fp8=keep_fp8,
                     vocab_parallel=vocab_parallel, packed_mxfp4=packed_mxfp4, mtp=mtp, moe_kernel=moe_kernel,
                     attn_tp=attn_tp, attn_group=attn_group, dp_attention=dp_attention, max_num_seqs=max_num_seqs,
-                    pd_role=pd_role)
+                    pd_role=pd_role, eagle3=eagle3)
     model.materialize = lambda mod: _materialize(mod, device)
+    model.load_range = None
+    if pp is not None:
+        from ..engine import pp as _pp
+
+        if not _pp.ALL_LAYERS:
+            if cfg.architecture == "InklingForConditionalGeneration":
+                raise NotImplementedError("stage-only loading (pipeline stages) is not wired for Inkling's loader")
+            stage, stages, split = pp
+            model.load_range = _pp.model_stage_range(model.layers, stages, stage, split)
     _load_decoder(model, path, dtype, fp8_max)
     for name, (cos, sin) in model.rope_tables(max_positions).items():
         model.register_buffer(f"rope_cos{name}", cos.to(dtype).to(device), persistent=False)
         model.register_buffer(f"rope_sin{name}", sin.to(dtype).to(device), persistent=False)
     model.register_buffer("vocab_start_t", torch.tensor(model.vocab_start, dtype=torch.int64).to(device),
                           persistent=False)
+    if getattr(model, "eagle", None) is not None:  # draft id -> target id offsets (vLLM: draft_id_to_target_id)
+        model.register_buffer("eagle_d2t", _Checkpoint(eagle3.path).get("d2t").to(torch.int64).to(device),
+                              persistent=False)
     model.dp_buffers(device)
     del model.materialize
-    stray = [n for n, t in [*model.named_parameters(), *model.named_buffers()] if t.device != device]
+    rng = model.load_range
+    skipped = (lambda n: n.startswith("layers.") and not rng[0] <= int(n.split(".", 2)[1]) < rng[1]) if rng else (
+        lambda n: False)
+    stray = [n for n, t in [*model.named_parameters(), *model.named_buffers()] if t.device != device and not skipped(n)]
     if stray:
         raise RuntimeError(f"{len(stray)} tensors not on {device} after loading, e.g. {stray[:3]}")
     return model.eval()
@@ -364,7 +388,9 @@ def _load_decoder(model: DecoderForCausalLM, path: str, dtype: torch.dtype, fp8_
         if "lm_head.weight" not in ck:
             raise KeyError("checkpoint has untied embeddings but no lm_head.weight")
         put_vocab(model.lm_head, "lm_head.weight")
-    if getattr(model, "mtp", None) is not None:  # the MTP head's own parameters live on the model
+    if getattr(model, "eagle", None) is not None:  # an EAGLE-3 draft's model-level parameters, from its own checkpoint
+        _load_eagle3_top(model, dtype)
+    elif getattr(model, "mtp", None) is not None:  # the MTP head's own parameters live on the model
         from .mtp import names as mtp_names  # not `names`: that would shadow this module's names() below
 
         m, mtp_post, mtp_final = mtp_names(cfg)
@@ -386,9 +412,14 @@ def _load_decoder(model: DecoderForCausalLM, path: str, dtype: torch.dtype, fp8_
     nm = names(cfg)
     mtp = getattr(model, "mtp", None)
     jobs = [(i, layer, f"model.layers.{i}.", "post_attention_layernorm") for i, layer in enumerate(model.layers)]
-    if mtp is not None:  # vLLM mimo_v2_mtp.py: MiMo's MTP block names its post-attention norm pre_mlp_layernorm
+    if getattr(model, "eagle", None) is not None:
+        _load_eagle3_layer(model, dtype)
+    elif mtp is not None:  # vLLM mimo_v2_mtp.py: MiMo's MTP block names its post-attention norm pre_mlp_layernorm
         jobs.append(("mtp", mtp, m, mtp_post))
+    rng = getattr(model, "load_range", None)
     for i, layer, pre, post_name in jobs:
+        if rng is not None and isinstance(i, int) and not rng[0] <= i < rng[1]:
+            continue  # a pipeline stage's other layers (load_model pp): unread, left on the meta device
         layer_done = materialize(layer)
         sp = layer.spec
         try:
@@ -455,11 +486,58 @@ def _load_decoder(model: DecoderForCausalLM, path: str, dtype: torch.dtype, fp8_
                 _assign(layer.gate_up, layer.gate_up_scale, w, sc, dtype, blk, fp8_max)
                 w, sc = ck.linear(pre + "mlp.down_proj", cols=im, block=blk)
                 _assign(layer.down, layer.down_scale, w, sc, dtype, blk, fp8_max)
+                if (layer.gate_up_scale is None and layer.gate_up.dtype == torch.bfloat16 and cfg.hybrid is None
+                        and nkilib_dense.enabled()):
+                    layer.pack_dense_mlp()  # KILN_DENSE_MLP_KERNEL=nkilib on trn2 / trn3 (kernels/nkilib_dense.py)
             if cfg.hybrid is not None and not layer.plain:
                 hybrid.load_layer(layer, ck, pre, cfg, r, n, dtype)
         except KeyError as e:
             raise KeyError(f"layer {i}: checkpoint is missing {e}") from None
         layer_done()
+
+
+def _load_eagle3_top(model, dtype) -> None:
+    """An EAGLE-3 draft's model-level weights (models/eagle3.py): fc, the final norm, the lm_head over the draft
+    vocabulary (replicated), and its own embedding when it has one (this rank's vocabulary rows, as the target's).
+    d2t is a buffer, set by load_model."""
+    d = model.eagle
+    ck = _Checkpoint(d.path)
+    model.eagle_fc.data.copy_(ck.get("fc.weight").to(dtype))
+    model.mtp_norm.data.copy_(ck.get("norm.weight").to(dtype))
+    model.eagle_head.data.copy_(ck.get("lm_head.weight").to(dtype))
+    if model.eagle_embed is not None:
+        start, rows, V = model.vocab_start, model.vocab_rows, model.cfg.vocab_size
+        stop = min(start + rows, V)
+        model.eagle_embed.data.zero_()
+        model.eagle_embed.data[: stop - start].copy_(ck.get("embed_tokens.weight", slice(start, stop)).to(dtype))
+
+
+def _load_eagle3_layer(model, dtype) -> None:
+    """The EAGLE-3 draft's decoder layer (Llama names under d.prefix), sharded like a target layer: q / k / v rows by
+    this rank's heads over the full 2H input, o_proj and down_proj columns, gate / up rows."""
+    d, layer = model.eagle, model.mtp
+    ck = _Checkpoint(d.path)
+    done = model.materialize(layer)
+    pre, sp = d.prefix, layer.spec
+
+    def get(name, rows=None, cols=None):
+        return ck.get(pre + name, rows, cols).to(dtype)
+
+    layer.in_norm.data.copy_(get("input_layernorm.weight"))
+    layer.hidden_norm.data.copy_(get("hidden_norm.weight"))
+    layer.post_norm.data.copy_(get("post_attention_layernorm.weight"))
+    Dk, Dv = sp.head_dim, sp.v_head_dim
+    ar, an = model.attn_rank, model.attn_tp
+    qs = _part(sp.num_heads * Dk, ar, an)
+    ks = slice(layer.kv_offset * Dk, (layer.kv_offset + layer.nkv) * Dk)
+    vs = slice(layer.kv_offset * Dv, (layer.kv_offset + layer.nkv) * Dv)
+    layer.qkv.data.copy_(torch.cat([get("self_attn.q_proj.weight", qs), get("self_attn.k_proj.weight", ks),
+                                    get("self_attn.v_proj.weight", vs)]))
+    layer.o.data.copy_(get("self_attn.o_proj.weight", cols=_part(sp.num_heads * Dv, ar, an)))
+    im = _part(d.layer.intermediate_size, model.tp_rank, model.tp_size)
+    layer.gate_up.data.copy_(torch.cat([get("mlp.gate_proj.weight", im), get("mlp.up_proj.weight", im)]))
+    layer.down.data.copy_(get("mlp.down_proj.weight", cols=im))
+    done()
 
 
 def _load_experts(layer, ck: _Checkpoint, pre: str, cfg: ModelConfig, r: int, n: int, dtype,

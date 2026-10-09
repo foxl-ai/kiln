@@ -353,6 +353,10 @@ if nki is not None:
         X = dict(Hi=Hi, D=D, Pp=Pp, NC=NC, NB=NB, two=1 - one, keep=keep, sub=sub, scale=scale, qT=qT, w=w, npool=npool, pk=pk,
                  out=out, outv=outv, scr=scr, scr2=scr, dbg=dbg, psum=None, lsub=lsub, dyn=0, vorder=vorder,
                  dscr=nl.ndarray((128, Pp), dtype=F32, buffer=nl.shared_hbm) if dbg else None)
+        npg = nl.num_programs(axes=0) if nl.program_ndim() != 0 else 1  # lnc2
+        if npg == 2 and nl.program_id(axis=0) == 1:  # lnc2: program 0 alone selects (see _lnc2_note)
+            nisa.core_barrier(data=out, cores=(0, 1))  # lnc2
+            return (out, outv, X["dscr"]) if dbg else (out, outv)  # lnc2
         IB = _sb((128, 128), BF16)
         nisa.dma_copy(dst=IB, src=identb)
         X["IB"] = IB
@@ -420,6 +424,8 @@ if nki is not None:
             X["psum"] = _psum()
             for t in range(NT):
                 _tile(X, t)
+        if npg == 2:  # lnc2
+            nisa.core_barrier(data=out, cores=(0, 1))  # lnc2
         if dbg:
             return out, outv, X["dscr"]
         return out, outv
@@ -427,18 +433,28 @@ else:
     kiln_dsa_long_select_kernel = None
 
 
-def _kernel_rev() -> int:
+def _kernel_rev(lnc2: bool = False) -> int:
     """CRC-32 of this module's kernel source, passed as the static argument `rev` (LNL's compile-cache key does
-    not include NKI kernel source: CLAUDE.md)."""
+    not include NKI kernel source: CLAUDE.md). Lines marked "# lnc2" act only at grid 2 (trn2, LNC=2) and are left
+    out of the grid-1 revision, so trn1's graphs keep their keys."""
     import zlib
 
     src = open(__file__).read()
     a = src.index("try:  # the Neuron venv")
     b = src.index("    kiln_dsa_long_select_kernel = None", a)
-    return zlib.crc32(src[a:b].encode())
+    body = src[a:b]
+    if not lnc2:
+        body = "".join(x for x in body.splitlines(keepends=True) if "# lnc2" not in x)
+    return zlib.crc32(body.encode())
 
 
+# _lnc2_note: at grid 2 (trn2, LNC=2) the kernel used to run whole on both programs, each writing the same out, outv
+# and HBM score scratch, one tensor shared by the two physical cores. Program 0 alone selects now; program 1 waits at a
+# core barrier on out, which program 0 reaches after its last write, so out is complete on both cores when either
+# returns. (Measured on trn2: the R8 long-context engine's 4096-page graphs answered the needle wrong at P=3 and faulted
+# with a vector-DGE out-of-bound copy at P=6 / P=12; docs/neuron-notes.md "Long prompts on trn2".)
 REV = _kernel_rev()
+REV_LNC2 = _kernel_rev(lnc2=True)
 LOOP = int(os.environ.get("KILN_DSA_LONG_LOOP", 1))
 
 
@@ -502,9 +518,12 @@ def select(qI: torch.Tensor, w: torch.Tensor, pk: torch.Tensor, npool: torch.Ten
     if not supported(qI.shape[1], qI.shape[2], P, keep, sub):
         raise NotImplementedError(f"long-context DSA selection kernel: Hi {qI.shape[1]}, D {qI.shape[2]}, P {P}, "
                                   f"keep {keep}, sub {sub}")
-    out, outv = wrap_nki(kiln_dsa_long_select_kernel)[platform.nki_grid()](
+    grid = platform.nki_grid()
+    out, outv = wrap_nki(kiln_dsa_long_select_kernel)[grid](
         **kernel_inputs(qI, w, pk, npool), keep=int(keep), scale=float(scale), sub=int(sub or CH),
-        lsub=int(sub or CH).bit_length() - 1, one=int(sub == 0), rev=REV, loop=LOOP,
+        lsub=int(sub or CH).bit_length() - 1, one=int(sub == 0), rev=REV_LNC2 if grid == 2 else REV,
+        # at grid 2 program 1 skips the tiles, so several tiles go unrolled (a device loop on one core only: NCC_IXGM002)
+        loop=0 if grid == 2 and N > 128 else LOOP,
         **({"vorder": 1} if vorder else {}))
     cnt = npool.to(torch.int64).clamp(0, P).clamp(max=keep)
     return out.reshape(-1, keep)[:N].to(torch.int64), cnt, outv.reshape(-1, keep)[:N]

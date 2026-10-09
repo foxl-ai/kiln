@@ -75,6 +75,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--state-checkpoints", type=int, default=None)
     ap.add_argument("--overlap", action="store_true")
     ap.add_argument("--out-json", default=None)
+    ap.add_argument("--forced", action="store_true",
+                    help="needle: teacher-forced, the answer's tokens appended to the prompt and scored by prompt "
+                         "logprobs (a case passes when every answer token is the argmax, rank 1: what greedy decoding "
+                         "would produce), one prefill and no decode (a pipeline stage, engine/pp.py, decodes nothing)")
+    # One long prefill over several engines (engine/pp.py): the same command on every stage (its own --pp-stage).
+    ap.add_argument("--pp-stages", type=int, default=1)
+    ap.add_argument("--pp-stage", type=int, default=0)
+    ap.add_argument("--pp-split", type=int, nargs="+", default=None)
+    ap.add_argument("--pp-listen", default=None)
+    ap.add_argument("--pp-next", default=None)
     return ap
 
 
@@ -108,7 +118,10 @@ def engine_config(args, path: str | None = None):
         prefill_token_buckets=(args.prefill_tokens // dp,),
         page_buckets=tuple(args.page_buckets) if args.page_buckets else page_buckets(max_len_, args.page_size,
                                                                                      dsa_long.LONG_KEYS),
-        tp=args.tp, tp_core_base=args.core_base, dp_attention=dp, piecewise=args.piecewise)
+        tp=args.tp, tp_core_base=args.core_base, dp_attention=dp, piecewise=args.piecewise,
+        **({"pp_stages": args.pp_stages, "pp_stage": args.pp_stage, "pp_listen": args.pp_listen,
+            "pp_next": args.pp_next, "pp_split": tuple(args.pp_split) if args.pp_split else None}
+           if getattr(args, "pp_stages", 1) > 1 else {}))
 
 
 def _text_ids(tok, path: str, n: int, skip: int = 0) -> list[int]:
@@ -139,6 +152,7 @@ def run_nll(args) -> dict:
         t0 = time.time()
         (r,) = eng.generate([ids], SamplingParams(max_new_tokens=1, prompt_logprobs=0))
         dt = time.time() - t0
+        _local_k_line(eng, None, "nll")
     finally:
         eng.close()
     lps = [v[0] for _, v in sorted(r.prompt_logprobs.items())]  # position q: log p(ids[q] | ids[:q]), q >= 1
@@ -151,6 +165,18 @@ def run_nll(args) -> dict:
             out["bands"].append({"from": a, "to": b, "nll": nll, "n": len(seg)})
             print(f"  positions [{a:>8}, {b:>8}): nll {nll:.4f} over {len(seg)} tokens")
     return out
+
+
+def _local_k_line(eng, before, what: str) -> None:
+    """KILN_DSA_CP_LOCAL_K (models/mla.py): this run's certificate counters (rank 0's row group), when they are on."""
+    model = getattr(getattr(eng, "runner", None), "model", None)
+    if model is None:
+        return
+    from kiln.models import mla
+
+    line = mla.local_k_report(before, mla.local_k_counts(model), what)
+    if line:
+        print(line, flush=True)
 
 
 def needle_prompt(tok, hay: list[int], length: int, depth: float, n: int) -> list[int]:
@@ -182,9 +208,12 @@ def run_needle(args) -> dict:
             for d in args.depths:
                 n = 1000003 + int(L * 7 + d * 1e6) % 8999991  # a 7-digit number per case
                 cases.append((L, d, n, needle_prompt(eng.tokenizer, hay, L, d, n)))
+        if getattr(args, "forced", False):
+            return _needle_forced(eng, cases, args)
         t0 = time.time()
         reqs = eng.generate([c[3] for c in cases], SamplingParams(max_new_tokens=args.answer_tokens, ignore_eos=True))
         dt = time.time() - t0
+        _local_k_line(eng, None, "needle")
         for (L, d, n, p), r in zip(cases, reqs):
             text = eng.tokenizer.decode(r.output_ids)
             ok = str(n) in text
@@ -195,6 +224,34 @@ def run_needle(args) -> dict:
     passed = sum(r["ok"] for r in results)
     print(f"RESULT needle {passed}/{len(results)} seconds={dt:.1f}")
     return {"cases": results, "passed": passed, "seconds": dt}
+
+
+def _needle_forced(eng, cases, args) -> dict:
+    """The needle cases teacher-forced: each prompt plus the tokens of " <number>." (what the chat format's "The
+    special magic number is" continues with), scored by prompt logprobs from the first answer token on; a case passes
+    when every answer token is the argmax (rank 1). One request at a time, in order (every pipeline stage submits the
+    same requests in the same order). The caller closes the engine."""
+    from kiln.engine.request import SamplingParams
+
+    results = []
+    t0 = time.time()
+    for L, d, n, p in cases:
+        ans = eng.tokenizer(" " + str(n) + ".", add_special_tokens=False)["input_ids"]
+        ids = p + ans
+        sp = SamplingParams(max_new_tokens=1, ignore_eos=True, prompt_logprobs=0, prompt_logprobs_start=len(p))
+        (r,) = eng.generate([ids], sp)
+        got = [r.prompt_logprobs.get(len(p) + i) for i in range(len(ans))]
+        ranks = [g[1] if g is not None else None for g in got]
+        ok = all(x == 1 for x in ranks)
+        results.append({"length": len(ids), "depth": d, "number": n, "answer_tokens": ans, "ranks": ranks,
+                        "logprobs": [g[0] if g is not None else None for g in got], "ok": ok})
+        print(f"  length {len(ids):>8} depth {d:4.2f}: {'PASS' if ok else 'FAIL'} number {n} answer ranks {ranks}",
+              flush=True)
+    dt = time.time() - t0
+    _local_k_line(eng, None, "needle-forced")
+    passed = sum(r["ok"] for r in results)
+    print(f"RESULT needle-forced {passed}/{len(results)} seconds={dt:.1f}")
+    return {"cases": results, "passed": passed, "seconds": dt, "forced": True}
 
 
 def main() -> None:

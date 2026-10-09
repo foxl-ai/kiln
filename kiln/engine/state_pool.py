@@ -107,6 +107,15 @@ class StatePool:
         if held is not None:
             (self._cooling if self.hold else self._frees)[held[2].dp_group].append(held[0])
 
+    def detach(self, req) -> list[int] | None:
+        """Take a request's rows out of its hands without freeing them (free_rows gives them back): a prefill engine
+        under KILN_PD_TRANSPORT=nixl keeps a handed-off request's state row until the decode engine has read it."""
+        held = self._held.pop(req.rid, None)
+        return held[0] if held is not None else None
+
+    def free_rows(self, rows: list[int], group: int = 0) -> None:
+        (self._cooling if self.hold else self._frees)[group].append(rows)
+
     def release_cooling(self) -> None:
         for free, cool in zip(self._frees, self._cooling):
             free.extend(cool)

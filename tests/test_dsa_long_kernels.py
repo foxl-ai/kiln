@@ -169,3 +169,90 @@ def test_long_select_value_order():
         assert (b_p[n, c:] == 0).all() and (b_v[n, c:] < -1e29).all()
         got = dict(zip(b_p[n, :c].tolist(), b_v[n, :c].tolist()))
         assert got == dict(zip(a_p[n, :c].tolist(), a_v[n, :c].tolist()))
+
+
+def _slots_c_case(N=6, H=8, R=128, NS=256, pools=512, seed=1, dtype=torch.float32):
+    """(q, kc, rows, bias): the context-parallel decode shape in small, each row a random set of live slots (a different
+    count per row), the tail pool's visible prefix on every other row, one row fully masked."""
+    g = torch.Generator().manual_seed(seed)
+    kc = torch.randn(pools * 4, R, generator=g).to(dtype)
+    q = (torch.randn(N, H, R, generator=g) * 0.1).to(dtype)
+    rows = torch.randint(0, pools, (N, NS), generator=g)
+    bias = torch.full((N, NS, 4), NEG)
+    for b in range(N):
+        sel = torch.randperm(NS - 56, generator=g)[: 10 + 9 * b]
+        bias[b, sel] = 0.0
+        if b % 2 == 0:
+            bias[b, NS - 56, : 1 + b % 4] = 0.0
+    bias[N // 2] = NEG
+    return q, kc, rows, bias
+
+
+def test_slots_c_plan():
+    """dsa_slots_c.plan: every live slot of a row exactly once in its compacted list (pool row and live tokens), the
+    rest row 0 with nv 0, partition-major order; `fits` false past C live slots."""
+    from kiln.kernels import dsa_slots_c
+
+    q, kc, rows, bias = _slots_c_case(N=7, NS=640)
+    bias[6, :300] = 0.0  # over C
+    nv = dsa_slots_c.live_tokens(bias)
+    crow, cnv, fits = dsa_slots_c.plan(rows, nv)
+    for b in range(6):
+        live = (nv[b] > 0).nonzero().view(-1)
+        n = live.numel()
+        assert bool(fits[b]) and n <= dsa_slots_c.C
+        p, ch = live % 128, live // 128
+        order = live[torch.argsort(p * 8 + ch)]  # partition-major
+        assert torch.equal(crow[b, :n], rows[b, order]) and torch.equal(cnv[b, :n], nv[b, order])
+        assert (crow[b, n:] == 0).all() and (cnv[b, n:] == 0).all()
+    assert not bool(fits[6])
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_slots_c_emulation(dtype):
+    """dsa_slots_c.emulate: each row over its compacted live slots equals dsa_slots.emulate over all slots (to fp32
+    summation order) on every row with a visible token; a call with a row over C live slots is dsa_slots.emulate
+    exactly (the kernel's full loop)."""
+    from kiln.kernels import dsa_slots_c
+
+    q, kc, rows, bias = _slots_c_case(NS=640, dtype=dtype)
+    o, lse = dsa_slots_c.emulate(q, kc, rows, bias, 0.125, lse=True)
+    wo, wl = dsa_slots.emulate(q, kc, rows, bias, 0.125, lse=True)
+    real = (bias > NEG / 2).any(-1).any(-1)
+    assert not real.all() and real.sum() == q.shape[0] - 1
+    tol = 1e-5 if dtype == torch.float32 else 5e-3
+    torch.testing.assert_close(o[real], wo[real], rtol=tol, atol=tol)
+    torch.testing.assert_close(lse[real], wl[real], rtol=1e-6, atol=1e-5)
+    assert (lse[~real] < -1e29).all() and torch.isfinite(o).all()
+    over = bias.clone()
+    over[0, :200] = 0.0
+    o2, l2 = dsa_slots_c.emulate(q, kc, rows, over, 0.125, lse=True)
+    w2, wl2 = dsa_slots.emulate(q, kc, rows, over, 0.125, lse=True)
+    assert torch.equal(o2, w2) and torch.equal(l2, wl2)
+
+
+@pytest.mark.parametrize("over", [False, True])
+def test_slots_c_simulator(over, monkeypatch):
+    """kiln_dsa_slots_c_kernel under nki.simulate (trn1): every row equals dsa_slots_c.emulate (rows padded to RPI);
+    a call with a row over C live slots gives the kernel no iteration (attend's dsa_slots_n call takes it)."""
+    nki = pytest.importorskip("nki")
+    from kiln.kernels import dsa_slots_c
+
+    monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn1")
+    q, kc, rows, bias = _slots_c_case(N=6, R=512, NS=256, dtype=torch.bfloat16)  # (the kernel's PSUM holds R = 512)
+    if over:
+        bias[0, :150] = 0.0
+    kw, N, Np, ov = dsa_slots_c.kernel_args(q, kc, rows, bias, 0.125, lse=True)
+    assert float(ov) == float(over) and int(kw["n_c"]) == (0 if over else Np // dsa_slots_c.RPI)
+    if over:
+        return
+    o, ls = nki.simulate(dsa_slots_c.kiln_dsa_slots_c_kernel)(**kw)
+    H, R = q.shape[1], q.shape[2]
+    o = torch.as_tensor(o).float().reshape(Np, H, R)[:N]
+    ls = torch.as_tensor(ls).float().reshape(Np, H)[:N]
+    wo, wl = dsa_slots_c.emulate(q.float(), kc, rows, bias, 0.125, lse=True)
+    real = (bias > NEG / 2).any(-1).any(-1)
+    err = ((o - wo)[real].abs().max() / wo[real].abs().max()).item()
+    assert err < 1e-2, err
+    assert ((ls - wl)[real].abs().max()).item() < 1e-2
+    assert (ls[~real] < -1e29).all()

@@ -518,7 +518,14 @@ def attend(qI, w, pk, pos, q_lat, kc, keep: int, scale_i: float, scale_a: float,
            simulate: bool = False):
     """o [C, H, R] fp32: the fused kernel on a Neuron device, emulate() elsewhere. qI [C, Hi, D] (bf16 values),
     w [C, Hi] fp32, pk [P, D] (bf16 values), pos [C] int, q_lat [C, H, R], kc [L, R] (or [L, 1, R]). simulate: run the
-    kernel in nki.simulate on host tensors, with every argument exactly as the device call takes it (tests)."""
+    kernel in nki.simulate on host tensors, with every argument exactly as the device call takes it (tests).
+    KILN_DSA_FUSED_CAUSAL=1: kernels/dsa_fused_c.py, the same result bit for bit without the work past the call's last
+    position; unset, only the gated trn2 configuration (dsa_fused_c.default_on) takes it, and every other graph traces
+    as before."""
+    from . import dsa_fused_c
+
+    if not dbg and not simulate and dsa_fused_c.takes(q_lat.shape[0], kc.shape[0]):
+        return dsa_fused_c.attend(qI, w, pk, pos, q_lat, kc, keep, scale_i, scale_a)
     kc2 = kc.reshape(kc.shape[0], -1)
     if q_lat.device.type == "cpu" and not simulate:
         return emulate(qI, w, pk, pos, q_lat, kc2, keep, scale_i, scale_a)

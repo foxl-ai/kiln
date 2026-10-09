@@ -54,14 +54,15 @@ def main() -> None:
     if args.warmup:
         w = eng.warmup()
         print(f"bucket warmup {w['seconds']:.1f}s over {w['graphs']} graphs", flush=True)
-    import uvicorn
+    from kiln.server.api import serve
 
     app = build_app(eng, a.served_model_name or args.model)
     print(f"kiln pd serve: {a.pd_role} engine on port {a.port}", flush=True)
     # The router keeps connections to every engine alive and drops idle ones after 30 s (kiln.server.pd_router); uvicorn
     # closing them first (its default keep-alive is 5 s) raced a request onto a closing connection: one prefill POST in
     # 1,320 of a G1 4:1 level failed with ReadError (2026-10-06).
-    uvicorn.run(app, host=a.host, port=a.port, log_level="warning", timeout_keep_alive=600)
+    # serve: a SIGTERM closes the engine (its workers, a pipeline's following stages, KILN_TIMELINE) before the exit.
+    serve(app, host=a.host, port=a.port, log_level="warning", timeout_keep_alive=600)
 
 
 if __name__ == "__main__":

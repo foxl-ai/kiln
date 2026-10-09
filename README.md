@@ -36,56 +36,64 @@ from cache instead of compiling for hours.
 
 ## Results
 
-**GLM-5.3-Flash on one trn1.32xlarge costs 35-80% less per output token than vLLM on
-8 x H200**, at concurrency 16, 32 and 64, with spot prices on both sides and Kiln's defaults.
+**GLM-5.3-Flash on one trn1.32xlarge costs 35-80% less per output token than vLLM on 8 x H200 at
+concurrency 16, 32 and 64 on spot prices.** On EC2 Capacity Block prices, the basis where both sides
+can actually be bought, it is 58% and 12% cheaper at concurrency 16 and 32, 1.31x the GPU's cost at
+concurrency 64, and 2.1x the GPU's best rate (concurrency 128, which trn1 cannot hold). Which basis
+applies is a question of capacity: trn1 spot was obtainable for these runs, p5en spot is a price quote.
 
-| concurrency | Kiln, trn1.32xlarge | Kiln, $ / 1M output tokens | vLLM, ml.p5en.48xlarge (8 x H200) | vLLM, $ / 1M output tokens | Kiln |
-|---:|---:|---:|---:|---:|---|
-| 16 | 110.5 tok/s | **$5.40** | 311 tok/s | $25.7-27.1 | 79-80% lower |
-| 32 | 144.8 tok/s | **$4.12** | 842 tok/s | $9.49-9.99 | 57-59% lower |
-| 64 | 167.8 tok/s | **$3.56** | 1,458 tok/s | $5.48-5.77 | 35-38% lower |
-| 64, opt-in EPLB + one-piece 8192 prefill | 191.3 tok/s | **$3.12** | | | 43-46% lower |
+| concurrency | Kiln, trn1.32xlarge | vLLM, ml.p5en.48xlarge (8 x H200) | Kiln spot $ / 1M out | vLLM spot quote $ / 1M out | Kiln Capacity Block $ / 1M out | vLLM Capacity Block $ / 1M out | Kiln on Capacity Blocks |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 16 | 110.5 tok/s | 311 tok/s | **$5.40** | $25.7-27.1 | **$23.96** | $56.41 | 58% lower |
+| 32 | 144.8 tok/s | 842 tok/s | **$4.12** | $9.49-9.99 | **$18.29** | $20.84 | 12% lower |
+| 64 | 167.8 tok/s | 1,458 tok/s | **$3.56** | $5.48-5.77 | **$15.78** | $12.03 | 1.31x higher |
+| 128 | does not fit | 2,359 tok/s | | $3.39-3.57 | | $7.44 | |
 
-<sub>zai-org/GLM-5.3-Flash (45 layers, 288 experts, FP8), 8,192 tokens in and 256 out per
-request, closed loop at the stated concurrency, 128 requests per level, real weights, all
-graphs from the compile farm. Kiln: trn1.32xlarge spot at $2.15/h, tensor parallel 32,
-DP attention 4, Neuron SDK 2.32, measured 2026-10-05 on development commit engine-v0 8229c3d
-(the opt-in row on feat/prefill-mfu-merge). The opt-in row needs
-`KILN_EP_REDUNDANT=1` with `KILN_EPLB_INIT=<placement>` and `--eplb-rebalance`, plus
-`--prefill-tokens 8192 --prefill-buckets 2048 KILN_PIECEWISE_PREFILL_MOE_GROUP=45
---kv-cache-gb 1.2 --state-checkpoints 4`. vLLM: the purpose-built
-`vllm/vllm-openai:glm53-flash` image on a SageMaker endpoint (TP 4 / DP 2 / EP 8), priced at the
-p5en.48xlarge spot band of $28.77-30.29/h. Commands, logs and the full iteration history are in
-[docs/price-performance.md](docs/price-performance.md).</sub>
+<sub>zai-org/GLM-5.3-Flash (45 layers, 288 experts, FP8), 8,192 tokens in and 256 out per request, closed
+loop at the stated concurrency, 128 requests per level, real weights, random-id prompts, all graphs from the
+compile farm. Kiln: tensor parallel 32, DP attention 4, Neuron SDK 2.32, measured 2026-10-05 on development
+commit engine-v0 8229c3d (v0.2.0's defaults). On real text, this release's measurement at concurrency 64 is
+164.5 out tok/s (64 requests started together, dd428fd = engine-v0 a6c5dd9 with an opt-in flag off): $3.63
+at spot, $16.10 on a Capacity Block. vLLM: the purpose-built `vllm/vllm-openai:glm53-flash` image on a SageMaker
+endpoint (TP 4 / DP 2 / EP 8). Prices: trn1.32xlarge spot $2.15/h (obtained), the p5en.48xlarge spot band of
+$28.77-30.29/h (`describe-spot-price-history`, read 2026-10-03: a quote, not capacity that was obtained), and
+the EC2 Capacity Block prices of https://aws.amazon.com/ec2/capacityblocks/pricing/ (read 2026-10-09):
+trn1.32xlarge $9.532/h, p5en.48xlarge $63.158/h, trn2.48xlarge $35.7608/h. Commands, logs and the full
+iteration history are in [docs/price-performance.md](docs/price-performance.md).</sub>
 
-Against model-provider list prices for the same request ($0.15 per 1M input tokens and
-$0.50 per 1M output tokens: $0.00136 per request), Kiln's cost is $0.000911 per request with
-its defaults, 33% below the list price, and $0.000799 with EPLB and the one-piece prefill, 41%
-below. Discounted providers are still 1.18-1.34x cheaper.
+**trn2.48xlarge, the whole box** (two tensor-parallel-32 engines behind Kiln's router, measured from the client
+over HTTP on real text like the GPU reference, development commit engine-v0 df64441 and a labelled merge of the
+causal DSA kernel, 2026-10-08): **632.4 out tok/s at concurrency 256**, $15.71 per 1M output tokens on a
+Capacity Block, 2.1x the GPU's best ($7.44 at concurrency 128). At a latency bar of TTFT p90 <= 5 s it holds
+concurrency 12-14 at 160-190 out tok/s ($52.25-61.51 per 1M), while vLLM holds that bar at least to concurrency
+128, its highest measured level (2,359 out tok/s at p90 1.56 s, $7.44): at least 12.4-14.6x the throughput gap and
+7.0-8.3x the cost. The target of 1,000 out tok/s at TTFT p90 <= 5 s on one box was not reached.
 
-Two subsystems are opt-in and new in 0.2.0. **Prefill / decode disaggregation**: 3 prefill boxes
-to 1 decode box sustain 930.9 out tok/s at $2.57 per 1M output tokens all-in over the middle half
-of a concurrency-320 level, with ITL p50 277 ms; whole level against whole level that is $3.02
-against $3.12, so on this workload it is close to a wash on cost and buys per-box throughput and
-latency instead. A decode-only box reaches $0.470 per 1M output tokens at 8K context with real KV.
-How it works and what it measures: [Disaggregated serving](#disaggregated-serving).
-**1M context**: GLM-5.3-Flash's full 1,044,480 tokens, needle-in-a-haystack 9 / 9 at 128k / 512k /
-1M on three engines, and $0.168 per 1M input tokens on trn1 at 3,549 input tokens/s per box.
+New in 0.3.0, all opt-in: **a layer pipeline** that runs one long prefill over several boxes and hands every
+stage's KV to one decode engine, **a device-to-device KV handoff over EFA** with NIXL, and **ports from
+vllm-neuron 0.24**. A 1,044,480-token prompt now takes 233.6 s on one trn1.32xlarge (1177.1 s in 0.2.0), and
+68.62 s through four pipeline stages and a decode box over NIXL. On one trn2 chip against vllm-neuron 0.24 on the
+same cores, Kiln's dense prefill is faster from 8k to 32k tokens (Qwen3-32B at 32k: 13.36 against 17.13 s),
+its parallel engine start 1.76x faster cold and 2.2x warm, and its EAGLE-3 at 0.981x vllm-neuron's speed with
+the same acceptance. How the pipeline and the handoff work: [Disaggregated serving](#disaggregated-serving); every
+measurement with its commit: [CHANGELOG.md](CHANGELOG.md).
 
 **What it does not win, measured:**
 
-- **Latency.** An idle 8K request takes 4.01 s to its first token colocated, and 1.60 s on the
-  disaggregated latency-prefill configuration, against 634 ms for vLLM on H200. No configuration
-  reaches a p90 of 1 s on trn1, and a long prompt takes minutes (133.0 s at 128k, 1177.1 s at 1M).
-  Each next token takes 131-363 ms across concurrency 16-64 against 20-43 ms on the GPU. The win is
-  cost per token, for throughput workloads.
+- **Latency.** On trn1 an idle 8K request takes 4.01 s to its first token colocated and 1.60 s on the
+  disaggregated latency-prefill configuration, against 634 ms for vLLM on H200; under load at concurrency 64 the
+  median first token takes 38.2 s on real text. Each next token takes 131-363 ms across concurrency 16-64 on trn1
+  and 52-368 ms across concurrency 8-256 on the trn2 box, against 20-43 ms on the GPU. A 1M prompt takes minutes,
+  not seconds. The win is cost per token on spot capacity, for throughput workloads.
+- **Capacity Block pricing** at the same concurrency from concurrency 64 on trn1 and from 32 on trn2 (the trn2
+  box is 16% below the GPU at concurrency 16, where the GPU's own TTFT p90 is 12.3 s), and against the GPU's best
+  rate everywhere.
 - **Concurrency 128** does not fit in trn1's 16 GiB per core.
-- **trn2.48xlarge** reaches 229.5 out tok/s at concurrency 128 and 243.9 at 256, but at its spot
-  price ($15.343/h) that is $18.57 and $17.47 per 1M output tokens, 4.9x trn1's default. trn2 also
-  costs more per token than trn1 at 8K on both sides of a disaggregated deployment, and expert
-  parallelism hangs there at LNC=2, so trn2 keeps tensor-parallel experts.
-- **Prefill is far from the hardware**: MFU 11.4% on trn1 for the best configuration, 2.8% of BF16
-  peak on trn2.
+- **Prefill is far from the hardware**: MFU 9.9% for trn1's 8K call and 17.1% of 32 x 95 TFLOPS for trn2's
+  8,192-row call (about 8% of trn2's own BF16 peak). Kiln's dense-model prefill reaches 35-41% on trn2.
+- **FP8 MoE** is faster on trn2 but fails the wikitext check, so it is not in this release.
+- **Expert-parallel load balancing** (EPLB) does not pay on real text (-1%); its 0.2.0 gains were measured on
+  random-id prompts.
 - **On-demand pricing.** trn1.32xlarge on-demand is ten times its spot price, so no level is won
   on-demand against SageMaker on-demand.
 
@@ -93,15 +101,15 @@ How it works and what it measures: [Disaggregated serving](#disaggregated-servin
 
 | Layer | What Kiln does |
 |---|---|
-| Serving | OpenAI-compatible HTTP API with streaming, tool-call and reasoning parsers, a cache-aware router over data-parallel replicas |
+| Serving | OpenAI-compatible HTTP API with streaming, tool-call and reasoning parsers (Hermes, Qwen3, GLM, Kimi K2, Llama 3 JSON), `/tokenize` and `/detokenize`, a cache-aware router over data-parallel replicas that balances unmatched requests by load |
 | Scheduler | continuous batching, chunked prefill, decodes that never pause for prefill, overlap scheduling, priority and cache-aware admission, mixed prefill + decode batches |
 | KV and state | paged KV with FP8, radix prefix caching, prefix caching for linear-attention models from recurrent-state checkpoints, a host-memory tier |
-| Parallelism | tensor parallel, DP attention, expert parallelism for MoE, sequence-parallel prefill streams with group collectives |
-| Kernels (NKI) | MoE prefill and decode with 128x128-block FP8 scales, expert-parallel MoE, KDA linear attention (chunked and decode), DSA top-k selection and sparse decode attention, pooled-key caches |
-| Speculation | MTP heads (DeepSeek-V3 / V3.2, GLM-5.3), n-gram and suffix drafting |
-| Long context | a long DSA path that forms nothing of the context's size per query, context parallelism over an attention group, a minimal KV layout, an fp8 index scorer: GLM-5.3-Flash's full 1,044,480 tokens |
-| Disaggregation | opt-in prefill and decode engine roles, a KV handoff that can cross attention TP degrees, and a router with threshold routing, decode-credit backpressure, latency prefill engines and SLO metrics |
-| Compilation | piecewise layer-group graphs, a CPU compile farm that captures every graph a device will trace, an HBM estimator that predicts which configurations load |
+| Parallelism | tensor parallel, DP attention, expert parallelism for MoE (trn1 and trn2), sequence-parallel prefill streams with group collectives, a layer pipeline that runs one long prefill over several boxes |
+| Kernels (NKI) | MoE prefill and decode with 128x128-block FP8 scales, expert-parallel MoE, KDA linear attention (chunked, gated norm, short convolution, decode), DSA top-k selection, fused and causal sparse prefill attention, sparse decode attention, pooled-key caches, segmented dense prefill attention (from nkilib) |
+| Speculation | MTP heads (DeepSeek-V3 / V3.2, GLM-5.3), EAGLE-3 drafts for dense models, n-gram and suffix drafting, speculation under overlap scheduling |
+| Long context | a long DSA path that forms nothing of the context's size per query, context parallelism over an attention group or over row groups of all ranks, an exact local top K per rank, a minimal KV layout, an fp8 index scorer: GLM-5.3-Flash's full 1,044,480 tokens |
+| Disaggregation | opt-in prefill and decode engine roles, a KV handoff over TCP or device to device over EFA (NIXL) that can cross attention TP degrees, a pipeline's stages as one prefill unit, and a router with threshold routing, decode-credit backpressure, latency prefill engines and SLO metrics |
+| Compilation | piecewise or one-graph prefill, a CPU compile farm that captures every graph a device will trace, parallel compilation at engine start, an HBM estimator that predicts which configurations load |
 
 The feature-by-feature comparison with the latest vLLM and SGLang is in
 [FEATURES.md](FEATURES.md); the architecture and its reasoning are in [DESIGN.md](DESIGN.md);
@@ -198,10 +206,37 @@ trn1)". `bench/pd_sweep.py` drives the router closed loop or with Poisson arriva
 steady and whole-level figures; `tools/check_pd.py` compares a disaggregated deployment's output
 with a colocated reference.
 
-Not done yet: the handoff runs over host memory and TCP; a device-to-device path over EFA is not
-built. trn2 is not a better disaggregation target at 8K: its best real-KV decode box costs $1.21 per
-1M output tokens against trn1's $0.89 for the non-context-parallel trn1 box, and trn2 prefill costs
-more per token than trn1's.
+**Device to device over EFA (opt-in).** With `KILN_PD_TRANSPORT=nixl` on both engines and
+`NEURON_RT_MAP_HBM=1`, the decode ranks read the prefill engine's caches and state rows straight from its HBM
+with NIXL over EFA; only a small meta frame crosses TCP. The host path stays the default. In a 3 : 1 deployment
+(trn1.32xlarge with 8 EFA interfaces each, one cluster placement group; the prefill boxes on the colocated G64
+graphs, so these two rows compare with each other only; feat/d2d-kv 8a60442): steady 786.0 -> 805.4 out tok/s,
+ITL p50 305.3 -> 290.4 ms, the handoff's mean 0.965 -> 0.235 s.
+
+**A long prompt over several boxes (opt-in).** A layer pipeline splits the model's layers into stages, one box
+each (`--pp-stages`, `--pp-split`, `--pp-follow` and the stage links, as `bench/serve_sweep.py` / `bench/pd_serve.py`
+arguments). A stage loads only its own layers, stage 0 takes the requests,
+and every stage hands its own layers' KV and state rows to one decode engine, which admits the request once all
+stages are in; the PD router takes the whole pipeline as one prefill unit (`--prefill-units`). One lone
+1,044,480-token request, GLM-5.3-Flash on trn1.32xlarge, every graph from the compile farm:
+
+| Layout | TTFT | Measured on |
+|---|---:|---|
+| One engine, one box | 233.6 s | 1c1f5f6 |
+| 4 stages, the pipeline alone | 67.95 s | scratch/pp-final (feat/pp-serve + feat/prefill-compute) |
+| 8 stages, the pipeline alone | 38.30 s | the same |
+| 4 stages + a decode box, end to end over the host path | 72.36 s | engine-v0 a6c5dd9 + feat/pd-early-inject 2bd146f + 618401f |
+| 4 stages + a decode box, end to end over NIXL | **68.62 s** (handoff 0.74 s, token 2 at 155 ms) | engine-v0 a6c5dd9 + feat/pd-early-inject 2bd146f |
+
+The end-to-end rows' 64 greedy tokens and logprobs equal one engine's. feat/pd-early-inject (a stage's share
+admitted as soon as it arrives) is not in this release. A warm second turn on the same 1M document, served from
+the prefix cache, takes 1.34 s to its first token on one box. The configurations are in
+[docs/neuron-notes.md](docs/neuron-notes.md) "The layer pipeline across boxes" and "A pipeline served as one
+prefill engine, end to end".
+
+trn2 is not a cheaper disaggregation target at 8K: its best real-KV decode box (5,007 out tok/s per box) costs
+$1.98 per 1M output tokens at the trn2 Capacity Block rate, about what trn1's best decode box costs at its own
+Capacity Block rate ($1.90), and trn1's runs on spot capacity that exists ($0.428).
 
 ## What moved the number
 
@@ -226,6 +261,10 @@ the same box against the one before it:
 | the runtime's hardware execution barrier (0.2.0's default: 167.8) | 167.8 |
 | opt-in expert-parallel load balancing with one redundant slot per rank | 180.2 |
 | opt-in 8192-token prefill as one 45-layer piece | 191.3 |
+
+Every row above was measured on random-id prompts. On real text the last two do not hold as written: EPLB gives
+-1% (182.4 / 182.5 out tok/s without it, 180.0 / 181.1 with it, on the one-piece prefill), because random ids skew
+the expert routing far more than text does.
 
 Ideas that were measured and did not pay are recorded beside the ones that did, in
 [docs/neuron-notes.md](docs/neuron-notes.md): all-to-all gathers (6x slower than a padded
@@ -271,7 +310,7 @@ Kiln installed at `/opt/kiln`; its entrypoint is `python -m kiln`. Run it on a t
 Neuron driver (the Deep Learning AMI for Neuron has it) and pass the Neuron devices in.
 
 ```bash
-docker pull public.ecr.aws/sanghwa/kiln:0.2.0     # also :0.2.0-neuronx-sdk2.32 and :latest
+docker pull public.ecr.aws/sanghwa/kiln:0.3.0     # also :0.3.0-neuronx-sdk2.32 and :latest
 ```
 
 The quickstart model on one NeuronCore (`/dev/neuron0` holds two on trn1). The first mount is the
@@ -283,7 +322,7 @@ docker run --rm --device=/dev/neuron0 -e NEURON_RT_VISIBLE_CORES=0 -p 8000:8000 
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -v ~/.cache/neuron_libtorch:/root/.cache/neuron_libtorch \
   -v /var/tmp/nki-intermediate-cache:/var/tmp/nki-intermediate-cache \
-  public.ecr.aws/sanghwa/kiln:0.2.0 --model Qwen/Qwen3-0.6B --device neuron --port 8000
+  public.ecr.aws/sanghwa/kiln:0.3.0 --model Qwen/Qwen3-0.6B --device neuron --port 8000
 
 curl -s localhost:8000/v1/completions -H 'content-type: application/json' \
   -d '{"model": "Qwen/Qwen3-0.6B", "prompt": "Trainium is", "max_tokens": 32}'
@@ -296,7 +335,7 @@ docker run --rm $(for i in $(seq 0 15); do echo --device=/dev/neuron$i; done) -p
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -v ~/.cache/neuron_libtorch:/root/.cache/neuron_libtorch \
   -v /var/tmp/nki-intermediate-cache:/var/tmp/nki-intermediate-cache \
-  public.ecr.aws/sanghwa/kiln:0.2.0 --model <model> --device neuron --tp 32 --port 8000
+  public.ecr.aws/sanghwa/kiln:0.3.0 --model <model> --device neuron --tp 32 --port 8000
 ```
 
 **GLM-5.3-Flash needs farm-compiled graphs.** Its graphs take hours to compile on the device, so
@@ -314,7 +353,7 @@ The CPU test suite runs in the image too:
 ```bash
 docker run --rm -e NEURON_RT_VISIBLE_CORES= -e KILN_TEST_MODEL=Qwen/Qwen3-0.6B \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  --entrypoint python public.ecr.aws/sanghwa/kiln:0.2.0 -m pytest -q
+  --entrypoint python public.ecr.aws/sanghwa/kiln:0.3.0 -m pytest -q
 ```
 
 ## License

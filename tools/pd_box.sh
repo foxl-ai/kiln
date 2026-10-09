@@ -10,7 +10,7 @@
 #
 # Configs (the exact env and serve_sweep arguments of a compile-farm capture: the KV pool, max_num_seqs and the buckets
 # are graph input shapes, so a server runs the graphs only with these):
-#   P8K-EPLB  prefill: engine-v0 c7c43e9's G64 + EPLB + one-piece 8192 prefill, q/pf-p8-7ce6a12 G64-EPLB-P8K-KV12CK4
+#   P8K-EPLB  prefill: G64 + EPLB + one-piece 8192 prefill, q/pf-p8-2f946a5 G64-EPLB-P8K-KV12CK4 (engine-v0 2f946a5)
 #             (the same-box best, 191.3 out tok/s); EPLB rebalances once after 200 prefill calls (KILN_EPLB_INTERVAL).
 #   STL9R2    decode: feat/decode-scale 4fd7469's ST + v9, 28 rows per DP group, real 8K KV (2.1 GB), q/dc1-t1 t1-STL9r2.
 set -uo pipefail
@@ -22,8 +22,17 @@ B=s3://<your-bucket>
 COMMON="KILN_ADMISSION=reserve KILN_CC_ARGS=--model-type=transformer KILN_DSA_POOL_CACHE=auto KILN_DSA_SELECT=nki KILN_LINEAR_ATTN_KERNEL=nki KILN_MOE_KERNEL=nki KILN_MOE_PREFILL_KERNEL=nki KILN_MOE_PREFILL_SKIP=20 KILN_PIECEWISE_MOE_GROUP=12 KILN_PREFILL_SP=1 KILN_SP_ROUTE=1 NEURON_LIBTORCH_ASSERT_CACHE_HIT=1"
 G1="--model zai-org/GLM-5.3-Flash --device neuron --tp 32 --dp-attention 4 --piecewise --overlap --input-len 8192 --output-len 256 --page-buckets 264 --warmup --max-seconds 1800"
 declare -A ENV ARGS
-ENV[P8K-EPLB]="$COMMON KILN_EPLB_INIT=/opt/kiln/eplb-init-random.pt KILN_EP_REDUNDANT=1 KILN_PIECEWISE_PREFILL_MOE_GROUP=45 KILN_EPLB_INTERVAL=${PD_EPLB_INTERVAL:-200} KILN_EPLB_MAX_REBALANCES=1 KILN_COMPILE_FARM=$B/compile-farm/q/pf-p8-7ce6a12/"
+# Farm queue q/pf-p8-2f946a5 (2026-10-06): the same G64-EPLB-P8K-KV12CK4 capture on engine-v0 2f946a5, whose keys moved
+# from q/pf-p8-7ce6a12's (16 of 25 differ: 4 one-piece prefill pieces and 12 decode-side graphs).
+ENV[P8K-EPLB]="$COMMON KILN_EPLB_INIT=/opt/kiln/eplb-init-random.pt KILN_EP_REDUNDANT=1 KILN_PIECEWISE_PREFILL_MOE_GROUP=45 KILN_EPLB_INTERVAL=${PD_EPLB_INTERVAL:-200} KILN_EPLB_MAX_REBALANCES=1 KILN_COMPILE_FARM=$B/compile-farm/q/pf-p8-2f946a5/"
 ARGS[P8K-EPLB]="$G1 --prefill-tokens 8192 --prefill-buckets 2048 --max-num-seqs 64 --concurrency 64 64 --decode-buckets 16 --kv-cache-gb 1.2 --kv-cache-dtype fp8 --state-checkpoints 4 --eplb-rebalance"
+# feat/prefill-fewer-graphs (code only; q/pfg-505b7c9 holds nothing yet): P8K-EPLB's 8192-row call as ONE graph
+# (P8K-W: KILN_PREFILL_WHOLE=1, prep + the 45-layer piece + post in one) and at 16384 rows, 4096 per DP-attention group
+# (P16K-W), to spread each expert's dequantize and every call's launches over twice the rows.
+PFG=$B/compile-farm/q/pfg-505b7c9/
+ENV[P8K-W]="${ENV[P8K-EPLB]%KILN_COMPILE_FARM=*}KILN_COMPILE_FARM=$PFG KILN_PREFILL_WHOLE=1"; ARGS[P8K-W]="${ARGS[P8K-EPLB]}"
+ENV[P16K-W]="${ENV[P8K-W]}"
+ARGS[P16K-W]="${ARGS[P8K-EPLB]/--prefill-tokens 8192 --prefill-buckets 2048/--prefill-tokens 16384 --prefill-buckets 4096}"
 ENV[STL9R]="$COMMON KILN_PIECEWISE_PREFILL_MOE_GROUP=12 KILN_MOE_EP=0 KILN_DENSE_FP8=0 KILN_DSA_PREFIX=mm KILN_DECODE_WHOLE=1 KILN_MOE_DEDUPE_MAX_TOKENS=256 KILN_MOE_DEDUPE_V9=1 KILN_COMPILE_FARM=$B/compile-farm/q/dc1-t1/"
 ARGS[STL9R]="$G1 --prefill-tokens 4096 --prefill-buckets 1024 --max-num-seqs 112 --kv-cache-gb 1.95 --kv-cache-dtype fp8 --no-prefix-caching --decode-buckets 28"
 # t1-STL9r2: the same with KV 2.1 GB (~7,777 pages per group; 1.95 GB is ~7,222, under 28 x 264 + 1 = 7,393).
@@ -47,6 +56,12 @@ ARGS[CP-R96]="--model zai-org/GLM-5.3-Flash --device neuron --tp 32 --dp-attenti
 # neither flag changes a paged cache or state row, so the handoff layout is CP-R96's.
 ENV[CPA-R96]="${ENV[CP-R96]} KILN_DSA_CP_ALL_LOCAL=1 KILN_DSA_CP_PAGE_KEYS=1"
 ARGS[CPA-R96]="${ARGS[CP-R96]}"
+# CPA-R96B / CPA-R96BC: CPA-R96 plus the decode agent's merge bound, and plus the in-kernel slot compaction
+# (feat/decode-next, q/dc2-t1 dn-R96AkB / dn-R96AkBD-fin). Neither changes a cache or state row: the handoff is CP-R96's.
+ENV[CPA-R96B]="${ENV[CPA-R96]} KILN_DSA_CP_MERGE_BOUND=1 KILN_COMPILE_FARM=$B/compile-farm/q/dc2-t1/"
+ARGS[CPA-R96B]="${ARGS[CP-R96]}"
+ENV[CPA-R96BC]="${ENV[CPA-R96B]} KILN_DSA_CP_DECODE_COMPACT=1 KILN_DSA_SLOTS_C_RPI=16"
+ARGS[CPA-R96BC]="${ARGS[CP-R96]}"
 ENV[CP-R80]="${ENV[CP-R96]}"
 ARGS[CP-R80]="--model zai-org/GLM-5.3-Flash --device neuron --tp 32 --dp-attention 4 --piecewise --overlap --input-len 8192 --output-len 256 --warmup --max-seconds 1800 --prefill-tokens 4096 --prefill-buckets 1024 --kv-cache-dtype fp8 --no-prefix-caching --page-size 256 --page-buckets 64 --max-num-seqs 320 --kv-cache-gb 0.77 --decode-buckets 80"
 # TP1-P4K / TP1-P2K: the latency prefill box, P8K-EPLB's env at DP attention 1 (attention TP 32: one request per call over
@@ -60,6 +75,17 @@ ENV[TP1-P4K]="$TP1"
 ARGS[TP1-P4K]="$TP1A --prefill-tokens 4096 --prefill-buckets 4096"
 ENV[TP1-P2K]="$TP1"
 ARGS[TP1-P2K]="$TP1A --prefill-tokens 2048 --prefill-buckets 2048"
+# G64P: a prefill box running the colocated G64 default's graphs (engine-v0 8229c3d .. fdea9af, q/pf-spw2-c0c8074
+# G64-SPW2, 4096-token calls of 1024-token chunks, KV 1.5 fp8): the prefill config whose keys this tree still hits when
+# P8K-EPLB's (q/pf-p8-7ce6a12) do not (measured 2026-10-06 on fdea9af: 3 prefill graph misses under ASSERT_CACHE_HIT).
+ENV[G64P]="$COMMON KILN_PIECEWISE_PREFILL_MOE_GROUP=12 KILN_COMPILE_FARM=$B/compile-farm/q/pf-spw2-c0c8074/"
+ARGS[G64P]="$G1 --prefill-tokens 4096 --prefill-buckets 1024 --max-num-seqs 64 --concurrency 64 --decode-buckets 16 --kv-cache-gb 1.5 --kv-cache-dtype fp8"
+# G64PL: G64P with the sparse-only page-bucket ladder 132,264 (q/dp-ladder G64L2, engine-v0 1942731): a call whose
+# sequences all end below 4,224 keys runs the 132-page graphs, so dsa_fused attends half the blocks. Bit-exact against
+# G64P (check_mixed 32 / 32, |dlogprob| 0), real text: lone 8K TTFT p50 4067 -> 3981 ms, conc 64 157.2 -> 159.3 out tok/s,
+# +0.51 GiB on the fullest core (14.28 -> 14.79 GiB; docs/neuron-notes.md "Phase 2 ... the page-bucket ladder").
+ENV[G64PL]="$COMMON KILN_PIECEWISE_PREFILL_MOE_GROUP=12 KILN_COMPILE_FARM=$B/compile-farm/q/dp-ladder/"
+ARGS[G64PL]="${G1/--page-buckets 264/--page-buckets 132,264} --prefill-tokens 4096 --prefill-buckets 1024 --max-num-seqs 64 --concurrency 64 --decode-buckets 16 --kv-cache-gb 1.5 --kv-cache-dtype fp8"
 ENV[STL9R2]="${ENV[STL9R]}"
 ARGS[STL9R2]="$G1 --prefill-tokens 4096 --prefill-buckets 1024 --max-num-seqs 112 --kv-cache-gb 2.1 --kv-cache-dtype fp8 --no-prefix-caching --decode-buckets 28"
 

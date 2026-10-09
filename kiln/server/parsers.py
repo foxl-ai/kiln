@@ -277,6 +277,7 @@ class _ToolFormat:
     closer: str | None  # None: the block runs to the end of the output
     tags: tuple[str, ...]  # every tag that can appear in a block, held back when split
     strip_content: bool = True  # content is .strip()ped when calls were made (vLLM default)
+    at_start: bool = False  # the opener counts only at the start of the message (Llama 3 JSON)
     validate_names: bool = False  # vLLM validate_tool_names
     verbatim_on_failure: bool = True  # a block that yields no call is returned as content
 
@@ -412,7 +413,47 @@ class _KimiFormat(_ToolFormat):
         return (s.strip() or "{}") if complete else s.rstrip()
 
 
+class _Llama3JsonFormat(_ToolFormat):
+    """Llama 3.x JSON tool calls: the whole message is `{"name": ..., "parameters": {...}}`, several separated by
+    `;` (vLLM v0.24.0 vllm/tool_parsers/llama_tool_parser.py Llama3JsonToolParser, the parser vllm-neuron's
+    features guide names for tool_choice auto). The model may open with `<|python_tag|>`, a special token the server's
+    skip_special_tokens decode drops, so the message starts with `{`. As in vLLM's streaming path, only a message that
+    STARTS with `{` is a tool call; a `{` later in the text is content. `arguments` or `parameters` both name the
+    arguments (vLLM: `obj["arguments"] if "arguments" in obj else obj["parameters"]`). Each call is announced whole
+    when its object closes, like the Hermes format. A message that yields no named call is returned as content (Kiln's
+    rule above; vLLM returns the whole output as content on a missing key, where Kiln keeps the calls before it)."""
+    opener, closer, tags = "{", None, ()
+    at_start = True
+    _decoder = json.JSONDecoder()
+
+    def scan(self, body, done):
+        text, views, pos = "{" + body, [], 0
+        while True:
+            while pos < len(text) and (text[pos].isspace() or text[pos] == ";"):
+                pos += 1
+            if pos >= len(text):
+                return views
+            # Trailing text, an object still being written or not JSON, or one without a name: the calls before it
+            # stand, in both paths (a streamed call cannot be retracted, and parse_full runs the same scan).
+            if text[pos] != "{":
+                return views
+            try:
+                obj, end = self._decoder.raw_decode(text, pos)
+            except json.JSONDecodeError:
+                return views
+            if not isinstance(obj, dict) or not isinstance(obj.get("name"), str):
+                return views
+            args = obj["arguments"] if "arguments" in obj else obj.get("parameters", {})
+            views.append(_View(obj["name"], args if isinstance(args, str) else json.dumps(args, ensure_ascii=False),
+                               True))
+            pos = end
+
+    def arguments(self, view, complete, props):
+        return view.args
+
+
 _HERMES, _XML, _GLM, _KIMI = _HermesFormat(), _XmlFormat(), _GlmFormat(), _KimiFormat()
+_LLAMA3_JSON = _Llama3JsonFormat()
 TOOL_PARSERS = {
     "hermes": _HERMES,  # vLLM, SGLang
     "qwen25": _HERMES,  # SGLang Qwen25Detector
@@ -425,6 +466,9 @@ TOOL_PARSERS = {
     "glm45": _GLM,  # vLLM -> Glm47MoeModelToolParser, SGLang Glm4MoeDetector
     "glm47": _GLM,  # vLLM, SGLang Glm47MoeDetector
     "kimi_k2": _KIMI,  # vLLM, SGLang KimiK2Detector
+    "llama3_json": _LLAMA3_JSON,  # vLLM Llama3JsonToolParser (also its llama4_json name)
+    "llama4_json": _LLAMA3_JSON,  # vLLM
+    "llama3": _LLAMA3_JSON,  # SGLang Llama32Detector's name
 }
 
 
@@ -530,6 +574,7 @@ class StreamParser:
         self._skip_nl = False  # drop the newlines that follow the end tag
         self._slots: list[_Slot] = []
         self._calls = 0
+        self._spoken = False  # content began with something other than an at_start opener
         if self.rfmt is not None:
             self._state = "start"
             if thinking_open or self.rfmt.always:
@@ -587,7 +632,17 @@ class StreamParser:
                         return _coalesce(out)
                     self._skip_nl = False
                 tags = []
-                if self.tfmt is not None:
+                at_start = self.tfmt is not None and self.tfmt.at_start
+                if at_start and not self._spoken:
+                    s = self._buf.lstrip()
+                    if s.startswith(self.tfmt.opener):
+                        self._buf = s[len(self.tfmt.opener):]
+                        self._state, self._slots = "block", []
+                        continue
+                    if not s and not final:
+                        return _coalesce(out)  # only whitespace so far: the opener may still come
+                    self._spoken = True  # the message starts with something else: content to the end
+                if self.tfmt is not None and not at_start:
                     tags.append(self.tfmt.opener)
                 if r is not None and self._closed:
                     tags.append(r.end)  # vLLM drops a duplicate end tag ((CONTENT, THINK_END))

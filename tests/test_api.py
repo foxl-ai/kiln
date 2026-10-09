@@ -118,6 +118,11 @@ def test_sglang_generate_and_metrics(client):
     assert "kiln:generation_tokens_total" in m and "kiln:time_to_first_token_seconds_count" in m
     gen = [l for l in m.splitlines() if l.startswith("kiln:generation_tokens_total ")][0]
     assert int(gen.split()[-1]) >= 4
+    # vllm-neuron's start-up and per-graph metrics (kiln/metrics.py startup_lines)
+    assert "kiln:model_load_time_seconds " in m and "kiln:model_load_size_bytes " in m
+    execs = [l for l in m.splitlines() if l.startswith("kiln:neff_execution_count{")]
+    assert execs and sum(int(l.split()[-1]) for l in execs) >= 4
+    assert any(l.startswith('kiln:compilation_time_seconds{bucket_name="') for l in m.splitlines())
 
 
 def test_jump_forward_streams_aligned_logprobs(client):
@@ -444,3 +449,21 @@ def test_decisions_prompt_wording():
     assert PROMPT_FORMAT_VERSION == 1
     for q in req.questions:
         assert render_question(text, question_view(q), labels[q.id]) == "\n".join([text, "", *want[q.id]])
+
+
+def test_tokenize_and_detokenize(client):
+    """vLLM's /tokenize and /detokenize shapes (v0.24.0 vllm/entrypoints/serve/tokenize/protocol.py)."""
+    tok = client.engine.tokenizer
+    r = client.post("/tokenize", json={"prompt": "The capital of France is", "return_token_strs": True})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    ids = tok("The capital of France is")["input_ids"]
+    assert body["tokens"] == ids and body["count"] == len(ids)
+    assert body["max_model_len"] == client.engine.cfg.max_model_len
+    assert body["token_strs"] == tok.convert_ids_to_tokens(ids)
+    r = client.post("/tokenize", json={"messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200 and r.json()["count"] > 1 and "token_strs" not in r.json()
+    r = client.post("/detokenize", json={"tokens": ids})
+    assert r.status_code == 200 and r.json()["prompt"] == tok.decode(ids)
+    assert client.post("/detokenize", json={"tokens": [-1]}).status_code == 400
+    assert client.post("/tokenize", json={}).status_code == 400

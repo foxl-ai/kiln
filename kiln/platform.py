@@ -128,7 +128,8 @@ _LNC: int | None = None  # resolved by configure_runtime_env, before anything is
 # fails that check (a vector-DGE out-of-bound indirect copy at 256-row chunks, under investigation) and
 # moe_dedupe's decode path is not covered by it yet.
 # moe_ep (kernels/moe_ep.py, feat/trn2-fast): the expert-parallel prefill and decode-v2 kernels, I-chunks of gate_up and
-# output columns of down per program with a^T swapped (exact in the NKI simulator; hangs in trn2 serving, an open bug);
+# output columns of down per program with a^T swapped (exact in the NKI simulator; its trn2 hang was the scatter's
+# out-of-bound skip, fixed 2026-10-06: docs/neuron-notes.md "The EP hang at LNC=2 is the scatter's out-of-bound skip");
 # kda_decode / dsa_decode: halves of the decode rows per program (bit-identical in the simulator, not on the trn2 device,
 # where the decode-path gate passed: docs/neuron-notes.md "trn2 on engine-v0 70ddc1b"). dsa_fused (kernels/dsa_fused.py,
 # KILN_DSA_FUSED=1): halves of the query tiles per program. Off by default.
@@ -140,7 +141,9 @@ LNC_SPLIT_DEFAULT = "delta_rule,dsa_topk"
 # the decode kernels; decode-path gate 28 / 32 equal, signed dlogprob +0.00020). Keyed on the runtime's LNC so that trn1, where
 # moe_dedupe's split argument is part of its graph key, traces exactly as before.
 # dsa_fused since 2026-10-06 (kernels/dsa_fused.py FUSED_FAMILIES: +3.2-3.7% per engine, the wikitext and check_mixed gates there).
-LNC_SPLIT_DEFAULT_LNC2 = "delta_rule,dsa_topk,moe_dedupe,kda_decode,dsa_decode,dsa_fused"
+# moe_ep since 2026-10-06, with expert parallelism the trn2 default for glm5_next (models/decoder.py moe_ep_enabled): unsplit,
+# both physical cores would run every pass.
+LNC_SPLIT_DEFAULT_LNC2 = "delta_rule,dsa_topk,moe_dedupe,kda_decode,dsa_decode,dsa_fused,moe_ep"
 
 
 def lnc_split(kernel: str) -> bool:

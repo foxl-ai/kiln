@@ -17,6 +17,8 @@ tools/probe_dsa_select.py, induced through the inputs):
   wide     keys scaled by 2^k, k in [-40, 40]: scores over ~24 orders of magnitude
   ulps     keys of one base vector with single bf16 ulp perturbations: scores a few ulps apart
   short    pooled, npool <= 300 for every query
+  band<k>  pooled, every query's npool within N / 32 of P / k (a serving chunk's local count: one CP rank's visible pools
+           of a context that fills 1 / k of the page bucket)
 Timings are p50 of synchronous calls (tools/profile_layer.timed) and ns per (query, pool).
 
 slots: kernels/dsa_slots.attend against kernels/dsa_decode.emulate (q_lat [N, 8, 512], a latent cache of 4096 pages
@@ -67,6 +69,8 @@ def make_inputs(kind: str, N: int, P: int, keep: int, g: torch.Generator, Hi: in
                           for i in range(N)])
     if kind == "short":
         npool = npool.clamp(max=300)
+    if kind.startswith("band"):  # band<k>: every query near P / k candidates, as a serving chunk's local count at P / k
+        npool = P // int(kind[4:]) + torch.arange(N) // 32
     return q.to(torch.bfloat16), w.float(), pk.to(torch.bfloat16), npool.clamp(0, P)
 
 
@@ -225,9 +229,67 @@ def slots_n_cases(args, pl) -> None:
                    f"{th * 1e6 / N:.2f} (per buffer row)", flush=True)
 
 
+def slots_c_cases(args, pl) -> None:
+    """kernels/dsa_slots_c.py against kernels/dsa_slots.py on the context-parallel decode shape (640 slots per row:
+    `--live` selected slots at random places among the first 512, the tail pool with 1-4 visible tokens on every
+    other row, padding): max |o - dsa_slots| / max |o| and the lse error, a call with one row over 128 live slots (the
+    full loop: must equal dsa_slots exactly), and the time per row of both."""
+    from kiln.kernels import dsa_decode, dsa_slots, dsa_slots_c
+
+    R, KP = 512, 4
+    pages, ps = 4096, 32
+    NS = dsa_decode.NCH * 128
+    for kv, H in [(kv, H) for kv in args.kv for H in args.heads]:
+        g = torch.Generator().manual_seed(7)
+        kc = (torch.randn(pages * ps, 1, R, generator=g) * 2).clamp(-200, 200)
+        kc = kc.to(torch.float8_e4m3fn if kv == "fp8" else torch.bfloat16)
+        for N in args.rows:
+            for live in args.live:
+                q = (torch.randn(N, H, R, generator=g) * 0.05).to(torch.bfloat16)
+                rows = torch.randint(0, pages * ps // KP, (N, NS), generator=g)
+                bias = torch.full((N, NS, KP), NEG_INF)
+                for b in range(N):
+                    sel = torch.randperm(512, generator=g)[:live]
+                    bias[b, sel] = 0.0
+                    if b % 2 == 0:
+                        bias[b, 512, : 1 + b % 4] = 0.0  # the tail pool's visible prefix
+                over = bias.clone()
+                over[0, :200] = 0.0  # one row over 128 live slots: the whole call takes the full loop
+                dev = tuple(x.to(pl.DEV) for x in (q, kc, rows, bias))
+                devo = tuple(x.to(pl.DEV) for x in (q, kc, rows, over))
+
+                def ref(q_, kc_, r_, b_):
+                    return dsa_slots.attend(q_, kc_, r_, b_, R ** -0.5, lse=True)
+
+                def f(q_, kc_, r_, b_):
+                    return dsa_slots_c.attend(q_, kc_, r_, b_, R ** -0.5, lse=True)
+
+                want_o, want_l = (x.cpu() for x in torch.compile(ref, **pl.OPTS)(*dev))
+                got_o, got_l = (x.cpu() for x in torch.compile(f, **pl.OPTS)(*dev))
+                emu_o, emu_l = dsa_slots_c.emulate(q.float(), kc.reshape(-1, R), rows, bias, R ** -0.5, lse=True)
+                err = (got_o - want_o).abs().max().item() / want_o.abs().max().item()
+                eerr = (got_o - emu_o).abs().max().item() / emu_o.abs().max().item()
+                lerr = (got_l - want_l).abs().max().item()
+                fin = torch.isfinite(got_o).all().item() and torch.isfinite(got_l).all().item()
+                pl.say(f"  slots_c N={N} H={H} kv={kv} live={live}: max |o - dsa_slots| / max |o| = {err:.2e}, "
+                       f"vs emulate {eerr:.2e}; lse max abs err {lerr:.2e}; finite {fin}", flush=True)
+                wo, wl = (x.cpu() for x in torch.compile(ref, **pl.OPTS)(*devo))
+                go, gl = (x.cpu() for x in torch.compile(f, **pl.OPTS)(*devo))
+                pl.say(f"  slots_c N={N} over-capacity call (dsa_slots_n fallback): equal to dsa_slots "
+                       f"{torch.equal(go, wo) and torch.equal(gl, wl)}", flush=True)
+                ta = pl.timed(f"slots   N={N} NS={NS} H={H} kv={kv} live={live}",
+                              lambda *a: sum(x.sum() for x in ref(*a)), dev, args.iters)
+                tb = pl.timed(f"slots_c N={N} NS={NS} H={H} kv={kv} live={live}",
+                              lambda *a: sum(x.sum() for x in f(*a)), dev, args.iters)
+                tc = pl.timed(f"slots_c N={N} NS={NS} H={H} kv={kv} over-capacity",
+                              lambda *a: sum(x.sum() for x in f(*a)), devo, args.iters)
+                pl.say(f"    us per row: dsa_slots {ta * 1e6 / N:.2f}, dsa_slots_c {tb * 1e6 / N:.2f} (both kernels "
+                       f"called, the compacted one computing), over capacity {tc * 1e6 / N:.2f}", flush=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", choices=["select", "slots", "slots_n"])
+    ap.add_argument("what", choices=["select", "slots", "slots_n", "slots_c"])
     ap.add_argument("--rows", type=int, nargs="+", default=[8, 128])
     ap.add_argument("--pools", type=int, nargs="+", default=[2112, 8448, 32768, 131072, 262144])
     ap.add_argument("--keep", type=int, default=512)
@@ -236,6 +298,7 @@ def main() -> None:
     ap.add_argument("--heads", type=int, nargs="+", default=[8, 64])
     ap.add_argument("--slots", type=int, nargs="+", default=None,
                     help="slots: slots per row (multiples of 128; default the long path's dsa_decode.NCH x 128 = 640)")
+    ap.add_argument("--live", type=int, nargs="+", default=[64], help="slots_c: selected slots per row")
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--time", action="store_true", help="time every kind (default: the first only)")
     ap.add_argument("--diag", action="store_true", help="on a mismatch, rerun with the device scores dumped")
@@ -245,7 +308,7 @@ def main() -> None:
     import profile_layer as pl
 
     pl.setup_device(args.cpu)
-    {"select": select_cases, "slots": slots_cases, "slots_n": slots_n_cases}[args.what](args, pl)
+    {"select": select_cases, "slots": slots_cases, "slots_n": slots_n_cases, "slots_c": slots_c_cases}[args.what](args, pl)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,14 @@
 """The fused pooled-DSA prefill kernel (kernels/dsa_fused.py: indexer scores, exact top-k selection and attention in one
 kernel) on one NeuronCore against its CPU emulation, and timed against the two kernels it replaces back to back
 (dsa_topk.score_select's kp 4 + tail mask, the visibility added, then kernels/dsa_prefill.py), at GLM-5.3-Flash's
-attention-TP-8 rank shape (8 heads, latent 512, a 32 x 128 indexer, 8448 keys = 2112 pools, keep 512).
+attention-TP-8 rank shape (8 heads, latent 512, a 32 x 128 indexer, 8448 keys = 2112 pools, keep 512). Form `causal`:
+kernels/dsa_fused_c.py (KILN_DSA_FUSED_CAUSAL), also compared bit for bit with `fused` when both run. kernels/dsa_split.py
+(KILN_DSA_SPLIT_SELECT) on one core, where there is no group to split over: `split` (the selection kernel over every row,
+then the attention-only kernel; bit for bit against `fused` when both run), and with --split-parts also its two kernels
+timed alone: the selection of one 128-row tile (a rank's share at attention TP 8) and the attention on a selection
+computed once.
 
-    python tools/probe_dsa_fused.py [--rows 1024] [--offset O ...] [--forms fused two]
+    python tools/probe_dsa_fused.py [--rows 1024] [--offset O ...] [--forms fused two causal] [--neff]
 
 The chunk sits at positions offset .. offset + C - 1 (default: the bucket's end). Reported: max |o - emulate()| / max |o|
 and p50 of synchronous calls.
@@ -35,6 +40,14 @@ def case(C: int, L: int, off: int, seed: int):
     return qI, w, pk, pos, q_lat, kc
 
 
+def _sum_and_out(fn):
+    def both(*x):
+        o = fn(*x)
+        return o.sum(), o
+
+    return both
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, nargs="+", default=[1024])
@@ -42,17 +55,25 @@ def main() -> None:
     ap.add_argument("--offset", type=int, nargs="+", default=[-1])
     ap.add_argument("--forms", nargs="+", default=["fused", "two"])
     ap.add_argument("--iters", type=int, default=10)
+    ap.add_argument("--neff", action="store_true", help="print each new graph's instruction counts")
+    ap.add_argument("--split-parts", action="store_true", help="also time dsa_split's two kernels alone")
+    ap.add_argument("--sel-rows", type=int, default=128,
+                    help="--split-parts: the rows one rank selects (C / attention TP: 128 at the 8K G64 shape, 256 at trn2 G1's)")
     a = ap.parse_args()
     import profile_layer as pl
 
     pl.setup_device()
+    pl.NEFF = a.neff
     from kiln.kernels import dsa_fused as df
+    from kiln.kernels import dsa_fused_c as dfc
+    from kiln.kernels import dsa_split as dsp
     from kiln.kernels import dsa_prefill as dp
     from kiln.kernels import dsa_topk as dk
 
     si, sa = D ** -0.5, 256 ** -0.5
     L = a.keys
     NEG = -1e30
+    boths = {}
     for C in a.rows:
         for off in a.offset:
             off = L - C if off < 0 else off
@@ -62,6 +83,12 @@ def main() -> None:
 
             def fused(qI_, w_, pk_, pos_, ql, kc_):
                 return df.attend(qI_, w_, pk_, pos_, ql, kc_, KEEP, si, sa)
+
+            def causal(qI_, w_, pk_, pos_, ql, kc_):
+                return dfc.attend(qI_, w_, pk_, pos_, ql, kc_, KEEP, si, sa)
+
+            def split(qI_, w_, pk_, pos_, ql, kc_):  # the split path on one core: every row's selection, then attention
+                return dsp.attend(dsp.select(qI_, w_, pk_, pos_, pos_, kc_.shape[0], KEEP, si), pos_, ql, kc_, sa)
 
             def two(qI_, w_, pk_, pos_, ql, kc_):  # the engine's path with both kernels: score_select, vis, attention
                 P = pk_.shape[0]
@@ -106,19 +133,49 @@ def main() -> None:
                     r = int(badm.nonzero()[0])
                     d = (gm[r] != wm[r]).nonzero().flatten()
                     pl.say(f"    row {r} (pos {int(pos[r])}): first wrong keys {d[:12].tolist()}", flush=True)
+            outs = {}
             for name in a.forms:
                 if name == "dbg":
                     continue
-                fn = fused if name == "fused" else two
+                fn = {"fused": fused, "causal": causal, "two": two, "split": split}[name]
                 dev = tuple(x.to(pl.DEV) for x in (qI, w, pk, pos, q_lat, kc))
-                t = pl.timed(f"{name} C={C} off={off}", lambda *x, fn=fn: fn(*x).sum(), dev, a.iters)
+                # one graph per form for the timing and the output (timed() syncs on the scalar, the first element):
+                # a second graph of the bare output cost the causal form a second ~9-minute compile
+                both = boths.setdefault(name, _sum_and_out(fn))
+                t = pl.timed(f"{name} C={C} off={off}", both, dev, a.iters)
                 if t != t:
                     continue
-                o = torch.compile(fn, **pl.OPTS)(*dev).cpu()
+                o = torch.compile(both, **pl.OPTS)(*dev)[1].cpu()
+                outs[name] = o
                 err = ((o - ref).abs().max() / ref.abs().max()).item()
                 rows = ((o - ref).abs().amax((1, 2)) / ref.abs().max() > 1e-2).sum().item()
                 pl.say(f"    {name}: o max|err| / max|o| {err:.2e}; rows off by more than 1e-2: {rows}; non-finite "
                        f"{int((~torch.isfinite(o)).sum())}", flush=True)
+            if a.split_parts:  # dsa_split's kernels alone
+                dev = tuple(x.to(pl.DEV) for x in (qI, w, pk, pos, q_lat, kc))
+
+                nr = a.sel_rows
+
+                def sel1(qI_, w_, pk_, pos_):
+                    return dsp.select(qI_[:nr], w_[:nr], pk_, pos_[:nr], pos_, L, KEEP, si).float().sum()
+
+                pl.timed(f"split select, {nr} rows C={C} off={off}", sel1, dev[:4], a.iters)
+                sel_d = torch.compile(lambda qI_, w_, pk_, pos_: dsp.select(qI_, w_, pk_, pos_, pos_, L, KEEP, si),
+                                      **pl.OPTS)(*dev[:4])
+
+                def att1(sel_, pos_, ql, kc_):
+                    return dsp.attend(sel_, pos_, ql, kc_, sa).sum()
+
+                pl.timed(f"split attend C={C} off={off}", att1, (sel_d, dev[3], dev[4], dev[5]), a.iters)
+            for x in ("causal", "split"):
+                if "fused" in outs and x in outs and x != "causal":
+                    d = (outs[x] - outs["fused"]).abs().max().item()
+                    pl.say(f"    {x} vs fused: bit-identical {bool(torch.equal(outs[x], outs['fused']))}, max |d| {d:.3e}",
+                           flush=True)
+            if "fused" in outs and "causal" in outs:
+                d = (outs["causal"] - outs["fused"]).abs().max().item()
+                pl.say(f"    causal vs fused: bit-identical {bool(torch.equal(outs['causal'], outs['fused']))}, max |d| {d:.3e}",
+                       flush=True)
 
 
 if __name__ == "__main__":

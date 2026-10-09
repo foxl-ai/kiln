@@ -80,6 +80,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--text-file", default=None,
                     help="score this file's text instead (its first --max-tokens tokens, 256-token prefill chunks)")
     ap.add_argument("--max-tokens", type=int, default=3072)
+    ap.add_argument("--page-buckets", default=None,
+                    help="comma-separated page buckets below the run's own (default 4 and max_len / 32): a ladder, so "
+                         "an early chunk runs a bucket sized to its context")
     ap.add_argument("--chunk", type=int, default=None,
                     help="--text-file: tokens per prefill call (default 256), so --chunk 1024 at --dp-attention 4 runs the "
                          "sequence-parallel row gathers at 32 rows per rank (the served graphs' path at 128)")
@@ -101,6 +104,14 @@ def _long_shape(args) -> tuple[int, int]:
     return (256, 2048) if getattr(args, "long", False) else (32, 512)
 
 
+def _page_buckets(args, max_len: int) -> tuple[int, ...]:
+    """(4, max_len / 32) by default; with --page-buckets, those (below max_len / 32) and max_len / 32."""
+    top = max_len // 32
+    if not getattr(args, "page_buckets", None):
+        return (4, top)
+    return tuple(sorted({int(x) for x in args.page_buckets.split(",") if 0 < int(x) < top} | {top}))
+
+
 def engine_config(args, path: str | None = None):
     """The EngineConfig this check runs with (tools/compile_farm.py capture --tool check_ppl builds
     the same one; it runs prompt logprobs, so capture with --plp)."""
@@ -112,7 +123,7 @@ def engine_config(args, path: str | None = None):
         model_path=path or resolve_model_path(args.model), device=args.device, dtype=torch.bfloat16, page_size=32,
         max_num_seqs=4, max_model_len=max_len, max_prefill_tokens=chunk, kv_cache_gb=args.kv_cache_gb,
         decode_batch_buckets=(-(-4 // args.dp_attention),), prefill_token_buckets=(chunk // args.dp_attention,),
-        page_buckets=(4, max_len // 32), tp=args.tp,
+        page_buckets=_page_buckets(args, max_len), tp=args.tp,
         tp_core_base=args.core_base, dp_attention=args.dp_attention,
         piecewise=args.piecewise, vocab_parallel=not args.no_vocab_parallel, piecewise_group=args.piecewise_group,
         weight_dtype=args.weight_dtype, mxfp4_packed=args.mxfp4_packed,

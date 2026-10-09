@@ -96,6 +96,135 @@ def test_prefill_depth_cap_late_binds_in_arrival_order():
     asyncio.run(uncapped())
 
 
+def _router_over(handler, latency=True):
+    """A PDRouter app whose engine calls go to `handler` (an httpx transport handler) instead of the network: the
+    router's own ordering and accounting, with one prefill and one decode worker."""
+    import httpx
+
+    from kiln.server.pd_router import PDRouter, Worker, build_pd_app
+
+    ph = {"role": "prefill", "max_num_seqs": 4}
+    dh = {"role": "decode", "max_num_seqs": 4, "pd_address": "127.0.0.1:1"}
+    r = PDRouter([Worker("http://p", ph, "latency" if latency else "throughput", 1)], [Worker("http://d", dh)], 0)
+    return r, build_pd_app(r, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+
+SSE_ONE = ('data: {"choices": [{"index": 0, "text": "x", "finish_reason": "length", "logprobs": {"tokens": ["x"]}}]}\n\n'
+           "data: [DONE]\n\n")
+
+
+def test_prefill_call_starts_without_waiting_for_the_decode_engine():
+    """A decode engine accepts a request only between two of its steps (api.EngineLoop._drain), so a router that waits
+    for its answer before calling the prefill engine puts up to a decode step in front of every prefill (slo4: ~0.26 s
+    of a 1.60 s 8K TTFT). Here the decode side answers only after the prefill call has arrived: the router that waited
+    deadlocked into the decode side's 3 s timeout (red before this change); now both calls are in flight at once, the
+    stream completes, and the prefill slot and the decode credit come back."""
+    import asyncio
+
+    import httpx
+
+    async def run():
+        arrived = asyncio.Event()
+        order = []
+
+        async def handler(req: httpx.Request):
+            body = json.loads(req.content)
+            if req.url.host == "p":
+                order.append("prefill")
+                arrived.set()
+                return httpx.Response(200, json={"kiln_pd": {"xfer": body["kiln_pd"]["xfer"], "handed_off": True}})
+            order.append("decode")
+            await asyncio.wait_for(arrived.wait(), 3.0)
+
+            async def sse():  # a stream, as the decode server's StreamingResponse is
+                yield SSE_ONE.encode()
+
+            return httpx.Response(200, content=sse(), headers={"content-type": "text/event-stream"})
+
+        r, app = _router_over(handler)
+        credits = r.decode[0].credits
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router") as c:
+            async with c.stream("POST", "/v1/completions",
+                                json={"prompt": [1, 2, 3], "max_tokens": 1, "stream": True}) as resp:
+                assert resp.status_code == 200
+                lines = [x async for x in resp.aiter_lines() if x.startswith("data: ")]
+        assert lines[-1] == "data: [DONE]" and "error" not in lines[0], lines
+        assert sorted(order) == ["decode", "prefill"]
+        for _ in range(100):  # the stream's finally gives the credit back after the last chunk
+            if r.decode[0].credits == credits:
+                break
+            await asyncio.sleep(0.01)
+        assert r.decode[0].credits == credits and r.prefill[0].inflight == 0
+        assert r.counts["handed_off"] == 1
+
+    asyncio.run(run())
+
+
+def test_a_refused_decode_request_cancels_its_prefill_call():
+    """The decode engine refuses (400) while the prefill call is in flight: the client gets the refusal at once, the
+    prefill call is cancelled, and the prefill slot and the decode credit are free again."""
+    import asyncio
+
+    import httpx
+
+    async def run():
+        cancelled = asyncio.Event()
+
+        async def handler(req: httpx.Request):
+            if req.url.host == "p":
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+                return httpx.Response(200, json={"kiln_pd": {}})
+            await asyncio.sleep(0.05)
+            return httpx.Response(400, json={"detail": "refused"})
+
+        r, app = _router_over(handler)
+        credits = r.decode[0].credits
+        t = time.perf_counter()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router") as c:
+            resp = await c.post("/v1/completions", json={"prompt": [1, 2, 3], "max_tokens": 1, "stream": True})
+        assert resp.status_code == 400 and time.perf_counter() - t < 5
+        await asyncio.wait_for(cancelled.wait(), 5)
+        await asyncio.sleep(0)
+        assert r.decode[0].credits == credits and r.prefill[0].inflight == 0
+
+    asyncio.run(run())
+
+
+def test_router_forwards_the_ids_it_tokenized():
+    """Threshold routing tokenizes a completions string prompt at the router; with forward_ids (main turns it on only
+    when --tokenizer is the served model) those ids replace the string, so neither engine tokenizes it again. Chat
+    bodies and id prompts are left alone. Needs KILN_TEST_MODEL (its tokenizer)."""
+    model = os.environ.get("KILN_TEST_MODEL")
+    if not model:
+        pytest.skip("set KILN_TEST_MODEL to run")
+    from transformers import AutoTokenizer
+
+    from kiln.server.pd_router import PDRouter, Worker
+
+    tok = AutoTokenizer.from_pretrained(model)
+    ph = {"role": "prefill", "max_num_seqs": 4}
+    dh = {"role": "decode", "max_num_seqs": 4, "pd_address": "127.0.0.1:1"}
+    r = PDRouter([Worker("p", ph)], [Worker("d", dh)], 4, tok)
+    text = "The history of the city goes back many centuries, and its people"
+    body = {"prompt": text}
+    assert not r.bypass("/v1/completions", body) and body["prompt"] == text  # off: the string goes on
+    r.forward_ids = True
+    body = {"prompt": text}
+    assert not r.bypass("/v1/completions", body)
+    assert body["prompt"] == tok(text)["input_ids"] and r.counts["forwarded_ids"] == 1
+    assert r.bypass("/v1/completions", {"prompt": "Hi"})  # short: still counted, and bypassed
+    ids = [5, 6, 7, 8, 9]
+    body = {"prompt": ids}
+    assert not r.bypass("/v1/completions", body) and body["prompt"] is ids
+    chat = {"messages": [{"role": "user", "content": text}]}
+    assert not r.bypass("/v1/chat/completions", chat) and "prompt" not in chat
+    assert r.counts["forwarded_ids"] == 2
+
+
 def _sweep_args(model):
     return ["--model", model, "--device", "cpu", "--tp", "1", "--max-num-seqs", "4", "--max-model-len", "512",
             "--prefill-tokens", "64", "--kv-cache-gb", "0.25", "--concurrency", "4"]
@@ -192,6 +321,7 @@ def test_pd_deployment_over_http():
             assert err < 0.05, err  # bf16 on CPU: the last prompt token runs in a prefill chunk, not a decode
         h = httpx.get(base + "/health").json()
         assert h["counts"]["disaggregated"] == 1 and h["counts"]["bypass"] == 1, h
+        assert h["counts"]["forwarded_ids"] == 2, h  # both prompts went on as the router's ids (the text still equal)
 
         r = httpx.post(base + "/v1/completions", json={"prompt": long_prompt, "max_tokens": 12, "temperature": 0},
                        timeout=600)
